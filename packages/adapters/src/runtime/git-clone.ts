@@ -23,8 +23,16 @@ export function sq(value: string): string {
 }
 
 /**
- * Inject a token into an HTTPS git URL for private repo access:
- *   https://github.com/owner/repo.git → https://x-access-token:<token>@github.com/owner/repo.git
+ * Inject a token into an HTTPS git URL for private repo access.
+ *
+ * On GitHub the username is not free-form: `x-access-token` is accepted only
+ * for GitHub App installation tokens (ghs_…). A classic or fine-grained PAT
+ * (ghp_…, github_pat_…, gho_…) behind a fixed `x-access-token` username is
+ * rejected with "Invalid username or token", so those credentials ride in
+ * the username slot instead:
+ *   https://github.com/owner/repo.git → https://ghp_<token>@github.com/owner/repo.git
+ * Other hosts keep the previous form (x-access-token:<token>@), which they
+ * accept with an arbitrary username.
  * Unchanged when no token or the URL isn't HTTPS.
  */
 export function injectGitToken(repoUrl: string, token?: string): string {
@@ -32,8 +40,14 @@ export function injectGitToken(repoUrl: string, token?: string): string {
   try {
     const url = new URL(repoUrl);
     if (url.protocol !== "https:") return repoUrl;
-    url.username = "x-access-token";
-    url.password = token;
+    const isGitHub = /(^|\.)github\.com$/.test(url.hostname);
+    if (isGitHub && !token.startsWith("ghs_")) {
+      url.username = token;
+      url.password = "";
+    } else {
+      url.username = "x-access-token";
+      url.password = token;
+    }
     return url.toString();
   } catch {
     return repoUrl;

@@ -1,10 +1,5 @@
 import { describe, it, expect } from "vitest";
-import {
-  sq,
-  injectGitToken,
-  toGitHubSshUrl,
-  assembleGitClone,
-} from "./git-clone";
+import { sq, injectGitToken, toGitHubSshUrl, assembleGitClone } from "./git-clone";
 
 describe("sq (POSIX single-quote)", () => {
   it("wraps a plain value", () => {
@@ -20,9 +15,29 @@ describe("sq (POSIX single-quote)", () => {
 });
 
 describe("injectGitToken", () => {
-  it("injects x-access-token into an HTTPS URL", () => {
-    expect(injectGitToken("https://github.com/owner/repo.git", "tok123")).toBe(
-      "https://x-access-token:tok123@github.com/owner/repo.git",
+  it("injects x-access-token for a GitHub App installation token (ghs_…)", () => {
+    expect(injectGitToken("https://github.com/owner/repo.git", "ghs_1234")).toBe(
+      "https://x-access-token:ghs_1234@github.com/owner/repo.git",
+    );
+  });
+  it("rides a classic PAT in the username slot on github.com", () => {
+    expect(injectGitToken("https://github.com/owner/repo.git", "ghp_1234")).toBe(
+      "https://ghp_1234@github.com/owner/repo.git",
+    );
+  });
+  it("rides a fine-grained PAT in the username slot on github.com", () => {
+    expect(injectGitToken("https://github.com/owner/repo.git", "github_pat_1234")).toBe(
+      "https://github_pat_1234@github.com/owner/repo.git",
+    );
+  });
+  it("rides an OAuth token in the username slot on github.com", () => {
+    expect(injectGitToken("https://github.com/owner/repo.git", "gho_1234")).toBe(
+      "https://gho_1234@github.com/owner/repo.git",
+    );
+  });
+  it("keeps x-access-token on non-GitHub hosts (arbitrary username accepted)", () => {
+    expect(injectGitToken("https://gitlab.com/owner/repo.git", "glpat-1")).toBe(
+      "https://x-access-token:glpat-1@gitlab.com/owner/repo.git",
     );
   });
   it("returns the URL unchanged when no token", () => {
@@ -31,7 +46,7 @@ describe("injectGitToken", () => {
     );
   });
   it("does not touch a non-HTTPS (scp-form) URL", () => {
-    expect(injectGitToken("git@github.com:owner/repo.git", "tok123")).toBe(
+    expect(injectGitToken("git@github.com:owner/repo.git", "ghp_1234")).toBe(
       "git@github.com:owner/repo.git",
     );
   });
@@ -44,26 +59,22 @@ describe("toGitHubSshUrl", () => {
     );
   });
   it("appends .git when missing", () => {
-    expect(toGitHubSshUrl("https://github.com/owner/repo")).toBe(
-      "git@github.com:owner/repo.git",
-    );
+    expect(toGitHubSshUrl("https://github.com/owner/repo")).toBe("git@github.com:owner/repo.git");
   });
   it("strips any embedded credentials", () => {
-    expect(
-      toGitHubSshUrl("https://x-access-token:secret@github.com/owner/repo.git"),
-    ).toBe("git@github.com:owner/repo.git");
+    expect(toGitHubSshUrl("https://x-access-token:secret@github.com/owner/repo.git")).toBe(
+      "git@github.com:owner/repo.git",
+    );
   });
 });
 
 describe("assembleGitClone — token / public mode", () => {
   const inv = assembleGitClone({
     repoUrl: "https://github.com/owner/repo.git",
-    gitToken: "tok123",
+    gitToken: "ghp_1234",
   });
-  it("injects the token into the clone URL", () => {
-    expect(inv.cloneUrl).toBe(
-      "https://x-access-token:tok123@github.com/owner/repo.git",
-    );
+  it("injects the token into the clone URL (PAT as username on github.com)", () => {
+    expect(inv.cloneUrl).toBe("https://ghp_1234@github.com/owner/repo.git");
   });
   it("fails fast instead of prompting (no interactive credential path)", () => {
     expect(inv.gitEnv).toContain("GIT_TERMINAL_PROMPT=0");
@@ -134,9 +145,9 @@ describe("assembleGitClone — option-injection guard", () => {
   // sq() makes the URL one shell WORD; it does not stop git from parsing a
   // leading dash as a flag. `--upload-pack=` would be RCE on the build host.
   it("refuses a URL that git would read as an option", () => {
-    expect(() =>
-      assembleGitClone({ repoUrl: "--upload-pack=touch /tmp/pwned" }),
-    ).toThrow(/must not start with/);
+    expect(() => assembleGitClone({ repoUrl: "--upload-pack=touch /tmp/pwned" })).toThrow(
+      /must not start with/,
+    );
   });
   it("refuses it regardless of leading whitespace", () => {
     expect(() => assembleGitClone({ repoUrl: "  --config=core.sshCommand=id" })).toThrow(
