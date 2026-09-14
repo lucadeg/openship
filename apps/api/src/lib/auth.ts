@@ -3,11 +3,20 @@ import { APIError } from "better-auth/api";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { bearer, mcp, emailOTP } from "better-auth/plugins";
 import { organization } from "better-auth/plugins/organization";
-import { defaultStatements, adminAc, memberAc, ownerAc } from "better-auth/plugins/organization/access";
+import {
+  defaultStatements,
+  adminAc,
+  memberAc,
+  ownerAc,
+} from "better-auth/plugins/organization/access";
 import { createAccessControl } from "better-auth/plugins/access";
 import { db, getDriver, repos, schema, and, eq, gt } from "@repo/db";
 import { env, runtimeTarget, runtimeTargetId, trustedOrigins } from "../config/env";
-import { resolveAuthBaseUrl, resolveDashboardPublicUrl, refreshSelfAppPublicUrl } from "./public-url";
+import {
+  resolveAuthBaseUrl,
+  resolveDashboardPublicUrl,
+  refreshSelfAppPublicUrl,
+} from "./public-url";
 import { sendMail, smtpEnabled, canSendMail, requireEmailVerificationStrict } from "./mail";
 import {
   resetPasswordOtpEmail,
@@ -16,12 +25,11 @@ import {
   organizationInviteEmail,
 } from "./email-templates";
 import { memberAudit } from "../modules/audit/member-emitter";
-import {
-  getOrgBillingState,
-  teardownBillingForOrg,
-} from "../modules/billing/billing-org-cleanup";
+import { getOrgBillingState, teardownBillingForOrg } from "../modules/billing/billing-org-cleanup";
 import { provisionUser } from "./provision-user";
-import { safeErrorMessage } from "@repo/core";
+import { invitationClaimPath, safeErrorMessage } from "@repo/core";
+import { invitationNeedsEmail } from "./invitation-delivery";
+import { invitationAccountCreationMode } from "./invitation-claim";
 
 /**
  * Better Auth organization-plugin access control config.
@@ -121,6 +129,16 @@ export const auth = betterAuth({
   // from the forwarded public host so remote MCP clients get reachable endpoints
   // (see resolveAuthBaseUrl). Static runtimeTarget.api otherwise (cloud/dev).
   baseURL: resolveAuthBaseUrl(),
+
+  // Better Auth's production fallback sends browser-flow failures to
+  // `/?error=...`. That lands inside the dashboard/session redirects, where the
+  // query is lost and an MCP client registration failure looks like a blank
+  // login page. Keep OAuth errors on a public, purpose-built dashboard page.
+  // Better Auth forwards the URL-encoded `error` and `error_description` params;
+  // the dashboard bounds them and renders them as text.
+  onAPIError: {
+    errorURL: `${resolveDashboardPublicUrl()}/auth/error`,
+  },
 
   database: drizzleAdapter(db, {
     provider: "pg",
@@ -229,7 +247,7 @@ export const auth = betterAuth({
   /* ---------- Session ---------- */
   session: {
     expiresIn: 60 * 60 * 24 * 30, // 30 days
-    updateAge: 60 * 60,            // refresh session every hour
+    updateAge: 60 * 60, // refresh session every hour
     ...(useSessionCookieCache
       ? {
           cookieCache: {
@@ -415,7 +433,35 @@ export const auth = betterAuth({
         // types are not enabled, so they fall through and send nothing.
         if (type === "email-verification") {
           const tmpl = verifyOtpEmailTemplate(otp, { expiresMinutes: 10 });
-          if (!(await sendMail({ to: email, ...tmpl }))) {
+          const delivered = await sendMail({ to: email, ...tmpl });
+
+          // DEV ESCAPE HATCH, `local-saas` ONLY.
+          //
+          // That target is a localhost-only SaaS used for development
+          // (`OPENSHIP_TARGET=local-saas`, ports 4100/3100) and it normally has no
+          // mail transport at all. Because CLOUD_MODE is true there,
+          // `requireEmailVerification` is forced on — so without this, signup on a
+          // dev machine is a dead end: the account is created, no session is issued,
+          // and the code needed to finish is inside an email nothing can send.
+          //
+          // Printing an auth credential to a log is only acceptable because of how
+          // narrow the gate is: `runtimeTargetId` comes from OPENSHIP_TARGET, an
+          // explicit operator choice validated against a fixed table (an unknown
+          // value throws at boot), and the `cloud-saas` row — production — cannot
+          // reach this branch. It is NOT gated on NODE_ENV, which flips by accident.
+          if (runtimeTargetId === "local-saas") {
+            console.warn(
+              `\n[dev:local-saas] email verification code for ${email}: ${otp}\n` +
+                `  (expires in 10 min. Logged because this target has no mail transport; ` +
+                `never happens on cloud-saas.)\n`,
+            );
+            // Deliberately does NOT throw on a delivery failure here, unlike every
+            // other target. The code above is the delivery channel on this target, so
+            // failing the request would make the account uncreatable.
+            return;
+          }
+
+          if (!delivered) {
             throw new APIError("SERVICE_UNAVAILABLE", {
               message:
                 "Could not send the verification code — this instance has no working " +
@@ -505,7 +551,7 @@ export const auth = betterAuth({
     organization({
       allowUserToCreateOrganization: true,
       organizationLimit: 10, // per-user cap on org creation
-      membershipLimit: 100,  // per-org cap on member count
+      membershipLimit: 100, // per-org cap on member count
       creatorRole: "owner",
       invitationExpiresIn: 60 * 60 * 24 * 7, // 7 days
       /**
@@ -529,7 +575,12 @@ export const auth = betterAuth({
         restricted: RESTRICTED_ROLE,
       },
       sendInvitationEmail: smtpEnabled
-        ? async (data) => {
+        ? async (data, request) => {
+            // Link-only is still Better Auth's normal, authorized invitation
+            // write; it merely skips transport so a self-hosted operator with
+            // no SMTP/cloud relay can copy the pending link from Team settings.
+            if (!invitationNeedsEmail(request)) return;
+
             // Use the instance's PUBLIC url so the accept link works from the
             // invitee's browser (a VPS/self-host box's real domain), not the
             // static loopback default. Falls back to the runtime-target dashboard
@@ -539,7 +590,7 @@ export const auth = betterAuth({
             // --public-url seed still wins inside resolveDashboardPublicUrl.
             await refreshSelfAppPublicUrl().catch(() => {});
             const inviteBase = resolveDashboardPublicUrl();
-            const inviteUrl = `${inviteBase}/accept-invite/${data.id}`;
+            const inviteUrl = `${inviteBase}${invitationClaimPath(data.id)}`;
             const email = organizationInviteEmail({
               invitee: { email: data.email },
               inviter: { name: data.inviter.user.name, email: data.inviter.user.email },
@@ -612,6 +663,31 @@ export const auth = betterAuth({
               message: "organizationId is required to create an invitation",
               code: "INVITE_MISSING_ORG",
             });
+          }
+
+          // Self-hosted account creation is invite-only. An org admin may still
+          // invite an EXISTING instance user, but only an INSTANCE admin may
+          // invite a new email that will mint a new account. Enforce this when
+          // the invitation is created so we never email an unusable link; the
+          // claim endpoint repeats the role check as defense in depth because
+          // the inviter's role can change before the link is opened.
+          if (!isSaasDeployment) {
+            const existingInvitee = await repos.user.findByEmail(invitation.email);
+            const instanceInviter = existingInvitee
+              ? undefined
+              : await repos.user.findById(inviter.id);
+            const creationMode = invitationAccountCreationMode({
+              accountExists: !!existingInvitee,
+              isSaas: false,
+              inviterIsInstanceAdmin: instanceInviter?.role === "admin",
+            });
+            if (creationMode === "disabled") {
+              throw new APIError("FORBIDDEN", {
+                message:
+                  "Only an instance administrator can invite someone who does not yet have an account.",
+                code: "INVITE_NEW_ACCOUNT_REQUIRES_INSTANCE_ADMIN",
+              });
+            }
           }
 
           const since = new Date(Date.now() - INVITE_RATE_LIMIT_WINDOW_MS);
@@ -727,8 +803,8 @@ export const auth = betterAuth({
           //      personal org. The column is NOT NULL by schema.
           //   4. Emit one audit row with the full summary.
           const memberSnapshot =
-            (organization as { _orgDeleteMemberSnapshot?: unknown })
-              ._orgDeleteMemberSnapshot ?? null;
+            (organization as { _orgDeleteMemberSnapshot?: unknown })._orgDeleteMemberSnapshot ??
+            null;
 
           let billingResult: {
             subscriptionsCancelled: number;
@@ -748,21 +824,14 @@ export const auth = betterAuth({
 
           let grantsDeleted = 0;
           try {
-            grantsDeleted = await repos.resourceGrant.deleteByOrganization(
-              organization.id,
-            );
+            grantsDeleted = await repos.resourceGrant.deleteByOrganization(organization.id);
           } catch (err) {
-            console.error(
-              "[organizationHooks.afterDeleteOrganization] grant cleanup failed:",
-              err,
-            );
+            console.error("[organizationHooks.afterDeleteOrganization] grant cleanup failed:", err);
           }
 
           let sessionsRepointed = 0;
           try {
-            sessionsRepointed = await repos.session.clearActiveOrganizationId(
-              organization.id,
-            );
+            sessionsRepointed = await repos.session.clearActiveOrganizationId(organization.id);
           } catch (err) {
             console.error(
               "[organizationHooks.afterDeleteOrganization] session re-point failed:",
@@ -784,8 +853,7 @@ export const auth = betterAuth({
               after: {
                 subscriptionsCancelled: billingResult?.subscriptionsCancelled ?? 0,
                 subscriptionsFailed: billingResult?.subscriptionsFailed ?? 0,
-                namespaceDecommissioned:
-                  billingResult?.namespaceDecommissioned ?? false,
+                namespaceDecommissioned: billingResult?.namespaceDecommissioned ?? false,
                 customerDeleted: billingResult?.customerDeleted ?? false,
                 billingErrors: billingResult?.errors ?? [],
                 grantsDeleted,
@@ -822,10 +890,7 @@ export const auth = betterAuth({
             await repos.resourceGrant.deleteByMember(organization.id, member.userId);
           } catch (err) {
             const message = safeErrorMessage(err);
-            console.error(
-              "[organizationHooks.afterRemoveMember] grant cleanup failed:",
-              err,
-            );
+            console.error("[organizationHooks.afterRemoveMember] grant cleanup failed:", err);
             await memberAudit.emit(
               { organizationId: organization.id, actorUserId: user.id },
               {
@@ -845,10 +910,7 @@ export const auth = betterAuth({
           // streaming this org's events to a removed member indefinitely. Best-
           // effort + audited, same as the grant cleanup above.
           try {
-            await repos.notificationSubscription.deleteAllForMember(
-              member.userId,
-              organization.id,
-            );
+            await repos.notificationSubscription.deleteAllForMember(member.userId, organization.id);
           } catch (err) {
             const message = safeErrorMessage(err);
             console.error(

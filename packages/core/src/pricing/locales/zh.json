@@ -24,20 +24,20 @@
   "features": {
     "everythingIn": "包含 {inherited} 的全部功能,另有:",
     "staticOnly": "仅支持静态站点:SSG、SPA 和纯 HTML",
-    "anyWorkload": "任意工作负载都能运行:容器、Compose 编排和后台任务",
-    "managedServices": "托管的 Postgres、Redis 和完整应用目录",
+    "anyWorkload": "任意工作负载:容器、Compose、后台任务、Postgres、Redis",
+    "runningServices": "{runningServices} 个同时运行的应用、数据库或后台任务",
+    "computeMinutes": "每月 {computeMinutes} 计算分钟",
     "buildMinutes": "每月 {buildMinutes} 分钟构建时长",
-    "credits": "每月 {credits} 计算积分",
+    "power": "每个应用最高可达 {powerCpu} vCPU 和 {powerRamGb} GB RAM",
+    "projects": "{maxProjects} 个项目",
+    "projectsUnlimited": "项目不限数量",
     "freeSubdomains": "{freeSubdomains} 个免费 {freeDomainSuffix} 子域名",
     "freeSubdomainsUnlimited": "免费 {freeDomainSuffix} 子域名不限数量",
+    "gitDeploys": "从 GitHub、GitLab 或任意 Git 远端部署",
     "customDomains": "自定义域名不限数量,含 TLS",
+    "deployLogs": "实时构建与部署日志",
+    "auditLog": "记录每一次变更的审计日志",
     "unlimitedSeats": "团队成员不限人数,永不按席位计费",
-    "previewDeploys": "每次推送都生成预览部署",
-    "backups": "每日备份,支持按时间点恢复",
-    "observability": "实时日志、指标和健康告警",
-    "mailServer": "内置邮件服务器:SMTP、IMAP 和网页邮箱",
-    "auditLog": "审计日志,保留期更长",
-    "sharedChannel": "共享的 Slack 或 Discord 频道",
     "sso": "SSO 与 SAML",
     "customLimits": "自定义配额,按合同商定",
     "dedicatedInfra": "专属基础设施与专属区域",
@@ -50,12 +50,7 @@
     "selfHostedUnlimited": "部署、项目、服务器和域名均不限数量",
     "selfHostedServices": "全部托管服务:Postgres、Redis、邮件服务",
     "selfHostedClients": "CLI、网页端和桌面端,共用一个后端",
-    "selfHostedFreeSubdomains": "连接 Cloud 后可获得 {freeSubdomains} 个免费 {freeDomainSuffix} 子域名",
-    "runningServices": "{runningServices} 个同时运行的服务:应用、数据库、后台任务",
-    "power": "每个服务最高可达 {powerCpu} vCPU 和 {powerRamGb} GB RAM",
-    "projects": "{maxProjects} 个项目",
-    "projectsUnlimited": "项目不限数量",
-    "meteredCredits": "计算、流量和存储都从你的每月积分中扣除"
+    "selfHostedFreeSubdomains": "连接 Cloud 后可获得 {freeSubdomains} 个免费 {freeDomainSuffix} 子域名"
   },
   "selfHosted": {
     "name": "自托管",
@@ -65,9 +60,9 @@
     "cta": "开始自托管"
   },
   "creditPacks": {
-    "pack_5k": "{credits} 积分",
-    "pack_25k": "{credits} 积分",
-    "pack_100k": "{credits} 积分"
+    "pack_5k": "{computeMinutes} 计算分钟",
+    "pack_25k": "{computeMinutes} 计算分钟",
+    "pack_100k": "{computeMinutes} 计算分钟"
   },
   "ui": {
     "perMonth": "/月",
@@ -83,6 +78,8 @@
     "billedMonthly": "按月计费,可随时取消",
     "campaignBadge": "立减 {percentOff}%",
     "campaignEnds": "优惠截止 {date}",
-    "wasPrice": "原价 {price}"
+    "wasPrice": "原价 {price}",
+    "standardTitle": "所有套餐均包含",
+    "creditPackNote": "≈ 小型应用运行 {appHours} 小时,或 {buildMinutes} 构建分钟"
   }
 }

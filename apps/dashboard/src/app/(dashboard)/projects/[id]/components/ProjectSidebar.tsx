@@ -8,7 +8,7 @@ import { useI18n, interpolate } from "@/components/i18n-provider";
 import { AppLogo } from "@/components/AppLogo";
 import { DomainSwitcher } from "@/components/routing/DomainSwitcher";
 import { formatDate } from "@/utils/date";
-import { getProjectStatus, PROJECT_STATUS_META, projectStatusLabel } from "@/utils/project-status";
+import { ProjectStatusBadge } from "@/components/shared/ProjectStatusBadge";
 import {
   LayoutDashboard,
   Activity,
@@ -78,8 +78,6 @@ export const ProjectSidebar = () => {
     setPendingDomainAction,
   } = useProjectSettings();
   const { t } = useI18n();
-  const status = getProjectStatus(projectData);
-  const meta = PROJECT_STATUS_META[status];
   const domainsAttention = domainsNeedAttention(projectData, domainsData);
 
   // Route switch: pick which domain the Production line shows/opens (shared via
@@ -167,11 +165,10 @@ export const ProjectSidebar = () => {
               </div>
             </div>
           </div>
-          <span
-            className={`shrink-0 inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-semibold ${meta.badge}`}
-          >
-            {projectStatusLabel(status, t)}
-          </span>
+          <ProjectStatusBadge
+            project={projectData}
+            className="shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold"
+          />
         </div>
 
         <div className="mt-4 space-y-3">

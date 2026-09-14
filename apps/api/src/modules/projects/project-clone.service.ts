@@ -224,6 +224,7 @@ export async function cloneProjectToServer(input: {
     adopted: cloning.map((row) => row.name),
     // Identity: the rows carry the source's own names, so nothing is renamed.
     renames: {},
+    rowNameByDiscovered: {},
     // Reuse the image running right now for every copied service. Our tags exist on the source
     // host and in no registry, so without this the target's first deploy would try to pull one.
     handover: Object.fromEntries(

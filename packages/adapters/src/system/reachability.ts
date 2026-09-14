@@ -144,6 +144,72 @@ export function probeHttp(
   });
 }
 
+/**
+ * One HTTP GET to the local edge, asked AS a specific hostname.
+ *
+ * Separate from `probeHttp` for two reasons, both essential to a static route
+ * check: it sets an explicit `Host:` header (the edge picks its server block by
+ * that header, so without it every request lands on `default_server` and the
+ * answer says nothing about the route), and it returns the STATUS rather than a
+ * boolean, because 404 vs 403 vs 502 are three different diagnoses.
+ *
+ * Returns `null` when nothing answered — a connection error or a timeout is "no
+ * signal about this path", never "the path is broken".
+ */
+export function probeHostedHttp(opts: {
+  hostname: string;
+  path?: string;
+  port?: number;
+  timeoutMs?: number;
+}): Promise<{ status: number; served: boolean } | null> {
+  const { hostname, path = "/", port = 80, timeoutMs = 3000 } = opts;
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value: { status: number; served: boolean } | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const req = request(
+      {
+        host: "127.0.0.1",
+        port,
+        path,
+        method: "GET",
+        timeout: timeoutMs,
+        // Claim https so the :80 block SERVES instead of answering our own
+        // HTTP→HTTPS redirect before the doc root is consulted — see the curl twin in
+        // output-exists.ts for why a 301 here read as a healthy site.
+        headers: { Host: hostname, "X-Forwarded-Proto": "https" },
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        res.resume(); // drain so the socket can close
+        // 401/403 mean a POLICY answered — basic auth, an edge rules guard. The
+        // route resolved and the files were found, so this counts as served; only
+        // 404 and 5xx are the failure signals. Mirrors `statusIsServed` in
+        // output-exists.ts, which answers the same question for the curl path.
+        done(
+          status > 0
+            ? { status, served: (status >= 200 && status < 400) || status === 401 || status === 403 }
+            : null,
+        );
+      },
+    );
+    const fail = () => {
+      try {
+        req.destroy();
+      } catch {
+        /* already torn down */
+      }
+      done(null);
+    };
+    req.once("timeout", fail);
+    req.once("error", fail);
+    req.end();
+  });
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -1,11 +1,22 @@
 import type { BuildConfig } from "../types";
-import { packageManagerEnsureCommand } from "@repo/core";
+import { packageManagerEnsureCommand, nodeBinDirs } from "@repo/core";
 
 import { sq } from "./build-pipeline";
 import { normalizeDockerRootDirectory } from "./docker-paths";
 
 const DOCKER_BUILD_EVENT_PREFIX = "[openship-build]";
-const INLINE_BUILD_ENV_EXCLUDES = new Set(["FORCE_COLOR", "TERM"]);
+/**
+ * Project env vars that must never reach the inline `export` prefix on a RUN line.
+ *
+ * `PATH` is not a preference, it is a correctness gate: the prefix is emitted
+ * AFTER the stage-level `ENV PATH` (see nodeBinPathEnvLine), so a project that
+ * sets PATH — usually by copying a value out of another platform — silently
+ * deletes `node_modules/.bin` from the lookup path and every dependency binary
+ * goes back to exit 127. The image already knows its own PATH; a build step has
+ * no business restating it. Applies to the JS, static, PHP-asset and
+ * workspace-prepare recipes at once, since all four share buildEnvPrefix.
+ */
+const INLINE_BUILD_ENV_EXCLUDES = new Set(["FORCE_COLOR", "TERM", "PATH"]);
 
 function formatDockerBuildEvent(
   step: "clone" | "install" | "build",
@@ -64,6 +75,26 @@ function runtimeCopyDirectives(config: BuildConfig, sourceDir: string): string[]
 
 function needsMultiStage(config: BuildConfig): boolean {
   return config.buildImage !== config.runtimeImage;
+}
+
+/**
+ * `ENV PATH` for one stage, so a command naming a locally-installed binary
+ * (`next build`, `next start`) resolves — the failure in openship#623, where a
+ * detected `next build` reached `/bin/sh` with nothing on PATH and exited 127.
+ *
+ * ENV rather than an inline `export` inside the RUN line, because the same PATH is
+ * needed by three things an inline export cannot reach: the workspace-prepare step
+ * (its own RUN layer, emitted before the source WORKDIR), the container's start
+ * command (docker.ts sets `Cmd: ["sh","-c", startCommand]`, which overrides this
+ * file's CMD entirely but still inherits the image env), and any `docker exec` an
+ * operator runs. One line per stage covers all of them.
+ *
+ * ENV does not cross a `FROM`, so every stage that runs project code emits its own.
+ * Returns null for non-node package managers.
+ */
+function nodeBinPathEnvLine(packageManager: string | undefined, roots: string[]): string | null {
+  const dirs = nodeBinDirs(packageManager, roots);
+  return dirs.length > 0 ? `ENV PATH="${dirs.join(":")}:$PATH"` : null;
 }
 
 /** The monorepo workspace-prepare RUN line (root `pnpm install` etc.). This is
@@ -125,9 +156,22 @@ function installRunLine(config: BuildConfig, envPrefix: string): string | null {
 const JS_PACKAGE_MANAGERS = ["pnpm", "yarn", "bun", "npm"] as const;
 
 /**
+ * Package manager for a Node asset stage, sniffed from the build command itself
+ * (`pnpm install && pnpm build` → pnpm) rather than taken from the project's — on
+ * the PHP recipe `config.packageManager` is "composer", which says nothing about
+ * which JS PM the asset build needs. Falls back to npm: the stage is a Node image
+ * running a JS build either way, so its `node_modules/.bin` layout is npm's.
+ */
+function assetStagePackageManager(config: BuildConfig): string {
+  const command = config.buildCommand?.trim() ?? "";
+  return (
+    JS_PACKAGE_MANAGERS.find((pm) => new RegExp(`(^|\\s|&&\\s*)${pm}\\s`).test(command)) ?? "npm"
+  );
+}
+
+/**
  * Build step only, prepared for a Node stage: the corepack prelude is chosen
- * from the command itself (`pnpm install && pnpm build` → pnpm) rather than from
- * the project's package manager.
+ * from the command itself rather than from the project's package manager.
  */
 function buildOnlyRunLine(config: BuildConfig, envPrefix: string): string | null {
   const command = config.buildCommand?.trim() ?? "";
@@ -217,8 +261,13 @@ function generatePhpDockerfile(config: BuildConfig): string {
   if (installLine) lines.push(installLine);
 
   if (assetBuildLine) {
+    // The asset stage is a Node image running the JS build, so it needs the same
+    // PATH as a JS recipe — keyed off the command's own PM, not the project's
+    // ("composer" here). Without it a bare `vite build` override fails at 127.
+    const assetBinPath = nodeBinPathEnvLine(assetStagePackageManager(config), [sourceDir, "/workspace"]);
     lines.push(
       `FROM ${PHP_ASSET_BUILD_IMAGE} AS assets`,
+      ...(assetBinPath ? [assetBinPath] : []),
       `WORKDIR /workspace`,
       `COPY . /workspace`,
       `WORKDIR ${sourceDir}`,
@@ -288,6 +337,36 @@ function staticNginxTemplateLines(port: number): string[] {
  * empty or wrong dir when `rootDirectory` / `outputDirectory` handling shifts, so
  * both the Dockerfile and `buildStaticToHost` call this.
  */
+/**
+ * The builder stage's WORKDIR — the directory `COPY . /workspace` lands the build
+ * context in, offset by `rootDirectory` for a monorepo sub-app.
+ *
+ * Exported so the static extractor can ask the one question it cannot answer
+ * locally: is this project's doc-root the same directory as its build context? It
+ * is exactly when `outputDirectory` is empty or ".", and that is the case where
+ * the context's own build files (`.dockerignore`, the generated Dockerfile) would
+ * otherwise be published as site content.
+ */
+export function builderContextRoot(config: BuildConfig): string {
+  return builderSourceDir(normalizeDockerRootDirectory(config.rootDirectory, config.localPath));
+}
+
+/**
+ * Is this a TOP-LEVEL doc-root entry that is a build input rather than content?
+ *
+ * `Dockerfile.*` covers both the single-app generated name (`Dockerfile.openship`)
+ * and the compose batch builder's per-service one
+ * (`Dockerfile.openship.<sessionId>`), plus a repo's own `Dockerfile.prod`.
+ */
+export function isExcludedDocRootEntry(name: string): boolean {
+  return (
+    name === ".dockerignore" ||
+    name === ".git" ||
+    name === "Dockerfile" ||
+    name.startsWith("Dockerfile.")
+  );
+}
+
 export function staticBuilderOutputPath(config: BuildConfig): string {
   const sourceDir = builderSourceDir(
     normalizeDockerRootDirectory(config.rootDirectory, config.localPath),
@@ -313,11 +392,10 @@ function generateStaticDockerfile(config: BuildConfig): string {
     .map((line) => `'${line}'`)
     .join(" ");
 
-  const lines: string[] = [
-    `FROM ${config.buildImage} AS builder`,
-    `WORKDIR /workspace`,
-    `COPY . /workspace`,
-  ];
+  const lines: string[] = [`FROM ${config.buildImage} AS builder`];
+  const buildBinPath = nodeBinPathEnvLine(config.packageManager, [sourceDir, "/workspace"]);
+  if (buildBinPath) lines.push(buildBinPath);
+  lines.push(`WORKDIR /workspace`, `COPY . /workspace`);
   if (workspacePrepare) {
     lines.push(workspacePrepareRunLine(config, envPrefix, workspacePrepare));
   }
@@ -363,17 +441,17 @@ export function generateDockerfile(config: BuildConfig): string {
   const envPrefix = buildEnvPrefix(config.envVars);
   const workspacePrepare = config.workspacePrepareCommand?.trim();
 
-  const lines: string[] = multiStage
-    ? [
-        `FROM ${config.buildImage} AS builder`,
-        `WORKDIR /workspace`,
-        `COPY . /workspace`,
-      ]
-    : [
-        `FROM ${config.runtimeImage}`,
-        `WORKDIR /workspace`,
-        `COPY . /workspace`,
-      ];
+  const lines: string[] = [
+    multiStage ? `FROM ${config.buildImage} AS builder` : `FROM ${config.runtimeImage}`,
+  ];
+
+  // Ahead of COPY so the layer survives every source change. On the single-stage
+  // path this is also the runtime stage — WORKDIR is left at `sourceDir` and
+  // node_modules is right there — so one line covers build AND start.
+  const buildBinPath = nodeBinPathEnvLine(config.packageManager, [sourceDir, "/workspace"]);
+  if (buildBinPath) lines.push(buildBinPath);
+
+  lines.push(`WORKDIR /workspace`, `COPY . /workspace`);
 
   // Monorepo workspace prepare: runs ONCE at /workspace (repo root)
   // before we cd into the sub-app and run the per-service install.
@@ -400,6 +478,10 @@ export function generateDockerfile(config: BuildConfig): string {
     lines.push(`FROM ${config.runtimeImage} AS runtime`);
     lines.push(...runtimeCopyDirectives(config, sourceDir));
     lines.push(`WORKDIR /app`);
+    // The copy retargets `sourceDir` → /app, so the runtime stage needs its own
+    // ENV (ENV does not cross a FROM) pointing at the new location.
+    const runtimeBinPath = nodeBinPathEnvLine(config.packageManager, ["/app"]);
+    if (runtimeBinPath) lines.push(runtimeBinPath);
   }
   lines.push(`EXPOSE ${config.port}`);
   if (config.startCommand) {

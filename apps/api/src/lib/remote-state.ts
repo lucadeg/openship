@@ -33,6 +33,10 @@ export function isConnectionLoss(err: unknown): boolean {
     /timed out|timeout|etimedout|econnreset|econnrefused|ehostunreach|enetunreach/.test(msg) ||
     msg.includes("channel open failure") ||
     msg.includes("open failed") ||
+    // A serialized SshExecRequestError loses its type at result boundaries.
+    // Match ssh2's complete sentinel only; remote stderr such as "unable to
+    // execute helper" is an operation failure, not lost connectivity.
+    msg === "unable to exec" ||
     // Deliberately here and NOT in the adapters' retryable set, because the two lists
     // answer different questions. "Did we reach the host?" — no, so a 503 naming the
     // target beats a 500 blaming the request. "Should we run the whole callback again?" —

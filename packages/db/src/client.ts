@@ -15,6 +15,8 @@ import { acquirePgliteLock, releasePgliteLock } from "./pglite-lock";
  * Every repo and service receives this; they never know which driver runs beneath.
  */
 export type Database = NodePgDatabase<typeof schema> | PgliteDatabase<typeof schema>;
+/** Transaction handle shared by the Postgres and PGlite drivers. */
+export type DatabaseTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 /** Which driver is active - useful for conditional logic in adapters */
 export type Driver = "pg" | "pglite";
@@ -33,6 +35,11 @@ export function getDriver(): Driver {
  * PGlite has no pool (and doesn't need cross-process locking).
  */
 let _pgPool: Pool | undefined;
+
+/** Pool capacity shared by ordinary queries and session advisory locks. Lock
+ *  callers reserve one slot below this ceiling so their callbacks can still
+ *  execute repository queries instead of deadlocking the whole pool. */
+export const PG_POOL_MAX = 20;
 
 export function getPgPool(): Pool {
   if (!_pgPool) {
@@ -77,8 +84,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // baked into a `bun build --compile` binary (the desktop app), where the .sql
 // files aren't present. OPENSHIP_MIGRATIONS_DIR points that build at the
 // migrations shipped alongside the binary as a data asset.
-const MIGRATIONS_DIR =
-  process.env.OPENSHIP_MIGRATIONS_DIR ?? resolve(__dirname, "../drizzle");
+const MIGRATIONS_DIR = process.env.OPENSHIP_MIGRATIONS_DIR ?? resolve(__dirname, "../drizzle");
 
 // ─── Data directory ──────────────────────────────────────────────────────────
 
@@ -97,9 +103,10 @@ function resolvePgliteDataDir(): string {
     // Expand a leading ~ ourselves: env files (loaded via `node --env-file`) do
     // NOT shell-expand, so `PGLITE_DATA_DIR=~/.openship/data-saas` would
     // otherwise resolve literally. `resolve` handles relative paths from cwd.
-    const expanded = explicit === "~" || explicit.startsWith("~/")
-      ? resolve(home, explicit.slice(1).replace(/^\/+/, ""))
-      : explicit;
+    const expanded =
+      explicit === "~" || explicit.startsWith("~/")
+        ? resolve(home, explicit.slice(1).replace(/^\/+/, ""))
+        : explicit;
     return resolve(expanded);
   }
 
@@ -269,7 +276,7 @@ async function createPgClient(url: string): Promise<Database> {
   const { drizzle } = await import("drizzle-orm/node-postgres");
   const pool = new Pool({
     connectionString: url,
-    max: 20,
+    max: PG_POOL_MAX,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 5_000,
   });

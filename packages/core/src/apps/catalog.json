@@ -121,6 +121,7 @@
             "GOTRUE_API_HOST": "0.0.0.0",
             "GOTRUE_API_PORT": "9999",
             "API_EXTERNAL_URL": "{{publicUrl:kong}}",
+            "GOTRUE_SAML_EXTERNAL_URL": "{{publicUrl:kong}}/auth/v1",
             "GOTRUE_DB_DRIVER": "postgres",
             "GOTRUE_DB_DATABASE_URL": "postgres://supabase_auth_admin:{{config:POSTGRES_PASSWORD}}@db:5432/postgres",
             "GOTRUE_SITE_URL": "{{publicUrl:kong}}",
@@ -377,7 +378,7 @@
         {
           "service": "kong",
           "path": "/usr/local/kong/kong.yml",
-          "content": "_format_version: \"3.0\"\n_transform: true\n\nconsumers:\n  - username: DASHBOARD\n  - username: anon\n    keyauth_credentials:\n      - key: {{config:ANON_KEY}}\n  - username: service_role\n    keyauth_credentials:\n      - key: {{config:SERVICE_ROLE_KEY}}\n\nacls:\n  - consumer: anon\n    group: anon\n  - consumer: service_role\n    group: admin\n\nbasicauth_credentials:\n  - consumer: DASHBOARD\n    username: {{config:DASHBOARD_USERNAME}}\n    password: {{config:DASHBOARD_PASSWORD}}\n\nservices:\n  - name: auth-v1-open\n    url: http://auth:9999/verify\n    routes:\n      - name: auth-v1-open\n        strip_path: true\n        paths:\n          - /auth/v1/verify\n    plugins:\n      - name: cors\n  - name: auth-v1-open-callback\n    url: http://auth:9999/callback\n    routes:\n      - name: auth-v1-open-callback\n        strip_path: true\n        paths:\n          - /auth/v1/callback\n    plugins:\n      - name: cors\n  - name: auth-v1-open-authorize\n    url: http://auth:9999/authorize\n    routes:\n      - name: auth-v1-open-authorize\n        strip_path: true\n        paths:\n          - /auth/v1/authorize\n    plugins:\n      - name: cors\n  - name: auth-v1\n    url: http://auth:9999/\n    routes:\n      - name: auth-v1-all\n        strip_path: true\n        paths:\n          - /auth/v1/\n    plugins:\n      - name: cors\n      - name: key-auth\n        config:\n          hide_credentials: false\n      - name: acl\n        config:\n          hide_groups_header: true\n          allow:\n            - admin\n            - anon\n  - name: rest-v1\n    url: http://rest:3000/\n    routes:\n      - name: rest-v1-all\n        strip_path: true\n        paths:\n          - /rest/v1/\n    plugins:\n      - name: cors\n      - name: key-auth\n        config:\n          hide_credentials: true\n      - name: acl\n        config:\n          hide_groups_header: true\n          allow:\n            - admin\n            - anon\n  - name: graphql-v1\n    url: http://rest:3000/rpc/graphql\n    routes:\n      - name: graphql-v1-all\n        strip_path: true\n        paths:\n          - /graphql/v1\n    plugins:\n      - name: cors\n      - name: key-auth\n        config:\n          hide_credentials: true\n      - name: request-transformer\n        config:\n          add:\n            headers:\n              - Content-Profile:graphql_public\n      - name: acl\n        config:\n          hide_groups_header: true\n          allow:\n            - admin\n            - anon\n  - name: realtime-v1-ws\n    url: http://realtime-dev.supabase-realtime:4000/socket/\n    routes:\n      - name: realtime-v1-ws\n        strip_path: true\n        paths:\n          - /realtime/v1/\n    plugins:\n      - name: cors\n      - name: key-auth\n        config:\n          hide_credentials: false\n      - name: acl\n        config:\n          hide_groups_header: true\n          allow:\n            - admin\n            - anon\n  - name: storage-v1\n    url: http://storage:5000/\n    routes:\n      - name: storage-v1-all\n        strip_path: true\n        paths:\n          - /storage/v1/\n    plugins:\n      - name: cors\n  - name: meta\n    url: http://meta:8080/\n    routes:\n      - name: meta-all\n        strip_path: true\n        paths:\n          - /pg/\n    plugins:\n      - name: key-auth\n        config:\n          hide_credentials: false\n      - name: acl\n        config:\n          hide_groups_header: true\n          allow:\n            - admin\n  - name: dashboard\n    url: http://studio:3000/\n    routes:\n      - name: dashboard-all\n        strip_path: true\n        paths:\n          - /\n    plugins:\n      - name: cors\n      - name: basic-auth\n        config:\n          hide_credentials: true\n"
+          "content": "_format_version: \"3.0\"\n_transform: true\n\nconsumers:\n  - username: DASHBOARD\n  - username: anon\n    keyauth_credentials:\n      - key: {{config:ANON_KEY}}\n  - username: service_role\n    keyauth_credentials:\n      - key: {{config:SERVICE_ROLE_KEY}}\n\nacls:\n  - consumer: anon\n    group: anon\n  - consumer: service_role\n    group: admin\n\nbasicauth_credentials:\n  - consumer: DASHBOARD\n    username: {{config:DASHBOARD_USERNAME}}\n    password: {{config:DASHBOARD_PASSWORD}}\n\nservices:\n  - name: auth-v1-open\n    url: http://auth:9999/verify\n    routes:\n      - name: auth-v1-open\n        strip_path: true\n        paths:\n          - /auth/v1/verify\n    plugins:\n      - name: cors\n  - name: auth-v1-open-callback\n    url: http://auth:9999/callback\n    routes:\n      - name: auth-v1-open-callback\n        strip_path: true\n        paths:\n          - /auth/v1/callback\n    plugins:\n      - name: cors\n  - name: auth-v1-open-authorize\n    url: http://auth:9999/authorize\n    routes:\n      - name: auth-v1-open-authorize\n        strip_path: true\n        paths:\n          - /auth/v1/authorize\n    plugins:\n      - name: cors\n  - name: auth-v1-open-sso-acs\n    url: http://auth:9999/sso/saml/acs\n    routes:\n      - name: auth-v1-open-sso-acs\n        strip_path: true\n        paths:\n          - /auth/v1/sso/saml/acs\n    plugins:\n      - name: cors\n  - name: auth-v1-open-sso-metadata\n    url: http://auth:9999/sso/saml/metadata\n    routes:\n      - name: auth-v1-open-sso-metadata\n        strip_path: true\n        paths:\n          - /auth/v1/sso/saml/metadata\n    plugins:\n      - name: cors\n  - name: auth-v1\n    url: http://auth:9999/\n    routes:\n      - name: auth-v1-all\n        strip_path: true\n        paths:\n          - /auth/v1/\n    plugins:\n      - name: cors\n      - name: key-auth\n        config:\n          hide_credentials: false\n      - name: acl\n        config:\n          hide_groups_header: true\n          allow:\n            - admin\n            - anon\n  - name: rest-v1\n    url: http://rest:3000/\n    routes:\n      - name: rest-v1-all\n        strip_path: true\n        paths:\n          - /rest/v1/\n    plugins:\n      - name: cors\n      - name: key-auth\n        config:\n          hide_credentials: true\n      - name: acl\n        config:\n          hide_groups_header: true\n          allow:\n            - admin\n            - anon\n  - name: graphql-v1\n    url: http://rest:3000/rpc/graphql\n    routes:\n      - name: graphql-v1-all\n        strip_path: true\n        paths:\n          - /graphql/v1\n    plugins:\n      - name: cors\n      - name: key-auth\n        config:\n          hide_credentials: true\n      - name: request-transformer\n        config:\n          add:\n            headers:\n              - Content-Profile:graphql_public\n      - name: acl\n        config:\n          hide_groups_header: true\n          allow:\n            - admin\n            - anon\n  - name: realtime-v1-ws\n    url: http://realtime-dev.supabase-realtime:4000/socket/\n    routes:\n      - name: realtime-v1-ws\n        strip_path: true\n        paths:\n          - /realtime/v1/\n    plugins:\n      - name: cors\n      - name: key-auth\n        config:\n          hide_credentials: false\n      - name: acl\n        config:\n          hide_groups_header: true\n          allow:\n            - admin\n            - anon\n  - name: storage-v1\n    url: http://storage:5000/\n    routes:\n      - name: storage-v1-all\n        strip_path: true\n        paths:\n          - /storage/v1/\n    plugins:\n      - name: cors\n  - name: meta\n    url: http://meta:8080/\n    routes:\n      - name: meta-all\n        strip_path: true\n        paths:\n          - /pg/\n    plugins:\n      - name: key-auth\n        config:\n          hide_credentials: false\n      - name: acl\n        config:\n          hide_groups_header: true\n          allow:\n            - admin\n  - name: dashboard\n    url: http://studio:3000/\n    routes:\n      - name: dashboard-all\n        strip_path: true\n        paths:\n          - /\n    plugins:\n      - name: cors\n      - name: basic-auth\n        config:\n          hide_credentials: true\n"
         },
         {
           "service": "db",
@@ -2046,6 +2047,7 @@
     {
       "available": true,
       "verified": true,
+      "minEngine": "0.6.6",
       "id": "minio",
       "name": "MinIO",
       "description": "S3-compatible object storage with a web console — point any S3 client (aws-cli, SDKs) at it, or bind a bucket straight into another project's uploads.",
@@ -2540,6 +2542,7 @@
     {
       "available": true,
       "verified": false,
+      "minEngine": "0.6.6",
       "minResources": {
         "memoryMb": 4096,
         "cpuCores": 2
@@ -2719,6 +2722,7 @@
     {
       "available": true,
       "verified": false,
+      "minEngine": "0.6.6",
       "minResources": {
         "memoryMb": 16384,
         "cpuCores": 4
@@ -3497,6 +3501,7 @@
     {
       "available": true,
       "verified": false,
+      "minEngine": "0.6.6",
       "id": "redis",
       "name": "Valkey (Redis)",
       "description": "In-memory data store for caching, sessions, rate limits, and queues — Valkey, the open-source Redis fork. Drop-in Redis-compatible: point any redis client at it. Ships with RedisInsight, a browser UI that arrives already connected to this instance.",
@@ -3975,6 +3980,7 @@
     {
       "available": true,
       "verified": false,
+      "minEngine": "0.6.6",
       "id": "clickhouse",
       "name": "ClickHouse",
       "description": "The columnar SQL database for analytics — billions of rows scanned per second. Ships with the CH-UI console, so you get a SQL editor, schema browser and dashboards the moment it installs: sign in with the ClickHouse user and password below, no extra setup.",
@@ -4239,6 +4245,318 @@
           "allowedModes": [
             "internal"
           ]
+        }
+      ]
+    },
+    {
+      "available": true,
+      "verified": true,
+      "id": "mindwire",
+      "name": "MindWire",
+      "description": "Run coding-agent runtimes behind a self-hosted control plane. MindWire keeps the runtime private and gives you one console to manage agents, credentials, and sessions.",
+      "repository": "https://github.com/oblien/mindwire",
+      "kind": "template",
+      "logo": "mindwire",
+      "category": "automation",
+      "tags": [
+        "ai",
+        "agents",
+        "coding",
+        "control-plane"
+      ],
+      "framework": "docker-compose",
+      "services": [
+        {
+          "name": "runtime",
+          "image": "ghcr.io/oblien/mindwire-runtime:0.1.3",
+          "environment": {
+            "ADDR": "0.0.0.0:8790",
+            "AGENT_TYPE": "claude-code",
+            "DAEMON_TOKEN": "{{config:MINDWIRE_RUNTIME_TOKEN}}"
+          },
+          "secretEnv": [
+            "DAEMON_TOKEN"
+          ],
+          "volumes": [
+            "mindwire_runtime:/home/node"
+          ],
+          "restart": "unless-stopped"
+        },
+        {
+          "name": "console",
+          "image": "ghcr.io/oblien/mindwire-console:0.1.3",
+          "exposedPort": 8787,
+          "exposed": true,
+          "routes": [
+            {
+              "port": 8787
+            }
+          ],
+          "dependsOn": [
+            "runtime"
+          ],
+          "environment": {
+            "NODE_ENV": "production",
+            "PORT": "8787",
+            "BASE_URL": "{{publicUrl:console}}",
+            "AUTH_DB_PATH": "/data/auth.db",
+            "CONSOLE_MODE": "self-hosted",
+            "CONSOLE_USERNAME": "{{config:CONSOLE_USERNAME}}",
+            "CONSOLE_PASSWORD": "{{config:CONSOLE_PASSWORD}}",
+            "AUTH_SECRET": "{{config:AUTH_SECRET}}",
+            "SECRETS_ENCRYPTION_KEY": "{{config:SECRETS_ENCRYPTION_KEY}}",
+            "ALLOW_LOCAL_RUNTIME": "true",
+            "ALLOW_SSH_RUNTIME": "true",
+            "ALLOW_DOCKER_RUNTIME": "true",
+            "ALLOW_REMOTE_RUNTIME": "true",
+            "DAEMON_URL": "http://runtime:8790",
+            "MINDWIRE_RUNTIME_TOKEN": "{{config:MINDWIRE_RUNTIME_TOKEN}}",
+            "SEED_DEFAULT_DAEMON": "true"
+          },
+          "secretEnv": [
+            "CONSOLE_PASSWORD",
+            "AUTH_SECRET",
+            "SECRETS_ENCRYPTION_KEY",
+            "MINDWIRE_RUNTIME_TOKEN"
+          ],
+          "volumes": [
+            "mindwire_console:/data"
+          ],
+          "healthcheck": {
+            "test": [
+              "CMD-SHELL",
+              "node -e \"fetch('http://127.0.0.1:8787/api/ping').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""
+            ],
+            "interval": "10s",
+            "timeout": "5s",
+            "retries": 12,
+            "startPeriod": "20s"
+          },
+          "restart": "unless-stopped"
+        }
+      ],
+      "configFields": [
+        {
+          "key": "CONSOLE_USERNAME",
+          "service": "console",
+          "label": "Console username",
+          "help": "The single owner account for this self-hosted console.",
+          "default": "admin",
+          "required": true
+        },
+        {
+          "key": "CONSOLE_PASSWORD",
+          "service": "console",
+          "label": "Console password",
+          "help": "Auto-generated. Use this with the owner username to sign in.",
+          "type": "password",
+          "generate": "secret",
+          "secret": true
+        },
+        {
+          "key": "AUTH_SECRET",
+          "service": "console",
+          "label": "Session signing secret",
+          "help": "Auto-generated. Keep it stable so existing sign-in sessions remain valid after upgrades.",
+          "generate": "secret",
+          "secret": true
+        },
+        {
+          "key": "SECRETS_ENCRYPTION_KEY",
+          "service": "console",
+          "label": "Credential vault key",
+          "help": "Auto-generated 32-byte key used to encrypt provider and runtime credentials at rest.",
+          "generate": "secret",
+          "secret": true
+        },
+        {
+          "key": "MINDWIRE_RUNTIME_TOKEN",
+          "service": "runtime",
+          "label": "Runtime bearer token",
+          "help": "Auto-generated. Authenticates the Console to the private MindWire runtime.",
+          "generate": "secret",
+          "secret": true
+        }
+      ],
+      "management": {
+        "kind": "schema"
+      },
+      "connection": {
+        "title": "Sign in to MindWire",
+        "description": "Open the Console and sign in with the generated owner credentials. The runtime stays private to this deployment.",
+        "guide": {
+          "intro": "MindWire gives you a production control plane for coding-agent runtimes without exposing the runtime API to the public internet.",
+          "defaultMode": "public"
+        },
+        "outputs": [
+          {
+            "id": "console",
+            "label": "MindWire Console",
+            "source": "publicUrl:console",
+            "kind": "url",
+            "recommended": true,
+            "help": "Open the control plane in your browser."
+          },
+          {
+            "id": "username",
+            "label": "Owner username",
+            "source": "env:console:CONSOLE_USERNAME"
+          },
+          {
+            "id": "password",
+            "label": "Owner password",
+            "source": "env:console:CONSOLE_PASSWORD",
+            "secret": true
+          }
+        ]
+      },
+      "endpoints": [
+        {
+          "service": "console",
+          "port": 8787,
+          "label": "MindWire Console",
+          "kind": "http",
+          "defaultMode": "domain"
+        }
+      ]
+    },
+    {
+      "$schema": "https://openship.io/app.schema.json",
+      "available": true,
+      "minEngine": "0.6.6",
+      "id": "pocketbase",
+      "name": "PocketBase",
+      "description": "Self-hosted PocketBase with auth, a realtime SQLite database, file storage, and an admin dashboard in one small service.",
+      "repository": "https://github.com/pocketbase/pocketbase",
+      "kind": "template",
+      "logo": "pocketbase",
+      "category": "backend",
+      "tags": [
+        "auth",
+        "database",
+        "sqlite",
+        "realtime"
+      ],
+      "framework": "docker-compose",
+      "services": [
+        {
+          "name": "pocketbase",
+          "build": {
+            "dockerfile": "FROM alpine:3.24.1 AS downloader\nARG PB_VERSION=0.40.1\nRUN apk add --no-cache ca-certificates unzip wget \\\n    && ARCH=$(uname -m) \\\n    && case \"$ARCH\" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; *) echo \"Unsupported architecture: $ARCH\" >&2; exit 1 ;; esac \\\n    && wget -q https://github.com/pocketbase/pocketbase/releases/download/v${PB_VERSION}/checksums.txt -O /tmp/checksums.txt \\\n    && wget -q https://github.com/pocketbase/pocketbase/releases/download/v${PB_VERSION}/pocketbase_${PB_VERSION}_linux_${ARCH}.zip -O /tmp/pocketbase_${PB_VERSION}_linux_${ARCH}.zip \\\n    && cd /tmp \\\n    && grep \" pocketbase_${PB_VERSION}_linux_${ARCH}.zip$\" checksums.txt | sha256sum -c - \\\n    && unzip pocketbase_${PB_VERSION}_linux_${ARCH}.zip -d /pb\nFROM alpine:3.24.1\nRUN apk add --no-cache ca-certificates su-exec \\\n    && addgroup -S pocketbase \\\n    && adduser -S -G pocketbase -h /pb pocketbase\nCOPY --chown=pocketbase:pocketbase --from=downloader /pb/pocketbase /pb/pocketbase\nCOPY --chown=pocketbase:pocketbase pocketbase/entrypoint.sh /pb/entrypoint.sh\nRUN chmod 755 /pb/entrypoint.sh\nWORKDIR /pb\nENTRYPOINT [\"/pb/entrypoint.sh\"]\nCMD [\"/pb/pocketbase\", \"serve\", \"--http=0.0.0.0:8090\", \"--encryptionEnv=PB_ENCRYPTION_KEY\"]\n",
+            "files": [
+              {
+                "path": "entrypoint.sh",
+                "content": "#!/bin/sh\nset -eu\nmkdir -p /pb/pb_data\nchown pocketbase:pocketbase /pb/pb_data\nexport PB_ENCRYPTION_KEY=\"$(printf '%.32s' \"$PB_ENCRYPTION_SEED\")\"\nif [ ! -e /pb/pb_data/.openship-superuser ]; then\n  su-exec pocketbase /pb/pocketbase superuser upsert \"$POCKETBASE_SUPERUSER_EMAIL\" \"$POCKETBASE_SUPERUSER_PASSWORD\" --dir=/pb/pb_data --encryptionEnv=PB_ENCRYPTION_KEY >/dev/null\n  su-exec pocketbase touch /pb/pb_data/.openship-superuser\nfi\nexec su-exec pocketbase \"$@\"\n"
+              }
+            ]
+          },
+          "environment": {
+            "GOMEMLIMIT": "512MiB"
+          },
+          "secretEnv": [
+            "PB_ENCRYPTION_SEED",
+            "POCKETBASE_SUPERUSER_PASSWORD"
+          ],
+          "ports": [
+            "8090:8090"
+          ],
+          "exposedPort": 8090,
+          "exposed": true,
+          "volumes": [
+            "pocketbase_data:/pb/pb_data"
+          ],
+          "healthcheck": {
+            "test": [
+              "CMD",
+              "wget",
+              "-qO-",
+              "http://127.0.0.1:8090/api/health"
+            ],
+            "interval": "5s",
+            "timeout": "3s",
+            "retries": 20,
+            "startPeriod": "10s"
+          },
+          "stopGracePeriod": "30s",
+          "restart": "unless-stopped"
+        }
+      ],
+      "configFields": [
+        {
+          "key": "PB_ENCRYPTION_SEED",
+          "service": "pocketbase",
+          "label": "Settings encryption seed",
+          "help": "Derives the stable 32-character key that encrypts PocketBase settings in the data volume.",
+          "generate": "secret",
+          "secret": true
+        },
+        {
+          "key": "POCKETBASE_SUPERUSER_PASSWORD",
+          "service": "pocketbase",
+          "label": "Initial superuser password",
+          "help": "Auto-generated for the first deployment and shown in the connection card.",
+          "generate": "secret",
+          "secret": true
+        },
+        {
+          "key": "POCKETBASE_SUPERUSER_EMAIL",
+          "service": "pocketbase",
+          "label": "Superuser email",
+          "help": "Email for the superuser created during the first deployment.",
+          "type": "text",
+          "default": "admin@openship.local",
+          "required": true
+        }
+      ],
+      "connection": {
+        "title": "Connect to PocketBase",
+        "description": "Use the public URL from browsers and other projects. The admin dashboard is available at /_/.",
+        "guide": {
+          "intro": "PocketBase stores auth, records, and files in one persistent SQLite-backed volume.",
+          "useHint": "Create scoped credentials for automation, configure off-host backups, and point each app at this URL.",
+          "defaultMode": "public"
+        },
+        "outputs": [
+          {
+            "id": "url",
+            "label": "PocketBase URL",
+            "source": "publicUrl:pocketbase",
+            "kind": "url",
+            "envKey": "POCKETBASE_URL",
+            "recommended": true
+          },
+          {
+            "id": "email",
+            "label": "Superuser email",
+            "source": "env:pocketbase:POCKETBASE_SUPERUSER_EMAIL",
+            "envKey": "POCKETBASE_SUPERUSER_EMAIL"
+          },
+          {
+            "id": "password",
+            "label": "Initial superuser password",
+            "help": "Use this installation credential until you change the password in PocketBase.",
+            "source": "env:pocketbase:POCKETBASE_SUPERUSER_PASSWORD",
+            "envKey": "POCKETBASE_SUPERUSER_PASSWORD",
+            "secret": true
+          }
+        ]
+      },
+      "provides": [
+        {
+          "id": "pocketbase",
+          "outputRefs": [
+            "url"
+          ],
+          "category": "database"
+        }
+      ],
+      "endpoints": [
+        {
+          "service": "pocketbase",
+          "port": 8090,
+          "label": "PocketBase API and dashboard",
+          "kind": "http",
+          "defaultMode": "domain"
         }
       ]
     }

@@ -102,6 +102,47 @@ export const WEBMAIL_SETTING_KEYS = {
 const OUR_IMAP_PORT = "993";
 const OUR_SMTP_PORT = "465";
 
+function webmailBackendSettings(
+  service: string,
+  backend: { imapHost: string; imapPort: string; smtpHost: string; smtpPort: string },
+  trustedOrigins?: string,
+): AppSettingChange[] {
+  return [
+    { service, key: WEBMAIL_SETTING_KEYS.imapHost, value: backend.imapHost },
+    { service, key: WEBMAIL_SETTING_KEYS.imapPort, value: backend.imapPort },
+    { service, key: WEBMAIL_SETTING_KEYS.smtpHost, value: backend.smtpHost },
+    { service, key: WEBMAIL_SETTING_KEYS.smtpPort, value: backend.smtpPort },
+    ...(trustedOrigins === undefined
+      ? []
+      : [{ service, key: WEBMAIL_SETTING_KEYS.trustedOrigins, value: trustedOrigins }]),
+  ];
+}
+
+/**
+ * Managed webmail always submits to our local Postfix, even when Postfix relays
+ * outbound mail through a provider. This pure plan is exported so the split-
+ * delivery boundary cannot regress into copying provider credentials/hosts into
+ * the webmail container (#391).
+ */
+export function managedMailWebmailSettings(
+  service: string,
+  installDomain: string,
+  publicHostname: string,
+  useProxyVariant: boolean,
+): AppSettingChange[] {
+  const mailHost = mailHostname(installDomain);
+  return webmailBackendSettings(
+    service,
+    {
+      imapHost: mailHost,
+      imapPort: OUR_IMAP_PORT,
+      smtpHost: mailHost,
+      smtpPort: OUR_SMTP_PORT,
+    },
+    useProxyVariant ? `https://${publicHostname}` : "",
+  );
+}
+
 // ─── Public shapes ───────────────────────────────────────────────────────────
 
 export type WebmailDeployTarget =
@@ -461,22 +502,15 @@ export async function startWebmailDeploy(
             customDomain: input.hostname,
           },
         ],
-    settings: [
-      { service: endpoint.service, key: WEBMAIL_SETTING_KEYS.imapHost, value: mailHost },
-      { service: endpoint.service, key: WEBMAIL_SETTING_KEYS.imapPort, value: OUR_IMAP_PORT },
-      { service: endpoint.service, key: WEBMAIL_SETTING_KEYS.smtpHost, value: mailHost },
-      { service: endpoint.service, key: WEBMAIL_SETTING_KEYS.smtpPort, value: OUR_SMTP_PORT },
-      {
-        service: endpoint.service,
-        key: WEBMAIL_SETTING_KEYS.trustedOrigins,
-        // The proxy variant has no route of its own, so the catalog's
-        // `{{publicUrl:webmail}}` resolves to nothing and sign-in would be
-        // refused as a cross-origin POST: pin the origin the browser sees.
-        // "" everywhere else CLEARS the override, handing the key back to the
-        // catalog token — which is what makes a hostname change self-correcting.
-        value: useProxyVariant ? `https://${input.hostname}` : "",
-      },
-    ],
+    // The proxy variant has no route of its own, so its trusted origin is the
+    // hostname the browser sees. Every other variant clears that override and
+    // hands the setting back to the catalog's `{{publicUrl:webmail}}` token.
+    settings: managedMailWebmailSettings(
+      endpoint.service,
+      installDomain,
+      input.hostname,
+      useProxyVariant,
+    ),
     deployTarget: input.target.kind === "cloud" ? "cloud" : "server",
     serverId: input.target.kind === "self" ? input.target.serverId : undefined,
     // The legacy row is gone by now, so this is a fresh install, not a redeploy.
@@ -521,28 +555,12 @@ export async function startExternalWebmailDeploy(
         customDomain: input.hostname,
       },
     ],
-    settings: [
-      {
-        service: endpoint.service,
-        key: WEBMAIL_SETTING_KEYS.imapHost,
-        value: input.backend.imapHost,
-      },
-      {
-        service: endpoint.service,
-        key: WEBMAIL_SETTING_KEYS.imapPort,
-        value: String(input.backend.imapPort),
-      },
-      {
-        service: endpoint.service,
-        key: WEBMAIL_SETTING_KEYS.smtpHost,
-        value: input.backend.smtpHost,
-      },
-      {
-        service: endpoint.service,
-        key: WEBMAIL_SETTING_KEYS.smtpPort,
-        value: String(input.backend.smtpPort),
-      },
-    ],
+    settings: webmailBackendSettings(endpoint.service, {
+      imapHost: input.backend.imapHost,
+      imapPort: String(input.backend.imapPort),
+      smtpHost: input.backend.smtpHost,
+      smtpPort: String(input.backend.smtpPort),
+    }),
     deployTarget: input.target.deployTarget,
     serverId: input.target.serverId,
   });

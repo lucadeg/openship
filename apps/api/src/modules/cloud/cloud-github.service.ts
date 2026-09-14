@@ -5,27 +5,25 @@
  *
  * Extracted from cloud-saas.controller. The handlers in that file now
  * only do HTML/JSON rendering — every policy decision (cookie allowlist,
- * org-owner binding, install-state attribution, installation lookup
+ * workspace binding, install-state attribution, installation lookup
  * with 404 mapping) lives here and is unit-testable in isolation.
  *
  * SECURITY: the 404-on-missing-installation guard in
  * `mintOrgInstallationToken` is the privilege-escalation boundary —
  * a caller-supplied installationId is intentionally NOT accepted.
- * The id is resolved server-side from (ownerUserId, owner).
+ * The id is resolved server-side from (organizationId, owner).
  */
 
+import crypto from "node:crypto";
 import { auth, COOKIE_PREFIX } from "../../lib/auth";
 import { cloudRuntimeTarget } from "../../config/env";
 import { repos } from "@repo/db";
 import { safeErrorMessage } from "@repo/core";
 import * as githubAuth from "../github/github.auth";
-import {
-  issueInstallState,
-  peekAndConsumeInstallState,
-} from "../../lib/github-install-state";
 import { createEphemeralStore } from "../../lib/ephemeral-store";
 import { buildBackgroundContext } from "../../lib/request-context";
 import { resolveOrgOwner } from "../../lib/org-actor";
+import { verifyGitHubInstallationForUser } from "../github/github.installation-verification";
 
 // ─── OAuth bridge store (shared between handoff + bridge handlers) ──────────
 //
@@ -208,20 +206,26 @@ export async function startGithubLinkFromBridgeToken(
 // ─── Install URL: org-bound state ────────────────────────────────────────────
 
 /**
- * Bind the install state to the org OWNER — the resulting GitHub
- * installation belongs to the org, not the team member who clicked
- * Install. Every team member sees + uses the same installations via
- * resolveCloudOwnerById. Solo SaaS users (personal org) bind to
- * themselves.
+ * Bind the install state to the authenticated user who initiated the flow and
+ * their active workspace. The installation itself is workspace-owned, while
+ * the initiating user is the GitHub identity used for anti-spoof verification
+ * and audit attribution.
  */
 export async function buildOrgScopedInstallUrl(
+  initiatingUserId: string,
   organizationId: string,
-): Promise<{ url: string; state: string; ownerUserId: string }> {
-  const { ownerUserId } = await resolveCloudOwnerById(organizationId);
-  const state = await issueInstallState(ownerUserId);
+): Promise<{ url: string; state: string }> {
+  const state = crypto.randomBytes(24).toString("base64url");
+  await repos.githubInstallState.purgeExpired().catch(() => 0);
+  await repos.githubInstallState.create({
+    state,
+    userId: initiatingUserId,
+    organizationId,
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+  });
   const baseUrl = githubAuth.getInstallUrl();
   const url = `${baseUrl}?state=${encodeURIComponent(state)}`;
-  return { url, state, ownerUserId };
+  return { url, state };
 }
 
 // ─── Install callback: state-based attribution ───────────────────────────────
@@ -232,6 +236,7 @@ export type GithubInstallAttributionResult =
   | { kind: "state-expired" }
   | { kind: "invalid-installation-id"; raw: string }
   | { kind: "pending-approval" }
+  | { kind: "forbidden"; message: string }
   | { kind: "failed"; installationId: number; error: string };
 
 export async function attributeGithubInstall(input: {
@@ -247,62 +252,66 @@ export async function attributeGithubInstall(input: {
     return { kind: "missing-params" };
   }
 
-  // peekAndConsumeInstallState verifies+burns the state without the
-  // userId-binding check that consumeInstallState does — the user's
-  // browser hits this endpoint anonymously after the github.com
-  // round-trip, so there's no session userId to compare against. The
-  // 16-byte random state IS the binding.
   console.log(
-    `[github install-callback] hit installation_id=${installationIdRaw} setup_action=${setupAction} state=${state.slice(0, 8)}…`,
+    `[github install-callback] hit installation_id=${installationIdRaw} setup_action=${setupAction} state_present=true`,
   );
-  const stateRow = await peekAndConsumeInstallState(state);
-  if (!stateRow) {
+  const installationId = Number(installationIdRaw);
+  if (!Number.isSafeInteger(installationId) || installationId <= 0) {
+    return { kind: "invalid-installation-id", raw: installationIdRaw };
+  }
+
+  // The callback is intentionally public because GitHub redirects the browser
+  // here without an Openship session. The durable, one-shot state recovers the
+  // exact initiating user + workspace and works across SaaS replicas/restarts.
+  // Peek first; the atomic claim below consumes only after GitHub verification.
+  const stateRow = await repos.githubInstallState.find(state).catch(() => null);
+  if (!stateRow || !stateRow.organizationId) {
     console.log("[github install-callback] state not found or expired");
     return { kind: "state-expired" };
   }
   const userId = stateRow.userId;
-  const installationId = Number(installationIdRaw);
-  if (!Number.isFinite(installationId)) {
-    return { kind: "invalid-installation-id", raw: installationIdRaw };
+  const organizationId = stateRow.organizationId;
+
+  // State proves who was authorized at issuance. Re-check membership so a
+  // user removed during the GitHub round-trip cannot finish mutating that
+  // workspace with a still-live capability.
+  let membership: Awaited<ReturnType<typeof repos.member.find>>;
+  try {
+    membership = await repos.member.find(organizationId, userId);
+  } catch (error) {
+    return { kind: "failed", installationId, error: safeErrorMessage(error) };
+  }
+  if (!membership) {
+    await repos.githubInstallState.remove(state).catch(() => {});
+    return {
+      kind: "forbidden",
+      message: "You no longer have access to the Openship workspace that started this install.",
+    };
   }
 
   // setup_action="request" means the user lacked admin perms on the org
   // and submitted an approval request instead of installing directly.
-  // GitHub will fire installation.created later when the admin approves;
-  // at that point our webhook can take over (the org admin's userId may
-  // also be linked). No row to write yet.
+  // The later installation.created webhook has no Openship workspace binding,
+  // so the user must restart the state-bound install after approval.
   if (setupAction === "request") {
-    return { kind: "pending-approval" };
+    const consumed = await repos.githubInstallState.consume(state).catch(() => null);
+    return consumed ? { kind: "pending-approval" } : { kind: "state-expired" };
   }
 
   try {
-    // App-JWT lookup — SaaS holds the GitHub App private key, so this
-    // works without any user OAuth token. Returns the installation's
-    // account (org or user the App was installed on).
-    const installation = await githubAuth.appFetch<{
-      id: number;
-      account: { login: string; id: number; avatar_url: string; type: string };
-    }>(`https://api.github.com/app/installations/${installationId}`);
+    // GitHub documents installation_id as attacker-controlled. The canonical
+    // verifier requires BOTH the initiating user's token and this SaaS App's
+    // JWT to resolve the same installation before any durable claim occurs.
+    const verification = await verifyGitHubInstallationForUser(userId, installationId);
+    if (verification.kind === "forbidden") {
+      return { kind: "forbidden", message: verification.message };
+    }
+    const installation = verification.installation;
 
-    // not ctx-scoped: install-attribution background path. This runs on
-    // the SaaS install-callback redirect, which carries the user's
-    // session cookie but not a state nonce we can verify against an
-    // org. The install_state row written by resolveInstallUrl IS
-    // org-aware — see FOLLOW-UP below.
-    //
-    // FOLLOW-UP: the install_state row has the originating org id —
-    // peek that row by installationId BEFORE falling back to
-    // memberships[0]. Today the row is consumed elsewhere
-    // (peekAndConsumeInstallState) so the linkage exists; threading
-    // organizationId from the consumed binding into here would drop
-    // the memberships[0] guess for the App-callback path.
-    const memberships = await repos.member
-      .listByUser(userId)
-      .catch(() => [] as Array<{ organizationId: string }>);
-    const organizationId =
-      memberships[0]?.organizationId ?? `org_${userId}`;
-
-    await repos.gitInstallation.upsert({
+    // Consume the state, upsert the workspace installation, and rebind every
+    // matching project source in one DB transaction. A failed write leaves the
+    // nonce retryable; concurrent replay has exactly one winner.
+    const claimed = await repos.gitInstallation.claimWithState(state, {
       userId,
       organizationId,
       provider: "github",
@@ -316,6 +325,20 @@ export async function attributeGithubInstall(input: {
       providerUserId: undefined,
       providerOwnerId: String(installation.account.id),
       isOrg: installation.account.type === "Organization",
+    });
+    if (!claimed) {
+      return { kind: "state-expired" };
+    }
+
+    await Promise.all([
+      githubAuth.invalidateUserGitHubCache(userId),
+      githubAuth.invalidateOrgGitHubCache(organizationId),
+    ]).catch((error) => {
+      // The durable claim already committed. Cache eviction is an optimization,
+      // so do not misreport success as failure or strand a consumed nonce.
+      console.warn(
+        `[github install-callback] cache invalidation failed: ${safeErrorMessage(error)}`,
+      );
     });
 
     await repos.auditEvent
@@ -390,8 +413,8 @@ export async function listOrgInstallations(
  * caller — a caller-supplied id is a privilege-escalation surface
  * (Bob could pass Alice's installation id and mint a token against her
  * GitHub App installation). The id is resolved server-side from
- * (ownerUserId, owner) via repos.gitInstallation.findByOwner. If the
- * org owner doesn't have an installation for `owner`, returns
+ * (organizationId, owner) via the workspace-scoped installation row. If the
+ * org doesn't have an installation for `owner`, returns
  * `not-found` so the caller can respond 404.
  */
 export async function mintOrgInstallationToken(
@@ -404,10 +427,10 @@ export async function mintOrgInstallationToken(
 > {
   const { ownerUserId } = await resolveCloudOwnerById(organizationId);
 
-  // Resolve installationId from the ORG OWNER's row — the org's GitHub
-  // installations all live on the owner's account. Never trust the
-  // client-supplied installationId.
-  const installation = await repos.gitInstallation.findByOwner(ownerUserId, owner);
+  // Resolve installationId from the workspace row. The owner user remains the
+  // background actor, but must not select an installation they connected in a
+  // different Openship workspace.
+  const installation = await repos.gitInstallation.findByOrgAndOwner(organizationId, owner);
   if (!installation) {
     return { kind: "not-found", owner };
   }

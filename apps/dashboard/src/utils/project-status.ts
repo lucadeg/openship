@@ -7,7 +7,9 @@ export type ProjectStatus =
   | "queued"
   | "building"
   | "deploying"
+  | "reconciling"
   | "migrating"
+  | "deploy_failed"
   | "failed"
   | "cancelled"
   | "deleting"
@@ -15,7 +17,7 @@ export type ProjectStatus =
 
 /**
  * The live migration run for this project, as the project payload carries it (API
- * `readActiveMigration` — id, status, mode, nothing else).
+ * `readActiveMigration` — an explicit, non-secret allowlist).
  *
  * Present here, in the shared status source, rather than fetched by whichever panel cares:
  * a project being moved to another server is a fact about the PROJECT, so the cards, the
@@ -29,6 +31,8 @@ export type ActiveMigration = {
   status: string;
   /** `project_move` (relocating this project) | `project_copy` (building a second one). */
   mode: string;
+  /** Server-derived because only the migration service may inspect failure details. */
+  needsAction?: boolean;
 };
 
 /**
@@ -50,10 +54,12 @@ const MIGRATION_AWAITING_OPERATOR = new Set(["awaiting_cutover", "partial"]);
  * be a card calling a run "in progress" next to a pill that says it needs attention.
  */
 export function migrationNeedsOperator(run: ActiveMigration | null | undefined): boolean {
-  return Boolean(run && MIGRATION_AWAITING_OPERATOR.has(run.status));
+  return Boolean(run && (run.needsAction ?? MIGRATION_AWAITING_OPERATOR.has(run.status)));
 }
 
 export type ProjectStatusSource = {
+  /** Required only when deriving the status badge's destination. */
+  id?: string | null;
   activeDeploymentId?: string | null;
   /**
    * The operator's switch (server-derived from `disabled_at`). False means a human
@@ -108,9 +114,15 @@ export const PROJECT_STATUS_META: Record<ProjectStatus, { badge: string }> = {
   building: { badge: "bg-info-bg text-info" },
   // primary = brand accent, intentionally not a status token.
   deploying: { badge: "bg-primary/10 text-primary" },
+  // The deployment outcome is being checked against the host. This is still
+  // progressing and does not ask the operator to do anything.
+  reconciling: { badge: "bg-info-bg text-info" },
   // Work in progress, like queued/building — NOT amber. A migration the operator started
   // and that is proceeding needs nothing from them; the amber states are the ones that do.
   migrating: { badge: "bg-info-bg text-info" },
+  // An older release may still be healthy even though the newest attempt failed.
+  // Keep that distinct from both project-wide `failed` and `attention`.
+  deploy_failed: { badge: "bg-danger-bg text-danger" },
   failed: { badge: "bg-danger-bg text-danger" },
   cancelled: { badge: "bg-muted text-muted-foreground" },
   deleting: { badge: "bg-danger-bg text-danger" },
@@ -123,7 +135,7 @@ export function projectStatusLabel(status: ProjectStatus, t: Dictionary): string
 }
 
 /**
- * The only latest-deploy statuses that may leave a project looking healthy.
+ * Settled latest-deploy outcomes that do not ask the operator to do anything.
  *
  * An ALLOWLIST, not a denylist: round 1 enumerated the bad statuses and caught
  * the literal "failed" only, so `partial_failure`, `rejected`, `reconciling` —
@@ -131,10 +143,10 @@ export function projectStatusLabel(status: ProjectStatus, t: Dictionary): string
  * never landed. `ready` is a landed deploy; `cancelled` is the operator's own
  * deliberate stop, which needs nothing from them and must not nag forever;
  * `no_changes` found every service already up to date and deliberately kept the
- * live release, so the project is exactly as healthy as before it ran.
- * Everything else is "the newest deploy did not land".
+ * live release, so the project is exactly as healthy as before it ran; and a
+ * `rejected` partial release was explicitly rolled back by the operator.
  */
-const SETTLED_HEALTHY_STATUSES = new Set(["ready", "cancelled", "no_changes"]);
+const SETTLED_NON_ACTION_STATUSES = new Set(["ready", "cancelled", "rejected", "no_changes"]);
 
 /** Why a project reads "attention". Null when it doesn't. */
 export type ProjectAttentionReason =
@@ -144,8 +156,6 @@ export type ProjectAttentionReason =
   | "routing"
   /** Newest deploy is blocked on a named, clearable cause (port conflict). */
   | "blocked"
-  /** Newest deploy did not land; an older release is still serving. */
-  | "newestDeployDidNotLand"
   /** A migration run is parked waiting for the operator to confirm the cutover or roll
    *  back (or to resolve a partial transfer). Nothing advances until they do. */
   | "migrationCutover";
@@ -181,18 +191,20 @@ export function getProjectAttentionReason(
   // and it outranks anything the deployment row has to say — the target's own deploy is
   // `ready` at this point, which is exactly why the run is waiting.
   if (migrationNeedsOperator(project.activeMigration)) return "migrationCutover";
+  // In-flight work and an explicit pause both outrank stale flags on the live
+  // release. Neither is waiting for input, so neither may manufacture an action.
+  if (
+    ["queued", "building", "deploying", "reconciling"].includes(
+      project.latestDeploymentStatus ?? "",
+    )
+  ) {
+    return null;
+  }
+  if (project.enabled === false) return null;
   if (project.awaitingDecision) return "decision";
   if (project.routingUnsynced) return "routing";
   if (project.latestDeploymentBlocked) return "blocked";
-
-  const latest = project.latestDeploymentStatus;
-  if (!latest || SETTLED_HEALTHY_STATUSES.has(latest)) return null;
-  if (["queued", "building", "deploying"].includes(latest)) return null;
-  if (latest === "action_required") return "blocked";
-  // A latest deploy that didn't land, while something older still serves.
-  if (project.activeDeploymentId && !latestDeployIsLive(project)) {
-    return "newestDeployDidNotLand";
-  }
+  if (project.latestDeploymentStatus === "action_required") return "blocked";
   return null;
 }
 
@@ -229,6 +241,8 @@ export function getProjectStatus(project: ProjectStatusSource): ProjectStatus {
       return "building";
     case "deploying":
       return "deploying";
+    case "reconciling":
+      return "reconciling";
     default:
       break;
   }
@@ -252,7 +266,12 @@ export function getProjectStatus(project: ProjectStatusSource): ProjectStatus {
   // Deliberately BEFORE the `activeDeploymentId → live` check below: a project
   // whose last release is serving fine but whose newest deploy is blocked is not
   // simply "Live", or the blocker would be invisible on every card and sidebar.
-  if (project.awaitingDecision || project.routingUnsynced || project.latestDeploymentBlocked) {
+  if (
+    project.awaitingDecision ||
+    project.routingUnsynced ||
+    project.latestDeploymentBlocked ||
+    project.latestDeploymentStatus === "action_required"
+  ) {
     return "attention";
   }
 
@@ -260,24 +279,22 @@ export function getProjectStatus(project: ProjectStatusSource): ProjectStatus {
   // Sits BEFORE the `activeDeploymentId → live` check below, which used to
   // short-circuit every failure arm at the bottom entirely.
   //
-  // Allowlist, not denylist (SETTLED_HEALTHY_STATUSES): checking for the literal
+  // Allowlist, not denylist (SETTLED_NON_ACTION_STATUSES): checking for the literal
   // "failed" left `partial_failure`, `rejected` and `reconciling` reading green.
   //
-  // Which honest signal depends on whether anything is actually serving. A
-  // non-landing deploy doesn't advance the project's live pointer, so a live
-  // pointer that ISN'T this deploy is an older, healthy release: the site is up
-  // but the newest deploy didn't land → "attention". The one exception is a
-  // partial failure the operator already KEPT: that release IS the live one and
-  // its decision is made (`awaitingDecision` above is what flags an open one).
+  // A plain failed attempt has no pending action, so it must NEVER borrow the
+  // "Action Required" label. When an older release is still serving, report the
+  // narrower "Deploy failed" state instead. A kept partial release is live; an
+  // open one was caught by `awaitingDecision` above.
   const latest = project.latestDeploymentStatus;
-  if (latest && !SETTLED_HEALTHY_STATUSES.has(latest)) {
+  if (latest && !SETTLED_NON_ACTION_STATUSES.has(latest)) {
     if (latestDeployIsLive(project)) {
       // The non-ready latest IS the serving release. `failed` still can't be
       // "live" — nothing that failed is serving — but a kept partial is.
       return latest === "failed" ? "failed" : "live";
     }
-    if (project.activeDeploymentId) return "attention";
-    return latest === "failed" ? "failed" : "attention";
+    if (project.activeDeploymentId) return "deploy_failed";
+    return "failed";
   }
 
   if (project.activeDeploymentId) {
@@ -286,6 +303,7 @@ export function getProjectStatus(project: ProjectStatusSource): ProjectStatus {
 
   switch (project.latestDeploymentStatus) {
     case "cancelled":
+    case "rejected":
       return "cancelled";
     default:
       return "draft";
@@ -294,12 +312,11 @@ export function getProjectStatus(project: ProjectStatusSource): ProjectStatus {
 
 /**
  * One localized line explaining an amber "Action Required" pill — the pill's
- * `title`. Some attention states have no clearable pending-action (a project
- * rolled back to an older release after a failed deploy sits at
- * active=d1/latest=d2:failed indefinitely), so without this the UI demands an
- * action it never names. Composed from existing copy: state, then the move.
+ * `title`. Every attention state has a real destination; ordinary failed deploys
+ * use the separate `deploy_failed` status instead.
  */
 export function projectStatusHint(project: ProjectStatusSource, t: Dictionary): string | null {
+  if (getProjectStatus(project) !== "attention") return null;
   const p = t.projects;
   switch (getProjectAttentionReason(project)) {
     case "decision":
@@ -308,12 +325,59 @@ export function projectStatusHint(project: ProjectStatusSource, t: Dictionary): 
       return `${p.routingRetry.title} — ${p.routingRetry.retry}`;
     case "blocked":
       return `${p.draft.headingFailed} — ${p.redeploy.reviewDeployment}`;
-    case "newestDeployDidNotLand":
-      return `${p.draft.headingFailed} — ${p.redeploy.redeployLatest}`;
     // Its own sentence rather than a compose of two halves: unlike the deploy states above,
     // neither half of "a parked migration and what to do about it" existed anywhere to reuse.
     case "migrationCutover":
       return p.migrationAwaitingHint;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Exact owner of a genuine "Action Required" badge.
+ *
+ * A badge without a destination is not actionable. Keep this next to the status
+ * derivation so every renderer (list, grid, home and project sidebar) shares the
+ * same routing contract instead of guessing from the label.
+ */
+export function projectActionHref(project: ProjectStatusSource): string | null {
+  if (!project.id || getProjectStatus(project) !== "attention") return null;
+
+  switch (getProjectAttentionReason(project)) {
+    case "decision":
+      return project.activeDeploymentId
+        ? `/build/${project.activeDeploymentId}`
+        : `/projects/${project.id}/deployments`;
+    case "routing":
+      return `/projects/${project.id}/domains`;
+    case "blocked":
+      return `/projects/${project.id}/deployments`;
+    case "migrationCutover":
+      return `/projects/${project.id}/advanced`;
+    default:
+      return null;
+  }
+}
+
+/** Destination for a status that has useful detail even when it needs no action. */
+export function projectStatusHref(project: ProjectStatusSource): string | null {
+  const actionHref = projectActionHref(project);
+  if (actionHref) return actionHref;
+  if (!project.id) return null;
+
+  switch (getProjectStatus(project)) {
+    case "queued":
+    case "building":
+    case "deploying":
+    case "reconciling":
+    case "deploy_failed":
+    case "failed":
+      return project.latestDeploymentId
+        ? `/build/${project.latestDeploymentId}`
+        : `/projects/${project.id}/deployments`;
+    case "migrating":
+      return `/projects/${project.id}/advanced`;
     default:
       return null;
   }

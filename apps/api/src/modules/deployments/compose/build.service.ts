@@ -17,7 +17,7 @@ import type {
   BuildResult,
 } from "@repo/adapters";
 import { BuildLogger, STATIC_RELEASE_BASE } from "@repo/adapters";
-import type { ComposeAdvanced } from "@repo/core";
+import { composeBuildIssues, validateImageReference, type ComposeAdvanced } from "@repo/core";
 import { repos, type Deployment, type Project, type Service } from "@repo/db";
 
 import {
@@ -28,9 +28,19 @@ import {
 import * as sessionManager from "../session-manager";
 import { pinnedImageForService } from "../pinned-artifacts";
 import { newerThanRestoredRelease } from "./project-services";
-import { serviceKind, isStaticService, hasSourceBuildRecipe } from "../../../lib/deployable-service";
+import {
+  serviceKind,
+  isStaticService,
+  hasSourceBuildRecipe,
+  resolveSubAppRecipe,
+} from "../../../lib/deployable-service";
 import { normalizeProjectRootDirectory } from "../../../lib/project-root-detector";
+import {
+  resolveComposeEnvironmentTemplates,
+  resolveComposeInterpolation,
+} from "../../../lib/compose-parser";
 import { resolveServicePort } from "./domain-helpers";
+import { ServiceBuildDnsDiagnostics } from "./build-service-dns";
 
 function sanitizeComposeImageName(value: string): string {
   return (
@@ -39,6 +49,78 @@ function sanitizeComposeImageName(value: string): string {
       .replace(/[^a-z0-9._-]+/g, "-")
       .replace(/^-+|-+$/g, "") || "service"
   );
+}
+
+/** Resolve Compose build args against this deployment's final build environment.
+ * Bare/null keys are omitted when unavailable (preserving Dockerfile defaults),
+ * while persisted `${...}` expressions are evaluated here rather than leaking or
+ * freezing a scan-time `.env` value. */
+export function resolveComposeBuildArgs(
+  raw: Record<string, string | null> | null | undefined,
+  buildEnv: Record<string, string>,
+  templateKeys: readonly string[] = [],
+): Record<string, string> | undefined {
+  if (!raw) return undefined;
+  const resolved: Record<string, string> = {};
+  const missing = new Set<string>();
+  const templates = new Set(templateKeys);
+  for (const [key, value] of Object.entries(raw)) {
+    if (value === null) {
+      if (Object.hasOwn(buildEnv, key)) resolved[key] = buildEnv[key]!;
+    } else if (templates.has(key)) {
+      // Compose interpolates every args value against the invocation environment
+      // independently. Sibling args are not variables (`A=one`, `B=${A:-two}`
+      // yields B=two unless the invocation env itself defines A).
+      const dynamic = resolveComposeEnvironmentTemplates(buildEnv, { [key]: value });
+      for (const item of dynamic.missingRequired) missing.add(item.variable);
+      resolved[key] = dynamic.env[key] ?? "";
+    } else {
+      resolved[key] = value;
+    }
+  }
+  if (missing.size > 0) {
+    throw new Error(
+      `Compose build arguments require missing variable(s): ${[...missing].join(", ")}`,
+    );
+  }
+  return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
+/**
+ * Resolve a Compose-authored image against the deployment's final project env.
+ *
+ * The parser also keeps its scan-time concrete value. That value is the safe
+ * fallback when the compose-adjacent `.env` file supplied variables which are
+ * intentionally not injected into every container/build environment. We only
+ * trust that fallback when the scan recorded zero unresolved variables; an
+ * unresolved preview can look syntactically valid (`repo:${TAG}suffix` →
+ * `repo:suffix`) and must never be pulled.
+ */
+export function resolveComposeImage(
+  image: string | null | undefined,
+  template: ComposeAdvanced["imageTemplate"],
+  deployEnv: Record<string, string>,
+): string {
+  let resolved = image?.trim() ?? "";
+
+  if (template) {
+    const dynamic = resolveComposeInterpolation(template.expression, deployEnv);
+    if (dynamic.unresolvedVariables.length === 0) {
+      resolved = dynamic.value.trim();
+    } else if (template.unresolvedVariables.length > 0) {
+      const variables = [...new Set(dynamic.unresolvedVariables)].sort();
+      throw new Error(
+        `Compose image requires missing variable${variables.length === 1 ? "" : "s"}: ${variables.join(", ")}`,
+      );
+    }
+    // Otherwise the source scan resolved every variable (normally from the
+    // compose-adjacent .env file). Keep that concrete, release-frozen preview.
+  }
+
+  const invalid = validateImageReference(resolved);
+  if (invalid) throw new Error(invalid);
+
+  return resolved;
 }
 
 /** A catalog template ships this service's Docker build context INLINE
@@ -169,8 +251,8 @@ async function materializeInlineBuildContexts(buildable: Service[]): Promise<Inl
  *
  * `..` is resolved rather than rejected: pointing back at the repo root is normal
  * for a compose file kept in a `deploy/` subfolder. Escaping ABOVE the clone root
- * is not resolvable and falls back to the compose directory, since there is no
- * such path in the checkout to build from.
+ * is refused. Falling back to another directory would silently build a different
+ * artifact than the compose file requested.
  *
  * The directory half is normalized by the shared `normalizeProjectRootDirectory`
  * rather than a local regex pair, so a repo-relative directory means the same
@@ -179,9 +261,14 @@ async function materializeInlineBuildContexts(buildable: Service[]): Promise<Inl
  * backslash or stray whitespace in the directory produced a literally broken path.
  */
 export function resolveComposeBuildContext(composeDirectory: string, context: string): string {
+  const invalid = composeBuildIssues(context)[0];
+  if (invalid) {
+    throw new Error(`Invalid Compose build context: ${invalid.reason}`);
+  }
+
   // Already maps "." / "./" / "" → "", so no special-casing is needed below.
   const normalizedDirectory = normalizeProjectRootDirectory(composeDirectory);
-  const segments = [...normalizedDirectory.split("/"), ...context.split(/[\\/]/)].filter(
+  const segments = [...normalizedDirectory.split("/"), ...context.trim().split(/[\\/]/)].filter(
     (segment) => segment.length > 0 && segment !== ".",
   );
 
@@ -191,9 +278,9 @@ export function resolveComposeBuildContext(composeDirectory: string, context: st
       resolved.push(segment);
       continue;
     }
-    // `..` above the clone root has nothing to resolve against — keep the compose
-    // directory rather than emitting a path outside the checkout.
-    if (resolved.length === 0) return normalizedDirectory;
+    if (resolved.length === 0) {
+      throw new Error("Invalid Compose build context: path escapes the linked repository.");
+    }
     resolved.pop();
   }
 
@@ -265,21 +352,26 @@ function resolveSubAppOverrides(opts: SubAppOverrideInputs): {
     }
   };
 
-  const installCommand = service.installCommand ?? snapshot.installCommand ?? undefined;
+  // The row-vs-snapshot RULE comes from the shared resolver; this function keeps
+  // only what is its own — the operator-facing log line per inherited command, and
+  // the wider set of build fields. Re-deriving the rule here is what let the
+  // buildable selector and the static-vs-server decision drift apart.
+  const recipe = resolveSubAppRecipe(service, snapshot);
+  const installCommand = recipe.installCommand ?? undefined;
   if (service.installCommand === null && installCommand !== undefined) {
     noteCommandFallback("installCommand", installCommand);
   }
-  const buildCommand = service.buildCommand ?? snapshot.buildCommand ?? undefined;
+  const buildCommand = recipe.buildCommand ?? undefined;
   if (service.buildCommand === null && buildCommand !== undefined) {
     noteCommandFallback("buildCommand", buildCommand);
   }
-  const startCommand = service.startCommand ?? snapshot.startCommand ?? undefined;
+  const startCommand = recipe.startCommand ?? undefined;
   if (service.startCommand === null && startCommand !== undefined) {
     noteCommandFallback("startCommand", startCommand);
   }
 
   return {
-    stack: service.framework ?? snapshot.framework ?? undefined,
+    stack: recipe.framework ?? undefined,
     buildImage: service.buildImage ?? snapshot.buildImage ?? undefined,
     packageManager: service.packageManager ?? snapshot.packageManager ?? undefined,
     installCommand,
@@ -291,8 +383,18 @@ function resolveSubAppOverrides(opts: SubAppOverrideInputs): {
 
 export interface ComposeBuildImagesResult {
   imageRefs: Map<string, string>;
+  /** Exact service/image pairs that are already available on the deploy target
+   * because they were built now or explicitly pinned by an internal workflow. */
+  preparedLocalImages: Map<string, string>;
   /** Image/workspace refs created during this build phase, excluding image-only services. */
   builtImageRefs: Map<string, string>;
+  /** Service id -> trusted host directory produced (or internally pinned) for
+   * a self-hosted static sub-app. Kept separate from imageRefs so an arbitrary
+   * absolute service.image can never be interpreted as a host artifact. */
+  staticArtifactRefs: Map<string, string>;
+  /** Effective static classification after applying project-snapshot fallback.
+   * Needed when a refresh reuses the prior deployment's host artifact. */
+  staticServiceIds: Set<string>;
   buildFailures: Map<string, string>;
   /** Count of image-only (external) services included in imageRefs */
   externalCount: number;
@@ -312,6 +414,9 @@ export async function buildComposeImages(opts: {
   logger: BuildLogger;
   snapshot: BuildConfigSnapshotLike;
   buildSessionId: string;
+  /** Project-scoped deployment env only. Compose image interpolation must not
+   *  accidentally consume Openship's injected CI/build helper variables. */
+  composeInterpolationEnv: Record<string, string>;
   buildEnvVars: Record<string, string>;
   buildResources: ResourceConfig;
   gitToken?: string;
@@ -333,8 +438,17 @@ export async function buildComposeImages(opts: {
 }): Promise<ComposeBuildImagesResult> {
   const services = await repos.service.listByProject(opts.project.id);
   const enabled = services.filter((service) => service.enabled);
+  const serviceNames = new Set(enabled.map((service) => service.name));
+  const buildDnsDiagnostics = new Map<string, ServiceBuildDnsDiagnostics>();
   const imageRefs = new Map<string, string>();
+  const preparedLocalImages = new Map<string, string>();
   const builtImageRefs = new Map<string, string>();
+  const staticArtifactRefs = new Map<string, string>();
+  const staticServiceIds = new Set(
+    enabled
+      .filter((service) => isStaticService(resolveSubAppRecipe(service, opts.snapshot)))
+      .map((service) => service.id),
+  );
   const buildFailures = new Map<string, string>();
   const cancelledServices = new Set<string>();
   const startedAt = Date.now();
@@ -385,24 +499,31 @@ export async function buildComposeImages(opts: {
         hasInlineBuild(service) ||
         (serviceKind(service) === "monorepo" &&
           !service.image &&
-          // Apply the SAME project-snapshot fallback that the build-spec resolver
-          // (resolveSubAppOverrides) and preflight use — a monorepo row whose
-          // command lives on the project snapshot (null on the row: an inheriting
-          // sub-app, or the #231 materialized app row) must be selected as
-          // buildable HERE too. Keying off the raw row dropped it to neither
-          // bucket → the misleading "No image available" the comment above warns of.
+          // Asked of the RESOLVED recipe, not the raw row: a monorepo row whose
+          // command lives on the project snapshot (an inheriting sub-app, or the
+          // #231 materialized app row) must be selected as buildable HERE too.
+          // Keying off the raw row dropped it to neither bucket → the misleading
+          // "No image available" the comment above warns of.
           //
-          // The verdict itself is `hasSourceBuildRecipe` so the row-materializer
-          // gates on the identical rule (#589) — only the fallback is local.
-          hasSourceBuildRecipe({
-            framework: service.framework ?? opts.snapshot.framework,
-            buildCommand: service.buildCommand ?? opts.snapshot.buildCommand,
-            startCommand: service.startCommand ?? opts.snapshot.startCommand,
-          }))),
+          // Two accepting verdicts, deliberately separate:
+          //   • `hasSourceBuildRecipe` — shared verbatim with the row-materializer
+          //     so the two cannot disagree (#589).
+          //   • `isStaticService` — a static sub-app is served as FILES, and its
+          //     extract-only recipe is a valid Dockerfile with an EMPTY build step.
+          //     So a sub-app that is already just files (hand-written HTML, a
+          //     committed `dist/`) has no command to declare and is still buildable.
+          //     This arm lives here rather than inside `hasSourceBuildRecipe`
+          //     because it is a row-level fact and that helper is shared with a
+          //     PROJECT-level gate — see its docblock.
+          (hasSourceBuildRecipe(resolveSubAppRecipe(service, opts.snapshot)) ||
+            isStaticService(resolveSubAppRecipe(service, opts.snapshot))))),
   );
   const external = enabled.filter(
     (service) =>
-      !isHandedOver(service) && !service.build && !hasInlineBuild(service) && !!service.image,
+      !isHandedOver(service) &&
+      !service.build &&
+      !hasInlineBuild(service) &&
+      Boolean(service.image || (service.advanced as ComposeAdvanced | null)?.imageTemplate),
   );
 
   // Repo-less catalog builds need their context on disk before any spec is built,
@@ -423,6 +544,10 @@ export async function buildComposeImages(opts: {
       const pinned = pinnedImageForService(opts.snapshot, service.name);
       if (!pinned) continue;
       imageRefs.set(service.id, pinned);
+      preparedLocalImages.set(service.id, pinned);
+      if (pinned.startsWith("/") && staticServiceIds.has(service.id)) {
+        staticArtifactRefs.set(service.id, pinned);
+      }
       sessionManager.broadcastServiceStatus(opts.dep.id, {
         serviceName: service.name,
         serviceId: service.id,
@@ -431,12 +556,32 @@ export async function buildComposeImages(opts: {
     }
 
     for (const service of external) {
-      if (service.image) {
-        imageRefs.set(service.id, service.image);
+      try {
+        const image = resolveComposeImage(
+          service.image,
+          (service.advanced as ComposeAdvanced | null)?.imageTemplate,
+          opts.composeInterpolationEnv,
+        );
+        imageRefs.set(service.id, image);
         sessionManager.broadcastServiceStatus(opts.dep.id, {
           serviceName: service.name,
           serviceId: service.id,
           status: "built",
+        });
+      } catch (err) {
+        const failureMessage =
+          err instanceof Error ? err.message : `Invalid image for service "${service.name}"`;
+        buildFailures.set(service.id, failureMessage);
+        opts.logger.log(
+          `Compose service "${service.name}" image resolution failed: ${failureMessage}\n`,
+          "error",
+          { serviceName: service.name },
+        );
+        sessionManager.broadcastServiceStatus(opts.dep.id, {
+          serviceName: service.name,
+          serviceId: service.id,
+          status: "failed",
+          error: failureMessage,
         });
       }
     }
@@ -485,9 +630,23 @@ export async function buildComposeImages(opts: {
         : service.build != null
           ? resolveComposeBuildContext(opts.snapshot.rootDirectory ?? "", service.build)
           : (service.rootDirectory ?? opts.snapshot.rootDirectory);
+      // #634: `build` is a build CONTEXT, so the runtime must point docker AT it —
+      // not merely resolve the Dockerfile inside it while building the whole clone.
+      // Without this the service's own `COPY requirements.txt` looked for the file at
+      // the repo root, and the repo's root `.dockerignore` pruned the service's tree.
+      //
+      // Only where the user actually declared a context. `rootDirectory` (monorepo
+      // sub-apps) stays a subdir WITHIN a whole-repo context — those build from a
+      // generated recipe that COPYs the workspace root. An inline catalog build keeps
+      // the root too: its context is the materialized root and the per-service subdir
+      // rides in the Dockerfile path, which is what makes a template author's
+      // `COPY <service-name>/<file>` resolve.
+      const buildContextDirectory = !inlineBuild && service.build != null ? context : undefined;
       const dockerfile = inlineBuild?.dockerfile ?? service.dockerfile;
+      const from =
+        buildContextDirectory !== undefined ? `build context ${context || "."}` : context || ".";
       opts.logger.log(
-        `Building ${isMonorepo ? "monorepo app" : "compose service"} "${service.name}" from ${context || "."}${dockerfile ? ` using ${dockerfile}` : ""}...\n`,
+        `Building ${isMonorepo ? "monorepo app" : "compose service"} "${service.name}" from ${from}${dockerfile ? ` using ${dockerfile}` : ""}...\n`,
         "info",
         { serviceName: service.name },
       );
@@ -499,16 +658,22 @@ export async function buildComposeImages(opts: {
       // Per-service logger keeps native terminal bytes intact and routes by
       // serviceName. Inner step events are forwarded as plain service logs;
       // the outer orchestrator owns the top-level step lifecycle.
-      const serviceLogger = new BuildLogger((entry) => {
-        opts.logger.callback({
-          timestamp: entry.timestamp,
-          message: entry.message,
-          level: entry.level,
-          serviceName: service.name,
-          serviceId: service.id,
-          rawData: entry.rawData,
-        });
-      });
+      const dnsDiagnostics =
+        opts.runtime.name === "docker" ? new ServiceBuildDnsDiagnostics(serviceNames) : undefined;
+      if (dnsDiagnostics) buildDnsDiagnostics.set(service.id, dnsDiagnostics);
+      const serviceLogger = new BuildLogger(
+        (entry) => {
+          opts.logger.callback({
+            timestamp: entry.timestamp,
+            message: entry.message,
+            level: entry.level,
+            serviceName: service.name,
+            serviceId: service.id,
+            rawData: entry.rawData,
+          });
+        },
+        (data, streamId) => dnsDiagnostics?.observe(data, streamId),
+      );
 
       if (opts.runtime.name === "cloud" && !opts.project.localPath) {
         opts.logger.log(
@@ -552,7 +717,7 @@ export async function buildComposeImages(opts: {
               // `staticExtractOnly` is gated on the runtime: on CLOUD there is no host
               // directory to serve (Oblien runs the workload), so those keep the
               // generated nginx image and stay a proxied container.
-              ...(isStaticService(service)
+              ...(isStaticService(resolveSubAppRecipe(service, opts.snapshot))
                 ? {
                     isStatic: true,
                     hasServer: false,
@@ -576,8 +741,18 @@ export async function buildComposeImages(opts: {
             gitToken: opts.gitToken,
             overrides: {
               slug: buildSlug,
+              // BOTH: `rootDirectory` stays the context because the cloud runtime
+              // reads only that field as its context root, while
+              // `buildContextDirectory` is what narrows the docker build on a
+              // self-hosted target. Same value, two readers.
               rootDirectory: context,
+              buildContextDirectory,
               dockerfilePath: dockerfile ?? undefined,
+              buildArgs: resolveComposeBuildArgs(
+                service.buildArgs,
+                opts.buildEnvVars,
+                service.advanced?.buildArgTemplateKeys,
+              ),
               // Inline catalog build: the source IS the materialized root, so
               // prepareSourceTree copies it instead of cloning a repo.
               ...(inlineBuild ? { localPath: inlineBuild.root } : {}),
@@ -602,6 +777,8 @@ export async function buildComposeImages(opts: {
 
     // Record a per-service build result: image refs / failures + status broadcast.
     const applyBuildResult = (service: Service, buildResult: BuildResult) => {
+      const dnsDiagnostics = buildDnsDiagnostics.get(service.id);
+      buildDnsDiagnostics.delete(service.id);
       // Cancelled ≠ failed: tracked separately so the pipeline can stop without
       // recording a build failure on the deployment. The per-service SSE status
       // union has no "cancelled" member, so the tab reports the reason instead of
@@ -621,8 +798,10 @@ export async function buildComposeImages(opts: {
       }
 
       if (buildResult.status === "failed" || !buildResult.imageRef) {
-        const failureMessage =
+        const originalFailure =
           buildResult.errorMessage ?? `Failed to build service "${service.name}"`;
+        const hint = dnsDiagnostics?.finish(originalFailure);
+        const failureMessage = hint ? `${originalFailure}\n\n${hint}` : originalFailure;
         buildFailures.set(service.id, failureMessage);
         opts.logger.log(
           `Compose service "${service.name}" build failed: ${failureMessage}\n`,
@@ -639,7 +818,11 @@ export async function buildComposeImages(opts: {
       }
 
       imageRefs.set(service.id, buildResult.imageRef);
+      preparedLocalImages.set(service.id, buildResult.imageRef);
       builtImageRefs.set(service.id, buildResult.imageRef);
+      if (buildResult.imageRef.startsWith("/") && staticServiceIds.has(service.id)) {
+        staticArtifactRefs.set(service.id, buildResult.imageRef);
+      }
       opts.logger.log(
         `Compose service "${service.name}" image ready: ${buildResult.imageRef}\n`,
         "info",
@@ -745,7 +928,10 @@ export async function buildComposeImages(opts: {
 
   return {
     imageRefs,
+    preparedLocalImages,
     builtImageRefs,
+    staticArtifactRefs,
+    staticServiceIds,
     buildFailures,
     externalCount: external.length,
     cancelled: cancelledServices.size > 0,

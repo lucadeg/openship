@@ -12,6 +12,7 @@
 
 import type {
   BuildConfig,
+  ImageArtifactConfig,
   DeployConfig,
   BuildResult,
   DeploymentResult,
@@ -40,6 +41,8 @@ import type { ContainerStabilitySample } from "./stability";
  */
 export type RuntimeCapability =
   | "build"
+  /** Acquire and deploy an already-built application container image verbatim. */
+  | "prebuiltImage"
   | "deploy"
   | "multiServiceDeploy"
   | "stop"
@@ -196,6 +199,15 @@ export interface RuntimeAdapter {
    */
   build(config: BuildConfig, logger?: BuildLogger): Promise<BuildResult>;
 
+  /**
+   * Turn a registry image into this runtime's native deploy artifact.
+   *
+   * Docker pulls it onto the target daemon and returns an immutable digest when
+   * available. Cloud provisions a temporary workspace from it. Runtimes that
+   * cannot run container images (Bare) omit the method and capability.
+   */
+  prepareImage?(config: ImageArtifactConfig, logger?: BuildLogger): Promise<BuildResult>;
+
   /** Cancel an in-progress build */
   cancelBuild(sessionId: string): Promise<void>;
 
@@ -324,7 +336,13 @@ export interface RuntimeAdapter {
    * port. Best-effort + idempotent. Optional (docker only; cloud/bare skip —
    * cloud uses public host:port, its private-link mesh is group-scoped).
    */
-  attachToExternalNetworks?(projectId: string, networkNames: string[]): Promise<void>;
+  attachToExternalNetworks?(
+    projectId: string,
+    networkNames: string[],
+    /** Containers to include BEYOND the `openship.project` label match — an adopted
+     *  container keeps its original labels, so the filter cannot see it. */
+    extraContainerIds?: string[],
+  ): Promise<void>;
 
   /**
    * Join already-running containers (migration attach-live reuse) to a project's
@@ -422,10 +440,7 @@ export interface RuntimeAdapter {
    * Open an interactive shell inside a deployed service. Optional —
    * runtimes without `serviceShell` capability throw if called.
    */
-  openServiceShell?(
-    containerId: string,
-    opts?: ShellOptions,
-  ): Promise<ShellSession>;
+  openServiceShell?(containerId: string, opts?: ShellOptions): Promise<ShellSession>;
 }
 
 // ─── Rollback primitive types ───────────────────────────────────────────────
@@ -497,11 +512,15 @@ export interface MultiServiceDeployConfig {
   restart?: string;
   /**
    * Force a fresh `docker pull` of the image tag even when a local copy exists.
-   * Set only for the "update" trigger — a normal deploy/redeploy stays
-   * pull-if-missing so it never surprise-bumps a `:latest` app or defeats the
-   * unchanged-image carry-forward.
+   * Set for explicit update operations and incoming deploy hooks. A normal
+   * manual redeploy stays pull-if-missing so it never surprise-bumps a
+   * `:latest` app or defeats unchanged-image carry-forward.
    */
   forcePull?: boolean;
+  /** The exact image reference was produced/pinned by the orchestrator or was
+   * already pulled during cohort preparation. Docker must not infer this from
+   * the tag text: a registry image can legitimately use Openship's tag shape. */
+  imageAlreadyPrepared?: boolean;
   /** Extended compose fields (healthcheck, …). Docker honors them; runtimes
    *  that can't (cloud) warn-and-drop. See ComposeAdvanced in @repo/core. */
   advanced?: ComposeAdvanced;
@@ -546,7 +565,15 @@ export interface MultiServiceDeployResult {
   containerId: string;
   status: string;
   ip?: string;
+  /** The FIRST binding the daemon reports — arbitrary for a multi-port container.
+   *  Anything picking a proxy target for a SPECIFIC container port must read
+   *  `hostPortByContainerPort`; this stays for the one scalar `service_deployment`
+   *  can persist. */
   hostPort?: number;
+  /** Every published binding, keyed by CONTAINER port → host port. See
+   *  `ContainerInfo.hostPortByContainerPort`: without it a route for a container's
+   *  second port is dialed at the first port's publish, reaching a different app. */
+  hostPortByContainerPort?: Record<number, number>;
   /**
    * Content-addressable image digest actually running (`repo@sha256:…`), read
    * from the image's RepoDigests after create. The anchor the update scanner
@@ -616,10 +643,7 @@ export interface MultiServiceRuntimeAdapter extends RuntimeAdapter {
    * reachable by name. Absent on runtimes with live DNS (Docker) — their real
    * network needs no post-pass.
    */
-  finalizeServiceGroup?(
-    group: MultiServiceGroupHandle,
-    onLog?: LogCallback,
-  ): Promise<void>;
+  finalizeServiceGroup?(group: MultiServiceGroupHandle, onLog?: LogCallback): Promise<void>;
 
   /**
    * Optional: seed an ALREADY-RUNNING service into the group's in-memory mesh

@@ -51,6 +51,7 @@ interface Row {
 const h = vi.hoisted(() => {
   return {
     projects: [] as Array<Record<string, unknown>>,
+    platformTarget: "selfhosted" as "cloud" | "selfhosted" | "desktop",
     deployments: [] as Array<Record<string, unknown>>,
     services: new Map<string, Array<Record<string, unknown>>>(),
     serviceDeployments: new Map<string, Array<Record<string, unknown>>>(),
@@ -117,6 +118,10 @@ vi.mock("@repo/db", () => {
     repos: {
       project: {
         listAllForScan: vi.fn(async () => h.projects),
+        listByOrganization: vi.fn(async (organizationId: string) => {
+          const rows = h.projects.filter((p) => p.organizationId === organizationId);
+          return { rows, total: rows.length, page: 1, perPage: 5000 };
+        }),
       },
       deployment: {
         findManyById: vi.fn(async (ids: string[]) => {
@@ -249,7 +254,10 @@ vi.mock("@repo/db", () => {
 
 vi.mock("@repo/adapters", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@repo/adapters")>()),
-  getPlatform: () => ({ target: "selfhosted", runtime: { name: "docker" } }),
+  getPlatform: () => ({
+    target: h.platformTarget,
+    runtime: { name: h.platformTarget === "desktop" ? "bare" : "docker" },
+  }),
 }));
 
 vi.mock("../../lib/notification-dispatcher", () => ({ notification: { emit: h.emit } }));
@@ -264,7 +272,7 @@ vi.mock("../../lib/public-url", () => ({
 vi.mock("./container-events", () => ({ renewEventWatchers: h.renew }));
 
 /**
- * Faithful copies of the two routing functions, for a SELFHOSTED base.
+ * Faithful copies of the two routing functions for self-hosted and desktop bases.
  *
  * Copied rather than imported because importing the real module pulls the platform + SSH
  * graph this file exists to avoid. That makes fidelity a hand-maintained property, so the
@@ -282,12 +290,16 @@ vi.mock("./container-events", () => ({ renewEventWatchers: h.renew }));
  * agrees with a sweep that is reading the wrong box.
  */
 vi.mock("../../lib/deployment-runtime", () => ({
-  resolveEffectiveTarget: (_base: string, meta: Record<string, unknown>) =>
-    meta.serverId || meta.deployTarget === "server"
-      ? "server"
-      : meta.deployTarget === "cloud" && meta.buildStrategy === "local"
-        ? "cloud"
-        : "local",
+  resolveEffectiveTarget: (base: string, meta: Record<string, unknown>) => {
+    if (base !== "cloud" && meta.serverId) return "server";
+    if (base === "desktop") return meta.deployTarget ?? "cloud";
+    if (base === "selfhosted") {
+      if (meta.deployTarget === "server") return "server";
+      if (meta.deployTarget === "cloud" && meta.buildStrategy === "local") return "cloud";
+      return "local";
+    }
+    return "cloud";
+  },
   resolveDeploymentRuntimeForRead: vi.fn(
     async (dep: { meta: Record<string, unknown>; organizationId: string }) => {
       const meta = dep.meta ?? {};
@@ -351,6 +363,7 @@ function fakeRuntime(box: string | null = null) {
 const OLD = () => new Date(Date.now() - 30 * 60_000);
 
 interface SeedOpts {
+  organizationId?: string;
   serverId?: string | null;
   status?: string;
   updatedAt?: Date;
@@ -382,15 +395,19 @@ function registerServer(id: string | null, organizationId = "org1") {
 /** A single-app (non-compose) project whose deploy settled half an hour ago. */
 function seedApp(opts: SeedOpts = {}) {
   const n = ++h.seq;
+  const organizationId = opts.organizationId ?? "org1";
   const projectId = `p${n}`;
   const depId = `d${n}`;
   const containerId = `container${n}`.padEnd(14, "0");
-  const box = registerServer(opts.serverId === undefined ? "srv1" : opts.serverId);
+  const box = registerServer(
+    opts.serverId === undefined ? "srv1" : opts.serverId,
+    organizationId,
+  );
   h.projects.push({
     id: projectId,
     name: `App ${n}`,
     slug: `app-${n}`,
-    organizationId: "org1",
+    organizationId,
     activeDeploymentId: depId,
     cloudWorkspaceId: opts.cloudWorkspaceId ?? null,
     disabledAt: opts.disabledAt ?? null,
@@ -398,7 +415,7 @@ function seedApp(opts: SeedOpts = {}) {
   h.deployments.push({
     id: depId,
     projectId,
-    organizationId: "org1",
+    organizationId,
     status: opts.status ?? "ready",
     containerId,
     meta: {
@@ -521,6 +538,12 @@ async function tick(opts?: { onlyServerKeys?: ReadonlySet<string>; afterMs?: num
   return runHealthWatch(opts?.onlyServerKeys ? { onlyServerKeys: opts.onlyServerKeys } : undefined);
 }
 
+async function checkCurrent(organizationId = "org1", afterMs = TICK_SPACING_MS) {
+  vi.setSystemTime(Date.now() + afterMs);
+  const { runCurrentHealthScan } = await import("./health-watch");
+  return runCurrentHealthScan(organizationId);
+}
+
 /** Two observations of the same fault, spaced far enough apart to confirm it. */
 async function confirm() {
   await tick();
@@ -565,6 +588,7 @@ beforeEach(() => {
   // still never reset — ids are fresh per seed.
   vi.setSystemTime(START);
   h.projects.length = 0;
+  h.platformTarget = "selfhosted";
   h.deployments.length = 0;
   h.incidents.length = 0;
   h.services.clear();
@@ -584,6 +608,121 @@ beforeEach(() => {
   h.emit.mockClear();
   h.disposed.mockClear();
   h.renew.mockClear();
+});
+
+// ─── Current-state checks ───────────────────────────────────────────────────
+
+describe("current-state check", () => {
+  it("checks a desktop-managed remote Docker deployment without a watcher job", async () => {
+    h.platformTarget = "desktop";
+    const { projectId, containerId } = seedApp({ serverId: "desktop-remote" });
+
+    const result = await checkCurrent();
+    const { isTrackedHealthContainer, listWorkloadHealthSnapshots, watchGroupKey } =
+      await import("./health-watch");
+
+    expect(result.summary).toMatchObject({ servers: 1, projects: 1, workloads: 1 });
+    expect(listWorkloadHealthSnapshots("org1").find((row) => row.projectId === projectId)?.state).toBe("healthy");
+    expect(isTrackedHealthContainer(watchGroupKey("desktop-remote", "org1"), containerId)).toBe(false);
+    expect(h.incidents).toHaveLength(0);
+    expect(h.renew).not.toHaveBeenCalled();
+  });
+
+  it("publishes healthy, unhealthy and down snapshots immediately", async () => {
+    const healthy = seedApp();
+    const unhealthy = seedApp();
+    const down = seedApp();
+    setState(unhealthy.containerId, "running", { health: "unhealthy" });
+    setState(down.containerId, "exited", { exitCode: 1 });
+
+    const result = await checkCurrent();
+    const { listWorkloadHealthSnapshots, getCurrentHealthScan } = await import("./health-watch");
+    const states = new Map(
+      listWorkloadHealthSnapshots("org1").map((row) => [row.projectId, row.state]),
+    );
+
+    expect(states.get(healthy.projectId)).toBe("healthy");
+    expect(states.get(unhealthy.projectId)).toBe("unhealthy");
+    expect(states.get(down.projectId)).toBe("down");
+    expect(result.summary).toMatchObject({ projects: 3, workloads: 3, errors: 0 });
+    expect(getCurrentHealthScan("org1")).toEqual(result);
+    expect(h.incidents).toHaveLength(0);
+    expect(h.emit).not.toHaveBeenCalled();
+    expect(h.renew).not.toHaveBeenCalled();
+  });
+
+  it("scans only the requested organization", async () => {
+    const own = seedApp({ organizationId: "org1", serverId: "srv-own" });
+    const other = seedApp({ organizationId: "org2", serverId: "srv-other" });
+    setState(other.containerId, "exited", { exitCode: 1 });
+
+    const result = await checkCurrent("org1");
+    const { listWorkloadHealthSnapshots } = await import("./health-watch");
+
+    expect(result.summary).toMatchObject({ servers: 1, projects: 1, workloads: 1 });
+    expect(h.inspects).toBe(1);
+    expect(listWorkloadHealthSnapshots("org1").some((row) => row.projectId === own.projectId)).toBe(true);
+    expect(listWorkloadHealthSnapshots("org2").some((row) => row.projectId === other.projectId)).toBe(false);
+  });
+
+  it("does not advance confirmation state or create and resolve incidents", async () => {
+    const { projectId, containerId } = seedApp();
+    setState(containerId, "exited", { exitCode: 1 });
+
+    await checkCurrent();
+    await checkCurrent();
+    expect(openFor(projectId)).toHaveLength(0);
+    expect(h.emit).not.toHaveBeenCalled();
+    expect(h.renew).not.toHaveBeenCalled();
+
+    const firstContinuous = await tick();
+    expect(firstContinuous.pending).toBe(1);
+    expect(openFor(projectId)).toHaveLength(0);
+    await tick();
+    expect(openFor(projectId)).toHaveLength(1);
+
+    h.emit.mockClear();
+    setState(containerId, "running");
+    await checkCurrent();
+    expect(openFor(projectId)).toHaveLength(1);
+    expect(h.emit).not.toHaveBeenCalled();
+
+    await tick();
+    expect(openFor(projectId)).toHaveLength(0);
+    expect(emitted("service.recovered")).toHaveLength(1);
+  });
+
+  it("reports an unreachable host and replaces stale certainty with unknown", async () => {
+    const { projectId } = seedApp();
+    const { listWorkloadHealthSnapshots } = await import("./health-watch");
+
+    await checkCurrent();
+    expect(listWorkloadHealthSnapshots("org1").find((item) => item.projectId === projectId)?.state).toBe("healthy");
+
+    h.listThrows = "connect ECONNREFUSED";
+
+    const result = await checkCurrent();
+    const row = listWorkloadHealthSnapshots("org1").find((item) => item.projectId === projectId);
+
+    expect(result.summary).toMatchObject({ unreachable: 1, workloads: 1, indeterminate: 1 });
+    expect(row?.state).toBe("unknown");
+    expect(h.incidents).toHaveLength(0);
+    expect(h.emit).not.toHaveBeenCalled();
+    expect(h.renew).not.toHaveBeenCalled();
+  });
+
+  it("deduplicates concurrent checks for the same organization", async () => {
+    seedApp();
+    const { runCurrentHealthScan } = await import("./health-watch");
+
+    const [first, second] = await Promise.all([
+      runCurrentHealthScan("org1"),
+      runCurrentHealthScan("org1"),
+    ]);
+
+    expect(second).toEqual(first);
+    expect(h.inspects).toBe(1);
+  });
 });
 
 // ─── Confirmation ────────────────────────────────────────────────────────────

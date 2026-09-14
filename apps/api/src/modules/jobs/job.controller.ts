@@ -11,6 +11,7 @@ import { NotFoundError } from "@repo/core";
 import { param, isServerInOrg } from "../../lib/controller-helpers";
 import { getRequestContext } from "../../lib/request-context";
 import { permission, checkPermissionOnResource } from "../../lib/permission";
+import { assertInstanceAdmin } from "../../middleware/instance-admin";
 import { streamRunSSE } from "../../lib/run-sse";
 import * as jobService from "./job.service";
 import { jobRunBus } from "./job-run.sse";
@@ -38,13 +39,15 @@ async function assertJobServersWritable(c: Context, serverIds: string[]): Promis
 }
 
 /**
- * Write gate for an EXISTING job, by key — the one gate every `/:key` write goes
- * through (update, remove, run).
+ * Write gate for a job by key — the one gate every `/:key` write goes through
+ * (update, remove, run). Update may opt into authorizing an available registered
+ * built-in before its row exists; the service creates it only after this gate.
  *
  * The job KEY is not an authorization boundary: jobs are instance-global, and
- * `job:write` only checks org membership. Authority comes from the job's TARGET
- * SERVERS, and the targets that matter are the ones STORED on the row — plus any
- * the patch adds, since a patch may re-point the job.
+ * `job:write` only checks org membership. Built-in jobs act across the instance,
+ * so only an instance admin may mutate or run them. Authority for a command job
+ * comes from its TARGET SERVERS, and the targets that matter are the ones STORED
+ * on the row — plus any the patch adds, since a patch may re-point the job.
  *
  * Gating only on the body was the hole (reported externally, fixed Aug 2026): an update is a
  * MERGE (`buildActionConfig` keeps the stored `serverIds` when the patch names
@@ -57,10 +60,27 @@ export async function assertJobWritable(
   c: Context,
   key: string,
   patch?: { serverId?: string; serverIds?: string[] },
+  opts: { allowMissingRegisteredSystem?: boolean } = {},
 ): Promise<Response | null> {
   const row = await repos.job.findByKey(key);
-  // Same 404 the service's NotFoundError produced, just reached before the write.
-  if (!row) return jobNotFound(c);
+  // PATCH may repair a missing code-registered row, but authorization must run
+  // before that write. Only an available definition qualifies; an arbitrary key
+  // and a built-in unavailable on this platform remain indistinguishable 404s.
+  if (!row) {
+    if (
+      !opts.allowMissingRegisteredSystem ||
+      jobService.systemJobAvailability(key) !== "available"
+    ) {
+      return jobNotFound(c);
+    }
+    await assertInstanceAdmin(getRequestContext(c));
+    return null;
+  }
+  if (jobService.systemJobAvailability(key) === "unavailable") return jobNotFound(c);
+  if (row.actionType === "builtin") {
+    await assertInstanceAdmin(getRequestContext(c));
+    return null;
+  }
   const targets = [
     ...resolveServerIds((row.actionConfig ?? {}) as CommandConfig),
     ...(patch ? resolveServerIds(patch) : []),
@@ -89,9 +109,10 @@ function jobNotFound(c: Context): Response {
  * Full authorization to RUN a job by key, shared by the run route and any other
  * caller that can trigger a job (e.g. an incoming-webhook `job` action). Jobs are
  * instance-global, so a bare `runJobNow(key)` bypasses both the `job:write` org
- * gate and the per-target server-admin check. Asserts the org gate itself (the
- * webhook path has no route tag to do it) and defers the target check to the
- * shared gate above. Returns a Response (403/404) when denied, else null.
+ * gate and the action-specific check (instance-admin for a built-in, target-
+ * server admin for a command). Asserts the org gate itself (the webhook path has
+ * no route tag to do it) and defers the action check to the shared gate above.
+ * Returns a Response (403/404) when denied, else null.
  */
 export async function assertJobRunnable(c: Context, key: string): Promise<Response | null> {
   await permission.assert(getRequestContext(c), { resourceType: "job", resourceId: "*", action: "write" });
@@ -117,6 +138,14 @@ export async function canRunJob(c: Context, key: string): Promise<boolean> {
   }
   const row = await repos.job.findByKey(key);
   if (!row) return false;
+  if (row.actionType === "builtin") {
+    try {
+      await assertInstanceAdmin(ctx);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   const serverIds = resolveServerIds((row.actionConfig ?? {}) as CommandConfig);
   for (const serverId of new Set(serverIds)) {
     if (!(await checkPermissionOnResource(ctx, { resourceType: "server", resourceId: serverId, action: "admin" }))) {
@@ -244,7 +273,9 @@ export async function update(c: Context) {
   const key = param(c, "key");
   const body = await c.req.json<TUpdateJobBody>();
   // The job's CURRENT targets as well as any the patch adds — see assertJobWritable.
-  const denied = await assertJobWritable(c, key, body);
+  const denied = await assertJobWritable(c, key, body, {
+    allowMissingRegisteredSystem: true,
+  });
   if (denied) return denied;
   const updated = await jobService.updateJob(key, body);
   return c.json({ data: await jobService.getJob(updated.key) });
@@ -262,9 +293,9 @@ export async function remove(c: Context) {
 
 export async function run(c: Context) {
   const key = param(c, "key");
-  // Re-authorize on every manual run: jobs are instance-global, so run-by-key
-  // would otherwise let a member trigger a command job pointed at a server
-  // outside their org. Shared with the incoming-webhook `job` action.
+  // Re-authorize on every manual run: built-ins require an instance admin and
+  // commands require admin access to every target server. Shared with the
+  // incoming-webhook `job` action.
   const denied = await assertJobRunnable(c, key);
   if (denied) return denied;
   const result = await jobService.runJobNow(key);

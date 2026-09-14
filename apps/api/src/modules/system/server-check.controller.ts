@@ -27,12 +27,13 @@ import {
   isSshAuthError,
   recoverInterruptedTakeover,
   scanPorts,
-  probeTcp,
-  type PortScanResult,
   type SystemLog,
   SYSTEM_COMPONENTS,
   getSystemComponentDefinition,
+  REMOTE_SERVER_REQUIRED_COMPONENTS,
+  resolveSystemComponentInstallPlan,
 } from "@repo/adapters";
+import { confirmPortScanReachability } from "../../lib/port-reachability";
 import { formatDuration, systemDebug } from "@/lib/system-debug";
 import { sshManager, buildSshConfig, isTransportFailure } from "../../lib/ssh-manager";
 import { sshKeyPathProblem } from "../../lib/ssh-key-path";
@@ -94,17 +95,6 @@ async function withCapabilities<T extends { name: string; installed?: boolean }>
       };
     }),
   );
-}
-
-/**
- * Core components required for the current deployment mode.
- * These are always shown in System Health regardless of install state.
- */
-function resolveRequiredComponents(): string[] {
-  const mode = env.DEPLOY_MODE;
-  if (mode === "docker") return ["docker", "git"];
-  if (mode === "bare") return ["git"];
-  return ["git"];
 }
 
 /**
@@ -345,9 +335,11 @@ export async function checkServer(c: Context) {
       );
     } else {
       // Check core required + all infrastructure components
-      const required = resolveRequiredComponents();
+      // Remote requirements come from the shared system policy. DEPLOY_MODE is
+      // how this control plane runs, not what this target server needs.
+      const required = [...REMOTE_SERVER_REQUIRED_COMPONENTS];
       const infra = resolveInfraComponents();
-      const requiredSet = new Set(required);
+      const requiredSet = new Set<string>(required);
       const allToCheck = [...required, ...infra.filter((n) => !requiredSet.has(n))];
 
       const allResults = await sshManager.withExecutor(serverId, async (executor) =>
@@ -487,6 +479,28 @@ async function deliverEdgeBeforeInstall(
   });
 }
 
+/** All transitive prerequisites, in install order, excluding the component. */
+function installPrerequisites(component: string): string[] {
+  return resolveSystemComponentInstallPlan([component]).filter((name) => name !== component);
+}
+
+/** Read-only dependency gate shared by both install endpoints. */
+async function missingInstallPrerequisites(
+  executor: CommandExecutor,
+  component: string,
+): Promise<string[]> {
+  const prerequisites = installPrerequisites(component);
+  if (prerequisites.length === 0) return [];
+
+  const statuses = await checkComponents(executor, prerequisites);
+  const healthy = new Set(statuses.filter((status) => status.healthy).map((status) => status.name));
+  return prerequisites.filter((name) => !healthy.has(name));
+}
+
+function dependencyFailureMessage(component: string, missing: string[]): string {
+  return `${component} requires healthy ${missing.join(", ")} on this server. Install ${missing.join(", ")} first.`;
+}
+
 /**
  * POST /system/install
  *
@@ -522,17 +536,38 @@ export async function installComponent(c: Context) {
   // a success-only `logs` would drop exactly the diagnostic the operator needs.
   const logs: string[] = [];
   try {
-    const installResult = await sshManager.withExecutor(serverId, async (executor) => {
+    const outcome = await sshManager.withExecutor(serverId, async (executor) => {
+      // This gate must run before deliverEdgeBeforeInstall: in development that
+      // delivery builds the Edge image on the target and therefore needs Docker
+      // itself. The adapter installer keeps its own guard for non-API callers.
+      const missingDependencies = await missingInstallPrerequisites(executor, componentName);
+      if (missingDependencies.length > 0) return { missingDependencies } as const;
+
       await deliverEdgeBeforeInstall(componentName, executor, (log) => logs.push(log.message));
-      return installerFn(
+      const installResult = await installerFn(
         executor,
         (log) => logs.push(log.message),
         withPinnedEdgeImage(body.config ?? {}),
       );
+      return { installResult } as const;
     });
 
+    if ("missingDependencies" in outcome && outcome.missingDependencies) {
+      const missingDependencies = outcome.missingDependencies;
+      return c.json(
+        {
+          error: "missing_dependency",
+          component: componentName,
+          missing: missingDependencies,
+          message: dependencyFailureMessage(componentName, missingDependencies),
+          logs,
+        },
+        409,
+      );
+    }
+
     return c.json({
-      ...installResult,
+      ...outcome.installResult,
       logs,
     });
   } catch (err) {
@@ -644,6 +679,11 @@ export async function installStream(c: Context) {
     return c.json({ error: "Invalid component names" }, 400);
   }
 
+  // Expand once from the shared dependency graph. This both inserts Docker for
+  // an Edge-only request and normalizes a reversed [edge, docker] request.
+  const installNames = resolveSystemComponentInstallPlan(validNames);
+  const explicitlyRequested = new Set(validNames);
+
   // Check for already running session
   const existing = getActiveSetupSession();
   if (existing) {
@@ -651,7 +691,7 @@ export async function installStream(c: Context) {
   }
 
   // Create session
-  const componentMeta = validNames.map((name) => {
+  const componentMeta = installNames.map((name) => {
     const def = getSystemComponentDefinition(name);
     return { name, label: def.label };
   });
@@ -680,23 +720,20 @@ export async function installStream(c: Context) {
       /** Per-component failure reason, for the cached row below. */
       const failures = new Map<string, string>();
 
-      // Before installing the edge, self-heal a takeover that crashed mid-flight
-      // on this server on a prior attempt (restores the previous proxy if the
-      // migrate didn't finish). No-op when there's no leftover journal.
-      if (validNames.includes("edge")) {
-        try {
-          await sshManager.withExecutor(serverId, (executor) =>
-            recoverInterruptedTakeover(executor, (l) =>
-              appendSetupLog(session.id, "edge", l.message, l.level),
-            ),
-          );
-        } catch {
-          /* best-effort */
-        }
-      }
-
-      for (const name of validNames) {
+      for (const name of installNames) {
         if (closed) break;
+
+        const failedDependencies = installPrerequisites(name).filter((dependency) =>
+          failures.has(dependency),
+        );
+        if (failedDependencies.length > 0) {
+          const msg = dependencyFailureMessage(name, failedDependencies);
+          appendSetupLog(session.id, name, msg, "error");
+          updateComponentProgress(session.id, name, "failed", msg);
+          failures.set(name, msg);
+          hasFailure = true;
+          continue;
+        }
 
         const installerFn = COMPONENT_INSTALLERS[name as keyof typeof COMPONENT_INSTALLERS];
         if (!installerFn) {
@@ -716,6 +753,36 @@ export async function installStream(c: Context) {
           appendSetupLog(session.id, name, log.message, log.level);
 
         try {
+          // A dependency inserted by the planner is not an operator request to
+          // reinstall it. Probe first and skip a healthy Docker daemon, even if
+          // config.reinstall was intended for the requested Edge component.
+          if (!explicitlyRequested.has(name)) {
+            const healthy = await sshManager.withExecutor(serverId, async (executor) => {
+              const statuses = await checkComponents(executor, [name]);
+              return statuses[0]?.healthy === true;
+            });
+            if (healthy) {
+              appendSetupLog(session.id, name, `${name} is already ready; dependency satisfied`);
+              updateComponentProgress(session.id, name, "installed");
+              continue;
+            }
+          }
+
+          // Docker is now known ready (or its failed install skipped this Edge
+          // step above), so it is safe to inspect the container-backed takeover
+          // journal. Doing this before the dependency loop used Docker too early.
+          if (name === "edge") {
+            try {
+              await sshManager.withExecutor(serverId, (executor) =>
+                recoverInterruptedTakeover(executor, (l) =>
+                  appendSetupLog(session.id, "edge", l.message, l.level),
+                ),
+              );
+            } catch {
+              /* best-effort */
+            }
+          }
+
           const result = await sshManager.withExecutor(serverId, async (executor) => {
             await deliverEdgeBeforeInstall(name, executor, onLog);
             // Single edge-prepare point: the installer raises the edge-conflict
@@ -768,7 +835,7 @@ export async function installStream(c: Context) {
       // row, so the attention card names the cause (`bind() … Address already in use`)
       // instead of repeating "is down". Edge only: it's the sole component here that
       // has a container row (mail is provisioned by its own wizard).
-      if (validNames.includes("edge")) {
+      if (installNames.includes("edge")) {
         await refreshServerContainer(serverId, "edge", failures.get("edge"));
       }
 
@@ -1038,64 +1105,11 @@ export async function scanExposedPorts(c: Context) {
 
   try {
     const result = await sshManager.withExecutor(serverId, (executor) => scanPorts(executor));
-    const enriched = await confirmReachability(result, server.sshHost);
+    const enriched = await confirmPortScanReachability(result, server.sshHost);
     return c.json(enriched);
   } catch (err) {
     const message = safeErrorMessage(err);
     if (isSshAuthError(err)) return c.json({ error: "auth_failed", message }, 400);
     return c.json({ error: "scan_failed", message }, 502);
   }
-}
-
-// Off-box reachability probe: the scan's `exposed` flag only means "bound to a
-// non-loopback interface" — a cloud/host firewall (Hetzner, ufw, security group)
-// can still block it. So we dial each exposed TCP port from the API host to learn
-// which are ACTUALLY reachable vs bound-but-blocked. Bounded (cap + concurrency +
-// short timeout) so a box full of firewalled ports can't stall the request.
-const REACHABILITY_MAX_PORTS = 50;
-const REACHABILITY_CONCURRENCY = 16;
-const REACHABILITY_TIMEOUT_MS = 1_500;
-
-async function confirmReachability(
-  result: PortScanResult,
-  host: string | null,
-): Promise<PortScanResult> {
-  // Only meaningful against a real remote target — an off-box dial to
-  // loopback/localhost tells us nothing about internet exposure.
-  const dialable = host && !/^(127\.|::1$|localhost$)/i.test(host.trim());
-  if (!result.scanned || !dialable) {
-    return { ...result, reachabilityProbed: false, reachableCount: 0 };
-  }
-
-  const targets = [
-    ...new Set(
-      result.listeners.filter((l) => l.exposed && l.proto === "tcp").map((l) => l.port),
-    ),
-  ].slice(0, REACHABILITY_MAX_PORTS);
-
-  const reachable = new Map<number, boolean>();
-  const queue = [...targets];
-  const workers = Array.from(
-    { length: Math.min(REACHABILITY_CONCURRENCY, queue.length) },
-    async () => {
-      for (let port = queue.shift(); port !== undefined; port = queue.shift()) {
-        const ok = await probeTcp(host!.trim(), port, REACHABILITY_TIMEOUT_MS).catch(() => false);
-        reachable.set(port, ok);
-      }
-    },
-  );
-  await Promise.all(workers);
-
-  const listeners = result.listeners.map((l) =>
-    l.exposed && l.proto === "tcp" && reachable.has(l.port)
-      ? { ...l, reachable: reachable.get(l.port)! }
-      : l,
-  );
-
-  return {
-    ...result,
-    listeners,
-    reachabilityProbed: true,
-    reachableCount: listeners.filter((l) => l.reachable === true).length,
-  };
 }

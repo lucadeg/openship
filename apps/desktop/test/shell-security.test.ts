@@ -178,6 +178,21 @@ describe("main process navigation containment", () => {
     expect(updateWindow).toMatch(/\.on\(\s*["']will-navigate["']/);
     expect(updateWindow).toMatch(/\.on\(\s*["']will-redirect["']/);
   });
+
+  it("renders advisory copy in the update window before raw release notes", () => {
+    expect(updateWindow).toContain("info.announcement?.title");
+    expect(updateWindow).toContain("info.announcement?.message");
+    expect(updateWindow).toContain('(info.notes || "").trim()');
+    expect(updateWindow).toContain('id="announcement"');
+    expect(updateWindow).toContain('id="notes"');
+  });
+
+  it("keeps the real changelog in its own scrollable region and links to the website", () => {
+    expect(updateWindow).toContain("overflow-y:auto");
+    expect(updateWindow).toContain("min-height:0");
+    expect(updateWindow).toContain("changelogUrl(`v${info.version}`)");
+    expect(updateWindow).toContain("openExternal(INFO.changelogUrl)");
+  });
 });
 
 describe("credential surface is off the bridge", () => {

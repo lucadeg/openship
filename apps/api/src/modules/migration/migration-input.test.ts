@@ -167,6 +167,38 @@ describe("sanitizeRoutes", () => {
     });
   });
 
+  it("preserves exact matching, including an exact root path", () => {
+    expect(
+      sanitizeRoutes({
+        mcp: {
+          domainType: "custom",
+          customDomain: "mcp.example.com",
+          targetPath: "/mcp",
+          exact: true,
+        },
+        root: {
+          domainType: "custom",
+          customDomain: "root.example.com",
+          targetPath: "/",
+          exact: true,
+        },
+      }),
+    ).toEqual({
+      mcp: {
+        domainType: "custom",
+        customDomain: "mcp.example.com",
+        targetPath: "/mcp",
+        exact: true,
+      },
+      root: {
+        domainType: "custom",
+        customDomain: "root.example.com",
+        targetPath: "/",
+        exact: true,
+      },
+    });
+  });
+
   it("drops a spec with no resolvable domain, and returns undefined when nothing is left", () => {
     expect(sanitizeRoutes({ a: { domainType: "free" } })).toBeUndefined();
     expect(sanitizeRoutes(undefined)).toBeUndefined();

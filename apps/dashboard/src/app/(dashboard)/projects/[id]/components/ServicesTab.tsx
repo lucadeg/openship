@@ -59,7 +59,12 @@ export const ServicesTab = () => {
     () => sortServicesByPublicFirst(servicesData.services),
     [servicesData.services],
   );
-  const loading = servicesData.isLoading || containersLoading;
+  // Skeleton only when there is nothing to show. containersLoading flips on
+  // every refetch (and every remount of this tab), so OR-ing it raw flashed
+  // the full-tab skeleton on every action and tab switch (#666) — rows render
+  // fine without container data (status falls back per service).
+  const loading =
+    servicesData.isLoading || (containersLoading && services.length === 0);
   const projectSlugBase = projectData.slug || projectData.name || "project";
   const selectedId = slug?.[1] ?? null;
   const hasProjectId = Boolean(id && id !== "undefined");
@@ -226,7 +231,12 @@ export const ServicesTab = () => {
   }
 
   /* ── Error state ───────────────────────────────────────────────── */
-  if (error || servicesData.error) {
+  // Full-tab error only when there is nothing to show. A failed refetch with
+  // rows on screen keeps them and reports the failure inline — blanking a
+  // working list on a transient 5xx was the same complaint as the skeleton
+  // flash (#666).
+  const failure = error || servicesData.error;
+  if (failure && services.length === 0) {
     return (
       <div className="bg-card rounded-2xl border border-border/50 p-8 text-center">
         <AlertCircle className="size-8 text-danger mx-auto mb-3" />
@@ -521,6 +531,19 @@ export const ServicesTab = () => {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {failure && (
+        <div className="flex items-center gap-2 rounded-xl border border-danger/30 bg-danger/[0.06] px-3 py-2 text-xs text-danger">
+          <AlertCircle className="size-3.5 shrink-0" />
+          <span className="min-w-0 flex-1">{failure}</span>
+          <button
+            onClick={fetchData}
+            className="font-medium underline underline-offset-2"
+          >
+            {t.projects.services.retry}
+          </button>
         </div>
       )}
 

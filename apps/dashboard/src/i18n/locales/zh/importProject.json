@@ -414,5 +414,14 @@
     "rowServices": "服务",
     "rowProject": "项目",
     "rowType": "类型"
+  },
+  "configDiagnostics": {
+    "title": "此仓库的 openship.json 有部分未生效",
+    "description": "下列字段被跳过，文件的其余部分已生效。本次部署将继续。",
+    "titleWholeFile": "已忽略此仓库的 openship.json",
+    "descriptionWholeFile": "文件中没有任何内容生效。本次部署将使用 Openship 自动检测到的设置继续。",
+    "refused": "已拒绝",
+    "unrecognized": "无法识别",
+    "hint": "下次部署前，请在仓库中运行 `openship config validate` 检查该文件。"
   }
 }

@@ -43,3 +43,38 @@ describe("openship deployment rollback", () => {
     expect(fetchStub.calls[0].url).toBe("http://api.test/api/deployments/dep1/rollback");
   });
 });
+
+describe("openship deployment cancel", () => {
+  it("reports success only after the worker lease is released", async () => {
+    fetchStub = stubFetch(() => ({
+      json: { success: true, pending: false, status: "cancelled", message: "Deployment cancelled" },
+    }));
+
+    const { code, err } = await runCommand(deploymentCommand, ["cancel", "dep1"]);
+
+    expect(code).toBe(0);
+    expect(err).toContain("Cancelled dep1");
+    expect(fetchStub.calls[0]).toMatchObject({
+      method: "POST",
+      url: "http://api.test/api/deployments/dep1/cancel",
+    });
+  });
+
+  it("exits non-zero instead of claiming success while cancellation is pending", async () => {
+    fetchStub = stubFetch(() => ({
+      status: 202,
+      json: {
+        success: false,
+        pending: true,
+        status: "cancelling",
+        message: "Cancellation was requested, but the deployment worker is still stopping.",
+      },
+    }));
+
+    const { code, err } = await runCommand(deploymentCommand, ["cancel", "dep1"]);
+
+    expect(code).toBe(1);
+    expect(err).toContain("worker is still stopping");
+    expect(err).not.toContain("Cancelled dep1");
+  });
+});

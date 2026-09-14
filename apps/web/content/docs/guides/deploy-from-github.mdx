@@ -25,17 +25,19 @@ the kitchen that cooks it and serves the meal. You point Openship at the recipe 
 
 Openship needs permission to read your repository. You only do this one time.
 
-Go to **Settings → General** and press **Connect GitHub**. A GitHub window pops up asking "do you allow
+Go to **Settings → Git** and choose a GitHub connection method. A GitHub window may open asking "do you allow
 this?" — say yes. When it closes, you're connected.
 
-<Callout title="Screenshot">Settings → General tab, the "GitHub" card with a **Connect GitHub** button. *(screenshot pending)*</Callout>
+<Callout title="Screenshot">Settings → Git with the GitHub connection choices. *(screenshot pending)*</Callout>
 
 <Callout title="Self-hosted: two ways to connect (no Openship account required)" type="info">
-On a self-hosted instance you're never forced through Openship Cloud. The **GitHub** card in
-**Settings → General** offers:
+On a self-hosted instance you're never forced through Openship Cloud. **Settings → Git** offers:
 
 - **Openship Cloud GitHub App** — the managed App (short-lived tokens, great for remote-server deploys).
   Optional; it needs an Openship Cloud connection.
+- **Your own self-hosted GitHub Apps** — use the one-click manifest flow or register one or more existing
+  GitHub/GitHub Enterprise Apps in the dashboard, then use installation tokens without Openship Cloud or PATs. See
+  [Self-hosted GitHub App](/docs/guides/self-hosted-github-app).
 - **Manual** — connect with your **own** GitHub identity, no Openship in the middle:
   - **`gh` CLI on the instance** — press **Log in with GitHub**; if the instance has `gh` authenticated
     it's picked up immediately, otherwise run the shown `gh auth login` on the box and the page detects it

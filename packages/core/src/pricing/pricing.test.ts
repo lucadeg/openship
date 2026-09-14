@@ -11,8 +11,10 @@ import {
   planAllowsWorkload,
   planAllowsServices,
   planMonthlyCredits,
+  computeUnitsPerMinute,
   resolvePlan,
   resolvePlans,
+  resolveStandard,
   resolveSelfHosted,
   resolveCreditPacks,
   resolveStripePriceId,
@@ -26,7 +28,7 @@ import {
   type PricingLocale,
 } from "./index";
 import { pricingCatalogSchema, pricingCopySchema } from "./schema";
-import { RESOURCE_TIER_ORDER } from "../resources";
+import { RESOURCE_TIER_ORDER, RESOURCE_TIER_SPECS } from "../resources";
 
 const localesDir = fileURLToPath(new URL("./locales", import.meta.url));
 const readLocale = (locale: string) =>
@@ -88,8 +90,8 @@ describe("pricing catalog (pricing.json)", () => {
 
   it("gives each paid tier more credit per dollar than the one below", () => {
     // The stated deal: scaling up must never get worse value.
-    const paid = PRICING.plans.filter((p) => (p.price.monthly ?? 0) > 0 && p.credits.monthlyMilli !== null);
-    const perDollar = paid.map((p) => p.credits.monthlyMilli! / p.price.monthly!);
+    const paid = PRICING.plans.filter((p) => (p.price.monthly ?? 0) > 0 && planMonthlyCredits(p.id) !== null);
+    const perDollar = paid.map((p) => planMonthlyCredits(p.id)! / p.price.monthly!);
     for (let i = 1; i < perDollar.length; i++) {
       expect(perDollar[i]!, `${paid[i]!.id} must not be worse value than ${paid[i - 1]!.id}`).toBeGreaterThan(perDollar[i - 1]!);
     }
@@ -103,9 +105,13 @@ describe("pricing catalog (pricing.json)", () => {
     expect(planAllowsServices("free")).toBe(false);
   });
 
-  it("gives the free tier 15 build minutes and 10 free subdomains", () => {
-    expect(planLimits("free").buildMinutesPerMonth).toBe(15);
+  it("gives the free tier 500 build minutes, 10 free subdomains and no app compute", () => {
+    expect(planLimits("free").buildMinutesPerMonth).toBe(500);
     expect(planLimits("free").freeSubdomains).toBe(10);
+    // 0 is the correct published figure, not a missing one: free is static-only
+    // (`runningServices` is 0), the edge serves static sites, so no app compute is
+    // consumed. The build allowance above is what free actually spends.
+    expect(planLimits("free").computeMinutesPerMonth).toBe(0);
   });
 
   it("never lets a count-bearing limit be 1", () => {
@@ -130,6 +136,7 @@ describe("pricing catalog (pricing.json)", () => {
       "runningServices", // Oblien max_workspaces + plan-guard
       "maxProjects", // plan-guard: assertProjectQuota
       "maxResourceTier", // Oblien max_vcpus/max_ram_mb/max_disk_gb
+      "computeMinutesPerMonth", // Oblien credit quota, via planMonthlyCredits()
       "buildMinutesPerMonth", // plan-guard: assertBuildMinutesAvailable
       "freeSubdomains", // plan-guard: assertFreeSubdomainQuota
       "customDomains", // null everywhere = unlimited, nothing to enforce
@@ -168,13 +175,74 @@ describe("pricing catalog (pricing.json)", () => {
   });
 
   it("keeps every credit grant under the Oblien 10,000,000-credit ceiling", () => {
-    for (const plan of PRICING.plans) {
-      if (plan.credits.monthlyMilli === null) continue;
-      expect(plan.credits.monthlyMilli / 1000, plan.id).toBeLessThanOrEqual(10_000_000);
+    for (const id of PLAN_IDS) {
+      const milli = planMonthlyCredits(id);
+      if (milli === null) continue;
+      expect(milli / 1000, id).toBeLessThanOrEqual(10_000_000);
     }
     for (const pack of PRICING.creditPacks) {
       expect(pack.creditsMilli / 1000, pack.id).toBeLessThanOrEqual(10_000_000);
     }
+  });
+
+  it("grants every finite tier a POSITIVE quota, free included", () => {
+    // `toOblienCredits()` rejects a non-positive quota, and free publishes 0
+    // compute minutes — so deriving the grant from compute alone would make every
+    // free-tier quota push throw at provision time. Build minutes are in the sum
+    // for exactly this reason; this is the test that fails if someone "simplifies"
+    // them back out.
+    for (const id of PLAN_IDS) {
+      const milli = planMonthlyCredits(id);
+      if (milli === null) continue; // enterprise: hand-granted
+      expect(milli, `${id} would be refused by toOblienCredits()`).toBeGreaterThan(0);
+    }
+  });
+
+  it("derives each tier's grant from its published minutes", () => {
+    // The published number and the billed number are one number in two units. If
+    // this drifts, the pricing page and the Oblien quota disagree.
+    const buildMultiplier = PRICING.oblien.buildResources.cpuCores / RESOURCE_TIER_SPECS.low.cpuCores;
+    for (const plan of PRICING.plans) {
+      const { computeMinutesPerMonth: compute, buildMinutesPerMonth: build } = plan.limits;
+      if (compute === null || build === null) {
+        expect(planMonthlyCredits(plan.id), plan.id).toBeNull();
+        continue;
+      }
+      expect(planMonthlyCredits(plan.id), plan.id).toBe((compute + build * buildMultiplier) * 1000);
+    }
+  });
+
+  it("includes enough compute to run a tier's whole app cap around the clock", () => {
+    // "10 apps" next to a budget that runs three of them is the incoherence the
+    // old credit numbers had: Scale advertised 50 running services on 60,000
+    // credits, when one always-on app needs 43,200 minutes a month. A cap the
+    // included compute cannot cover is a number we would be quoting to be sued
+    // over, so the two are locked together here.
+    const MINUTES_PER_MONTH = 43_200;
+    for (const plan of PRICING.plans) {
+      const { runningServices: apps, computeMinutesPerMonth: compute } = plan.limits;
+      if (apps === null || compute === null) continue; // enterprise: negotiated
+      expect(
+        compute,
+        `${plan.id} advertises ${apps} apps but only ${compute} compute minutes ` +
+          `(${apps} apps always-on needs ${apps * MINUTES_PER_MONTH})`,
+      ).toBeGreaterThanOrEqual(apps * MINUTES_PER_MONTH);
+    }
+  });
+
+  it("charges bigger machines proportionally more per minute", () => {
+    // The multiplier is what lets ONE published allowance cover every machine size.
+    // It is derived from RESOURCE_TIER_SPECS so it cannot keep charging 4x for
+    // `high` after `high` has been re-specced.
+    expect(computeUnitsPerMinute("low")).toBe(1);
+    for (const tier of RESOURCE_TIER_ORDER) {
+      expect(computeUnitsPerMinute(tier), tier).toBe(
+        RESOURCE_TIER_SPECS[tier].cpuCores / RESOURCE_TIER_SPECS.low.cpuCores,
+      );
+    }
+    // Ordered, so a larger machine never costs less per minute than a smaller one.
+    const rates = RESOURCE_TIER_ORDER.map((t) => computeUnitsPerMinute(t));
+    expect([...rates].sort((a, b) => a - b)).toEqual(rates);
   });
 
   it("derives Oblien ceilings that can always fit a BUILD workspace", () => {
@@ -392,9 +460,29 @@ describe("pricing copy (locales/*.json)", () => {
   });
 
   it("declares no unused feature copy", () => {
-    const used = new Set([...PRICING.plans.flatMap((p) => p.features), ...PRICING.selfHosted.features]);
+    // This is the guard that keeps a RETIRED promise from lingering. `mailServer`
+    // ("Built-in mail server — SMTP, IMAP, and webmail") sat in all nine locales
+    // while `mail.controller.ts` 404s every mail route under CLOUD_MODE; dropping
+    // the bullet without dropping the copy would leave it one edit from returning.
+    const used = new Set([
+      ...PRICING.plans.flatMap((p) => p.features),
+      ...PRICING.standard.features,
+      ...PRICING.selfHosted.features,
+    ]);
     const declared = Object.keys(en.features as Record<string, string>);
     expect(declared.filter((k) => !used.has(k))).toEqual([]);
+  });
+
+  it("retires the copy for capabilities cloud does not sell", () => {
+    // Named explicitly, because "unused" only catches a key nothing references —
+    // it would not stop someone re-adding `mailServer` to a plan's bullets. Cloud
+    // cannot run mail at all, and preview deploys are not built.
+    const declared = Object.keys(en.features as Record<string, string>);
+    for (const gone of ["mailServer", "previewDeploys"]) {
+      expect(declared, `features.${gone} must stay retired`).not.toContain(gone);
+    }
+    // The self-hosted card still sells mail, and should — that asymmetry is real.
+    expect((en.features as Record<string, string>).selfHostedServices).toMatch(/mail/i);
   });
 
   it("has full key parity across all locales (English is the source of truth)", () => {
@@ -467,19 +555,57 @@ describe("pricing copy (locales/*.json)", () => {
 describe("pricing resolution", () => {
   it("interpolates limits into localized feature copy", () => {
     const free = resolvePlan("free", "en");
-    expect(free.features).toContain("15 build minutes per month");
+    expect(free.features).toContain("500 build minutes per month");
     expect(free.features).toContain("10 free .opsh.io subdomains");
     expect(free.features.join(" ")).not.toMatch(/\{[a-z]/i);
   });
 
   it("formats large counts for the locale", () => {
-    expect(resolvePlan("team", "en").features).toContain("60,000 compute credits per month");
+    expect(resolvePlan("team", "en").features).toContain("2,200,000 compute minutes per month");
     // Arabic is pinned to Latin numerals so a price stays legible.
-    expect(resolvePlan("team", "ar").features.join(" ")).toMatch(/60/);
+    expect(resolvePlan("team", "ar").features.join(" ")).toMatch(/2,200,000/);
   });
 
-  it("names the inherited tier in the everything-in line", () => {
-    expect(resolvePlan("pro", "en").features[0]).toBe("Everything in Starter, plus:");
+  it("differentiates tiers on usage and size, not on capability", () => {
+    // The point of the model: above free, what separates two tiers is FIVE numbers
+    // and a support level. A tier that gained a capability bullet the tier below
+    // lacks would be the regression this locks out.
+    for (const id of ["starter", "pro", "team"] as const) {
+      const words = resolvePlan(id, "en").features.join(" ");
+      expect(words, `${id} must quote compute minutes`).toMatch(/compute minutes/);
+      expect(words, `${id} must quote build minutes`).toMatch(/build minutes/);
+      expect(words, `${id} must quote a machine size`).toMatch(/vCPU/);
+      // Nothing that reads as a paywall on something every tier already has.
+      expect(words, `${id} must not gate the audit log`).not.toMatch(/audit/i);
+      // Deliberately not a bare /mail/ — that matches "Email support", which is a
+      // support level, not a mail server.
+      expect(words, `${id} must not sell mail`).not.toMatch(/mail server|webmail|SMTP|IMAP/i);
+    }
+  });
+
+  it("states what every plan includes exactly once", () => {
+    const standard = resolveStandard("en");
+    expect(standard.title).toBe("In every plan");
+    expect(standard.features).toContain("Audit log of every change");
+    expect(standard.features.join(" ")).not.toMatch(/\{[a-z]/i);
+    // It is a shared block, so it must not also be duplicated into a tier column.
+    for (const id of PLAN_IDS) {
+      const tier = resolvePlan(id, "en").features;
+      for (const line of standard.features) {
+        expect(tier, `${id} duplicates the shared line "${line}"`).not.toContain(line);
+      }
+    }
+  });
+
+  it("names the inherited tier in the everything-in line, OUTSIDE the bullet list", () => {
+    const pro = resolvePlan("pro", "en");
+    expect(pro.inheritedFrom).toBe("Everything in Starter, plus:");
+    // The reason it moved: every surface renders `features` with a checkmark per
+    // item, so while this sentence lived in the list a transition ending in a colon
+    // was drawn as one of the things you get.
+    expect(pro.features.join(" ")).not.toMatch(/Everything in/);
+    // Free inherits nothing, so it has no lead-in at all.
+    expect(resolvePlan("free", "en").inheritedFrom).toBeUndefined();
   });
 
   it("renders unlimited instead of a blank for a null limit", () => {
@@ -511,8 +637,31 @@ describe("pricing resolution", () => {
     for (const id of PLAN_IDS) expect(PLANS[id]).toEqual(resolvePlan(id, "en"));
   });
 
-  it("names credit packs from their credit count", () => {
-    expect(resolveCreditPacks("en").map((p) => p.name)).toEqual(["5,000 credits", "25,000 credits", "100,000 credits"]);
+  it("explains what a top-up pack actually buys", () => {
+    const packs = resolveCreditPacks("en");
+    const small = packs.find((p) => p.id === "pack_5k")!;
+    // 5,000 compute minutes ÷ 60 = 83 hours of a `low` app; ÷ 8 (the build
+    // machine's rate) = 625 build minutes. "+5,000 compute minutes" alone answers
+    // nothing — nobody knows if that is an afternoon or a year.
+    expect(small.explains).toBe("≈ 83 hours of a small app, or 625 build minutes");
+    // Derived, not authored: every pack gets the line, in every locale, with no
+    // placeholder left unresolved.
+    for (const locale of PRICING_LOCALES) {
+      for (const pack of resolveCreditPacks(locale)) {
+        expect(pack.explains, `${locale}/${pack.id}`).toBeTruthy();
+        expect(pack.explains, `${locale}/${pack.id}`).not.toMatch(/\{\w+\}/);
+      }
+    }
+  });
+
+  it("names credit packs in the unit the plans publish", () => {
+    // Authored in credits (`creditsMilli`, live Stripe price ids untouched), SOLD in
+    // compute minutes — one compute minute is one credit, so the number is the same.
+    expect(resolveCreditPacks("en").map((p) => p.name)).toEqual([
+      "5,000 compute minutes",
+      "25,000 compute minutes",
+      "100,000 compute minutes",
+    ]);
     expect(CREDIT_PACKS[0]!.credits_milli).toBe(5_000_000);
   });
 

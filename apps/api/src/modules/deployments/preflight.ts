@@ -15,6 +15,7 @@ import type { DeploymentConfigSnapshot } from "./build.service";
 import { platform } from "../../lib/controller-helpers";
 import {
   resolveEffectiveTarget,
+  resolvePlannedTargetTopology,
   usesManagedRouting as usesManagedRoutingFor,
 } from "../../lib/deployment-runtime";
 import {
@@ -29,7 +30,11 @@ import {
 import { cloudClient } from "../../lib/cloud/client";
 import { isCloudConnectedForOrg } from "../../lib/cloud/session";
 import { runCloudPreflight, type CloudPreflightData } from "../../lib/cloud-preflight";
-import { isStaticService, type DeployableService } from "../../lib/deployable-service";
+import {
+  isStaticService,
+  resolveSubAppRecipe,
+  type DeployableService,
+} from "../../lib/deployable-service";
 import { isFullyPinned, snapshotNeedsGitSource } from "./pinned-artifacts";
 import { snapshotToClass } from "./deployment-class";
 import { relayConfigEligible, resolveClonePlan } from "./clone-plan";
@@ -47,8 +52,8 @@ import {
   getInstallationId,
   getInstallationIdByOrg,
   getGitHubAuthMode,
-  getInstallUrl,
   resolveGitHubAuthMode,
+  resolveInstallUrl,
 } from "../github/github.auth";
 import { canResolveTokenFor } from "../github/github.token";
 import { canResolveServerGitCredential } from "../github/server-github.service";
@@ -221,6 +226,7 @@ async function checkGitHubAppInstallation(
   if (installationId) {
     return { ...baseCheck, status: "pass" };
   }
+  const install = await resolveInstallUrl(ctx);
   return {
     ...baseCheck,
     status: "fail",
@@ -228,7 +234,7 @@ async function checkGitHubAppInstallation(
     message:
       `The Openship GitHub App is not installed on "${owner}". ` +
       `Deploys need it to mint a scoped token for cloning the repo. ` +
-      `Install it at ${getInstallUrl()} and deploy again.`,
+      `Install it at ${install.url} and deploy again.`,
   };
 }
 
@@ -516,10 +522,7 @@ async function checkPublicEndpoints(
 
   // Collection-level rule: a cloud static deploy supports at most one
   // explicit path-targeted endpoint.
-  if (
-    isCloudStatic &&
-    endpoints.filter((e) => typeof e.targetPath === "string").length > 1
-  ) {
+  if (isCloudStatic && endpoints.filter((e) => typeof e.targetPath === "string").length > 1) {
     checks.push(
       fail(
         "endpoint-static-cloud-shape",
@@ -596,13 +599,21 @@ async function checkPublicEndpoints(
       const hostname = endpoint.customDomain ? normalizeCustomHostname(endpoint.customDomain) : "";
       if (!hostname) {
         checks.push(
-          fail(idOf("domain"), `Endpoint domain (${label})`, "Custom endpoint domains cannot be empty."),
+          fail(
+            idOf("domain"),
+            `Endpoint domain (${label})`,
+            "Custom endpoint domains cannot be empty.",
+          ),
         );
         return;
       }
       if (seenHostnames.has(hostname)) {
         checks.push(
-          fail(idOf("domain"), `Endpoint domain (${label})`, `Duplicate domain configured: ${hostname}`),
+          fail(
+            idOf("domain"),
+            `Endpoint domain (${label})`,
+            `Duplicate domain configured: ${hostname}`,
+          ),
         );
         return;
       }
@@ -614,7 +625,11 @@ async function checkPublicEndpoints(
     const slug = endpoint.domain?.trim().toLowerCase();
     if (!slug) {
       checks.push(
-        fail(idOf("slug"), `Endpoint subdomain (${label})`, "Free endpoint subdomains cannot be empty."),
+        fail(
+          idOf("slug"),
+          `Endpoint subdomain (${label})`,
+          "Free endpoint subdomains cannot be empty.",
+        ),
       );
       return;
     }
@@ -626,7 +641,11 @@ async function checkPublicEndpoints(
     const hostname = `${slug}.${baseDomain}`;
     if (seenHostnames.has(hostname)) {
       checks.push(
-        fail(idOf("domain"), `Endpoint domain (${label})`, `Duplicate domain configured: ${hostname}`),
+        fail(
+          idOf("domain"),
+          `Endpoint domain (${label})`,
+          `Duplicate domain configured: ${hostname}`,
+        ),
       );
       return;
     }
@@ -647,7 +666,11 @@ async function checkPublicEndpoints(
           ? await requestCloudPreflight(snapshot, { customDomain: lk.hostname })
           : cloud;
         const result = await checkCustomDomain(lk.hostname, endpointCloud, snapshot);
-        return { ...result, id: `endpoint-${lk.index}-domain`, label: `Endpoint domain (${lk.label})` };
+        return {
+          ...result,
+          id: `endpoint-${lk.index}-domain`,
+          label: `Endpoint domain (${lk.label})`,
+        };
       }
       // Redeploy reclaiming a subdomain this project already holds live is not
       // a conflict — skip the cloud availability probe entirely for it.
@@ -786,8 +809,7 @@ async function resolveCloudPreflight(
   // to ping cloud preflight. Cloud-target deploys obviously need it
   // too (cloud IS doing the deploy). Single authority shared with the pipeline.
   const usesManagedRouting = usesManagedRoutingFor(plat.target, effectiveTarget);
-  const hasManagedPublicEndpoints =
-    storedPublicEndpointsNeedCloud(opts?.publicEndpoints);
+  const hasManagedPublicEndpoints = storedPublicEndpointsNeedCloud(opts?.publicEndpoints);
   // The project-level free-domain slug is a routable web hostname only for a
   // single-app project. In services mode there is no project domain — each
   // service routes via its own endpoint (needsManagedComposeDomains), so an
@@ -797,8 +819,7 @@ async function resolveCloudPreflight(
   const needsManagedProjectDomain =
     (!opts?.multiService && !!opts?.slug && !opts?.customDomain && usesManagedRouting) ||
     (usesManagedRouting && hasManagedPublicEndpoints);
-  const needsManagedComposeDomains =
-    composeServicesNeedCloud(opts?.composeServices, opts?.slug);
+  const needsManagedComposeDomains = composeServicesNeedCloud(opts?.composeServices, opts?.slug);
   const needsCloudPreflight =
     effectiveTarget === "cloud" || needsManagedProjectDomain || needsManagedComposeDomains;
   const requestInput = opts?.publicEndpoints?.length
@@ -823,6 +844,17 @@ async function resolveCloudPreflight(
 
 function checkConfig(snapshot: DeploymentConfigSnapshot, opts?: PreflightOptions): PreflightCheck {
   const missing: string[] = [];
+  const releaseImageRef = snapshot.releaseImageRef?.trim();
+
+  if (releaseImageRef && opts?.multiService) {
+    return {
+      id: "config",
+      label: "Service configuration",
+      status: "fail",
+      message:
+        "A project-level release image deploys one app. Configure images on the individual services for a multi-service project.",
+    };
+  }
 
   // A FULLY PINNED deploy (a rollback restoring a retained artifact, a migration
   // cutover) builds nothing and clones nothing: it runs an artifact that was
@@ -845,10 +877,12 @@ function checkConfig(snapshot: DeploymentConfigSnapshot, opts?: PreflightOptions
   // A folder-upload deploy has no git and no host path — its source is the
   // pre-staged upload workspace (`sourceStaged`, set by requestBuildAccess).
   // That's a valid source, so it satisfies both the source and branch checks.
-  if (!snapshot.repoUrl && !snapshot.localPath && !snapshot.sourceStaged) {
+  if (!snapshot.repoUrl && !snapshot.localPath && !snapshot.sourceStaged && !releaseImageRef) {
     missing.push("repository URL or local path");
   }
-  if (!snapshot.branch && !snapshot.localPath && !snapshot.sourceStaged) missing.push("branch");
+  if (!snapshot.branch && !snapshot.localPath && !snapshot.sourceStaged && !releaseImageRef) {
+    missing.push("branch");
+  }
 
   if (opts?.multiService) {
     // A services/compose deploy needs a project repo/localPath ONLY when some
@@ -923,18 +957,23 @@ function checkConfig(snapshot: DeploymentConfigSnapshot, opts?: PreflightOptions
       // Requiring them here would block every Dockerfile-based monorepo
       // sub-app (e.g. a Railway-style per-service-Dockerfile repo).
       if (svc.framework === "docker") continue;
-      const installFallback = svc.installCommand ?? snapshot.installCommand;
-      const buildFallback = svc.buildCommand ?? snapshot.buildCommand;
-      const startFallback = svc.startCommand ?? snapshot.startCommand;
+      // One resolver for the row-vs-snapshot fallback, shared with the buildable
+      // selector — a monorepo row legitimately inherits its commands from the
+      // project, so asking the RAW row is how preflight and the builder disagree.
+      const resolved = resolveSubAppRecipe(svc, snapshot);
+      const installFallback = resolved.installCommand;
+      const buildFallback = resolved.buildCommand;
+      const startFallback = resolved.startCommand;
       // A static sub-app is served as FILES — on self-hosted straight off the host
-      // by the edge, on cloud by a generated nginx image. Either way it needs a
-      // build (to produce the output dir) and NO start command.
-      if (isStaticService(svc)) {
-        if (!buildFallback) {
-          subAppFailures.push(`sub-app "${svc.name}" missing build command`);
-        }
-        continue;
-      }
+      // by the edge, on cloud by a generated nginx image. Either way it needs NO
+      // start command, and it needs no BUILD either: the extract-only recipe is a
+      // valid Dockerfile with an empty build step, so a sub-app that is already
+      // just files (hand-written HTML/CSS, a committed `dist`) is deployable as-is.
+      // Requiring one here refused the deploy outright for exactly the shape the
+      // single-app path explicitly allows ("a static workload needs neither a start
+      // command nor a port"), so the same folder deployed as a project and was
+      // rejected as a sub-app.
+      if (isStaticService(resolved)) continue;
       // hasBuild/hasServer aren't per-service today - fall back to the
       // project-level booleans on the snapshot. Conservative: if either
       // the project says it has a build OR has a server, the sub-app must
@@ -973,14 +1012,16 @@ function checkConfig(snapshot: DeploymentConfigSnapshot, opts?: PreflightOptions
   // image), so buildImage is never consumed — refusing the deploy for a missing
   // buildImage there is wrong (it blocked repo-Dockerfile + self-app deploys).
   // Mirrors the multi-service branch's dockerfile/build check. #231
-  if (snapshot.framework !== "docker" && !snapshot.buildImage) missing.push("build image");
+  if (!releaseImageRef && snapshot.framework !== "docker" && !snapshot.buildImage) {
+    missing.push("build image");
+  }
 
   // A single-project Dockerfile owns install, build, and process startup. Those
   // buildpack commands are deliberately empty after repository/folder detection
   // and are not consumed by the Docker pipeline. The workload-specific checks
   // below still enforce a port for web apps.
   const dockerOwnsBuild = snapshot.framework === "docker";
-  if (!dockerOwnsBuild && snapshot.hasBuild && !snapshot.installCommand) {
+  if (!releaseImageRef && !dockerOwnsBuild && snapshot.hasBuild && !snapshot.installCommand) {
     missing.push("install command");
   }
 
@@ -988,7 +1029,9 @@ function checkConfig(snapshot: DeploymentConfigSnapshot, opts?: PreflightOptions
   if (cls.workload === "web") {
     // A web app is reached on a port and must declare how it starts and listens.
     // Dockerfile apps inherit their process command from the image.
-    if (!dockerOwnsBuild && !snapshot.startCommand) missing.push("start command");
+    // A prebuilt image may intentionally inherit its Dockerfile CMD.
+    if (!releaseImageRef && !dockerOwnsBuild && !snapshot.startCommand)
+      missing.push("start command");
     if (!snapshot.port) missing.push("port");
   } else if (cls.workload === "worker") {
     // A worker is a portless long-running container (#538-B): it needs a command
@@ -1218,9 +1261,7 @@ async function checkCustomDomainSelfHosted(
  * at the cloud edge directly. Non-blocking; the .opsh.io free domain
  * stays attached so the deploy still ships.
  */
-async function checkCustomDomainCloudCname(
-  customDomain: string,
-): Promise<PreflightCheck> {
+async function checkCustomDomainCloudCname(customDomain: string): Promise<PreflightCheck> {
   const records = await resolveRecords(customDomain, "CNAME", {
     timeoutMs: DOMAIN_CHECK_TIMEOUT_MS,
   });
@@ -1409,11 +1450,12 @@ export async function runPreflightChecks(
   const hasEndpointRouting = !!opts?.publicEndpoints?.length;
   const hasManagedProjectDomain =
     !opts?.multiService &&
-    !hasEndpointRouting && !!opts?.slug && !opts?.customDomain && usesManagedRouting;
-  const hasManagedPublicEndpoints =
-    storedPublicEndpointsNeedCloud(opts?.publicEndpoints);
-  const hasManagedComposeDomains =
-    composeServicesNeedCloud(opts?.composeServices, opts?.slug);
+    !hasEndpointRouting &&
+    !!opts?.slug &&
+    !opts?.customDomain &&
+    usesManagedRouting;
+  const hasManagedPublicEndpoints = storedPublicEndpointsNeedCloud(opts?.publicEndpoints);
+  const hasManagedComposeDomains = composeServicesNeedCloud(opts?.composeServices, opts?.slug);
   const cloudRequirement =
     effectiveTarget === "cloud"
       ? "cloud-runtime"
@@ -1483,16 +1525,37 @@ export async function runPreflightChecks(
   // demands, and the deploy-time clone goes anonymous (clone-auth.ts).
   const ghRepo = parseGithubOwnerRepo(snapshot.repoUrl, opts?.gitOwner, opts?.gitRepo);
   const repoIsPublic = ghRepo ? await isPublicRepo(ghRepo.owner, ghRepo.repo) : false;
+  const needsGitCredentialPlan =
+    !repoIsPublic && !!opts?.gitOwner && snapshotNeedsGitSource(snapshot, opts?.composeServices);
+  const runtimeMode = snapshot.runtimeMode ?? "docker";
+  const plannedTarget = needsGitCredentialPlan
+    ? await resolvePlannedTargetTopology(
+        effectiveTarget,
+        snapshot.serverId,
+        snapshot.organizationId,
+      )
+    : null;
+  const clonePlan = resolveClonePlan({
+    effectiveTarget,
+    serverId: plannedTarget?.serverId ?? snapshot.serverId,
+    runtimeIsBare: runtimeMode === "bare",
+    cloneStrategy: snapshot.cloneStrategy,
+    buildStrategy: effectiveBuildStrategy,
+    isDesktop: plat.target === "desktop",
+    forwardGitCredentials: snapshot.forwardGitCredentials,
+    repoIsGithub: !!opts?.gitOwner,
+    dockerTransport: runtimeMode === "docker" ? plannedTarget?.dockerTransport : undefined,
+  });
 
-  // GitHub App installation check — only relevant when the repo is cloned on a
-  // REMOTE build worker (server build). A LOCAL build ("Build on this machine")
-  // clones on the API host using local credentials (gh CLI / OAuth), so the
-  // cloud App installation is irrelevant — skip it. This mirrors the
-  // remote-clone-token check below, which already passes for local builds.
-  if (!repoIsPublic && getGitHubAuthMode() === "app" && effectiveBuildStrategy !== "local") {
-    checks.push(
-      await checkGitHubAppInstallation(githubCtx, opts?.gitOwner),
-    );
+  // Installation auth is relevant only beyond the API-host credential boundary.
+  // In particular, a server-row deployment over a local Docker socket still
+  // acquires source in the API container and must not be treated as remote.
+  if (
+    needsGitCredentialPlan &&
+    getGitHubAuthMode() === "app" &&
+    clonePlan.cloneCredentialPurpose === "server"
+  ) {
+    checks.push(await checkGitHubAppInstallation(githubCtx, opts?.gitOwner));
   }
 
   // A remote clone credential is only needed when the repo is actually cloned
@@ -1502,17 +1565,15 @@ export async function runPreflightChecks(
   // the API host), and cloud builds clone inside the workspace. So the two
   // credential checks below apply only to bare + server; otherwise the clone is
   // local and these checks would wrongly demand a remote/App/cloud credential.
-  const runtimeMode = snapshot.runtimeMode ?? "docker";
   const clonesOnRemote =
-    !repoIsPublic &&
+    needsGitCredentialPlan &&
     runtimeMode === "bare" &&
     // Only a WEB workload can build on a bare remote worker: static apps build
     // in a Docker sandbox and workers build in Docker (both clone on the
     // orchestrator), so neither ever needs a remote clone credential even when
     // runtimeMode is "bare" (#538-B).
     snapshotToClass(snapshot).workload === "web" &&
-    effectiveTarget === "server" &&
-    effectiveBuildStrategy !== "local";
+    clonePlan.cloneRunsOnTarget;
 
   if (clonesOnRemote) {
     // Remote-build credential check. For App-scoped modes (app / cloud-app):
@@ -1552,20 +1613,7 @@ export async function runPreflightChecks(
   // is already covered by the hard-fail clonesOnRemote checks above.
   // Same clone decision the build pipeline uses (resolveClonePlan) — so this
   // credential check verifies exactly the clone the pipeline will perform.
-  const dockerClonesOnServer = resolveClonePlan({
-    effectiveTarget,
-    serverId: snapshot.serverId,
-    runtimeIsBare: runtimeMode === "bare",
-    cloneStrategy: snapshot.cloneStrategy,
-    buildStrategy: effectiveBuildStrategy,
-    isDesktop: plat.target === "desktop",
-    forwardGitCredentials: snapshot.forwardGitCredentials,
-    // GitHub projects carry a parsed gitOwner; docker acquires the source
-    // tarball on the server for them. Same structured signal the pipeline uses
-    // (`!!project.gitOwner`) so the two decisions can't drift.
-    repoIsGithub: !!opts?.gitOwner,
-  }).dockerClonesOnServer;
-  if (dockerClonesOnServer) {
+  if (needsGitCredentialPlan && clonePlan.dockerClonesOnTarget) {
     checks.push(
       await checkCloneOnServerCredential(
         githubCtx,
@@ -1583,12 +1631,25 @@ export async function runPreflightChecks(
 
   if (opts?.composeServices?.length) {
     checks.push(
-      ...(await checkComposeServiceDomains(opts.composeServices, opts.slug, cloudPreflight, snapshot)),
+      ...(await checkComposeServiceDomains(
+        opts.composeServices,
+        opts.slug,
+        cloudPreflight,
+        snapshot,
+      )),
     );
   }
 
   if (opts?.publicEndpoints?.length) {
-    checks.push(...(await checkPublicEndpoints(snapshot, opts.publicEndpoints, cloudPreflight, opts.ctx, opts.projectId)));
+    checks.push(
+      ...(await checkPublicEndpoints(
+        snapshot,
+        opts.publicEndpoints,
+        cloudPreflight,
+        opts.ctx,
+        opts.projectId,
+      )),
+    );
   }
 
   // Catch the "this deploy will have no public URL" foot-gun: self-hosted,
@@ -1602,9 +1663,7 @@ export async function runPreflightChecks(
   const hasAnyEndpointDomain = (opts?.publicEndpoints ?? []).some(
     (endpoint) => !!endpoint.domain || !!endpoint.customDomain,
   );
-  const hasAnyComposeExposed = (opts?.composeServices ?? []).some(
-    (service) => service.exposed,
-  );
+  const hasAnyComposeExposed = (opts?.composeServices ?? []).some((service) => service.exposed);
   const willHavePublicUrl =
     effectiveTarget === "cloud" ||
     cloudRequirement !== "none" ||

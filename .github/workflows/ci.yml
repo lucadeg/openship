@@ -4,12 +4,16 @@ on:
   pull_request: {}
   push:
     branches: [main]
-    # Tags run typecheck + tests here for the record; nothing in THIS file gates a
-    # release, because workflows are not ordered against one another. The checks that
-    # BLOCK a publish — this same suite plus the real-daemon E2E matrix, which used to
-    # live in this file and only ever ran alongside the release it claimed to gate —
-    # are in release-gate.yml, which Release and Docker images both list in `needs:`.
-    tags: ["v*"]
+    # NO `tags:` here, deliberately. Nothing in THIS file gates a release — the checks
+    # that BLOCK a publish (this same suite plus the real-daemon E2E matrix) live in
+    # release-gate.yml, which Release and Docker images each list in `needs:` because
+    # workflows are not ordered against one another.
+    #
+    # It used to run on tags too, "for the record". The record was three copies: the gate
+    # runs this suite once per calling workflow, so a tag push executed typecheck + tests
+    # THREE times and produced one extra full run whose result gated nothing and whose
+    # failure nobody could act on differently. A tag is not branch-protected, so no
+    # required check disappears with it.
   workflow_dispatch: {}
 
 # One in-flight run per ref. PR pushes cancel their predecessor — nobody reads

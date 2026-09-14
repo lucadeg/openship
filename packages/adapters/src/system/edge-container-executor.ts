@@ -107,8 +107,10 @@ async function writeEdgeFileIn(
   container: string | null,
   path: string,
   content: string,
+  opts?: { mode?: number },
 ): Promise<void> {
-  await inner.writeFile(path, content);
+  if (opts === undefined) await inner.writeFile(path, content);
+  else await inner.writeFile(path, content, opts);
   if (!container) return;
   const visible = await inner
     .exec(containerCommand(container, `test -e ${sq(path)} && echo visible`))
@@ -218,8 +220,8 @@ export function edgeContainerExecutor<E extends CommandExecutor>(
     // with one probe saved.
     Object.assign(overrides, {
       readFile: (path: string) => readMaybeInContainer(inner, path, container),
-      writeFile: (path: string, content: string) =>
-        writeEdgeFileIn(inner, container, path, content),
+      writeFile: (path: string, content: string, writeOpts?: { mode?: number }) =>
+        writeEdgeFileIn(inner, container, path, content, writeOpts),
       exists: async (path: string) => {
         if (await inner.exists(path).catch(() => false)) return true;
         // `test` reports absence via exit code — an answer, not a failure.

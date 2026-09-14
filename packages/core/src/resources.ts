@@ -82,6 +82,20 @@ export interface HostCapacity {
   source: "docker" | "local" | "unknown";
 }
 
+/** Project resource settings returned by the API and consumed by the dashboard. */
+export interface ProjectResources {
+  production: ResourceValues;
+  build: ResourceValues;
+  sleepMode: string;
+  port: number;
+  /** Preset matching the saved production values. */
+  tier: ResourceTier;
+  /** Target-machine ceiling; `source: "unknown"` means the probe failed. */
+  capacity?: HostCapacity;
+  /** Cloud targets require limits; self-hosted targets may use the whole machine. */
+  requiresLimit: boolean;
+}
+
 export const UNKNOWN_CAPACITY: HostCapacity = { cpuCores: 0, memoryMb: 0, source: "unknown" };
 
 export function hasCpuLimit(r?: { cpuCores?: number } | null): boolean {

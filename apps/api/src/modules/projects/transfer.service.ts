@@ -12,11 +12,15 @@
  *                                 wipe the local rows, restore, clear
  *                                 cloudWorkspaceId. (Demote — see plan.)
  *
- * SCOPE OF THIS FILE: data-layer transfer only. Container teardown on the
- * source side, mail-server reattachment, GitHub installation re-binding,
- * DNS / domain re-provisioning, and racing concurrent deploys are
- * INTENTIONALLY deferred for the business-logic discussion. The hooks for
- * those live as TODOs below.
+ * SCOPE OF THIS FILE: the data-layer transfer, plus source-side teardown on the
+ * PROMOTE path — which calls `teardownProject(… force, preserveWebhook)` once the
+ * rows have landed, so that half is no longer deferred.
+ *
+ * Still INTENTIONALLY deferred for the business-logic discussion, with hooks as
+ * TODOs below: destroying the cloud workspace RUNTIME on the bring-home path,
+ * re-triggering the local deploy, mail-server reattachment, GitHub installation
+ * re-binding, DNS / domain re-provisioning, the audit_event row, and racing
+ * concurrent deploys.
  */
 
 import {

@@ -43,7 +43,11 @@ export const MAX_TOTAL_CHARS = 4_000_000;
  * Credentials embedded in a URL's userinfo. The shape that matters is the one
  * `injectGitToken` builds for a private clone:
  *
- *   https://x-access-token:<installation-token>@github.com/owner/repo.git
+ *   https://<user-token>:x-oauth-basic@github.com/owner/repo.git   (PAT / OAuth)
+ *   https://x-access-token:<installation-token>@github.com/owner/repo.git   (App)
+ *
+ * Both are matched by userinfo position, not by which slot holds the secret, so a
+ * change to the credential pair cannot quietly stop the redaction from firing.
  *
  * That URL is interpolated into a shell command whose git output is streamed into
  * the persisted build log, so without this the token lands in `build_session.logs`
@@ -148,18 +152,43 @@ function stripAndRepair(text: string): string {
  * are dropped (except TAB, LF, ESC), CR included — `collapseTerminalLogs` has
  * already resolved carriage-return overwrites into final lines by the time we
  * run — and unpaired surrogates become U+FFFD. Valid multi-byte UTF-8 and
- * surrogate PAIRS pass through untouched.
+ * surrogate PAIRS pass through untouched. Credentials are redacted on the way through
+ * — see `storableTextPreservingSecrets` for the variant that must not.
+ */
+export function sanitizeLogText(text: string): string {
+  return storableText(text, true);
+}
+
+/**
+ * The STORABILITY half of `sanitizeLogText`, without the redaction half.
  *
+ * For structured values where the string IS the operational record and a `***` in it
+ * is not a redaction but a break: a backup artifact's `restoreCommand`. That command
+ * is the only record of how to put the artifact back (`CustomCommandProducer.restore`
+ * reads it straight off the recorded metadata), so scrubbing the DSN out of it left an
+ * artifact that LOOKED restorable and died on authentication — while the real command
+ * sat unredacted in the destination's own manifest.json, which is the copy that leaves
+ * the box. Redacting the DB copy therefore protected nothing and cost the restore.
+ *
+ * Storability is NOT optional and is why this exists rather than a bare passthrough:
+ * Postgres refuses a NUL in a text column outright and refuses a lone surrogate in
+ * jsonb, and this value rides into the SAME write as the run's terminal status.
+ */
+export function storableTextPreservingSecrets(text: string): string {
+  return storableText(text, false);
+}
+
+/**
  * ORDER MATTERS: capping runs after the repair pass, so anything the cut itself
  * introduces would never be re-examined. The cut is pair-safe, and the repair is
  * re-run when it actually fired, so the returned string is well-formed no matter
- * what the input was.
+ * what the input was. Redaction, when asked for, runs FIRST — before the cap. A cut
+ * that lands mid-token would leave a prefix behind and, worse, would stop the pattern
+ * matching at all, so redacting after capping would silently do nothing for exactly
+ * the longest lines.
  */
-export function sanitizeLogText(text: string): string {
-  // Redaction runs FIRST, before the cap. A cut that lands mid-token would leave a
-  // prefix behind and, worse, would stop the pattern matching at all — so redacting
-  // after capping would silently do nothing for exactly the longest lines.
-  const cleaned = stripAndRepair(redactCredentials(text));
+function storableText(text: string, redact: boolean): string {
+  const cleaned = stripAndRepair(redact ? redactCredentials(text) : text);
   const capped = capEntryLength(cleaned);
   return capped === cleaned ? capped : stripAndRepair(capped);
 }
@@ -248,18 +277,56 @@ function boundTotalSize(entries: LogEntry[]): LogEntry[] {
  * there doesn't just lose the message, it fails the deploy.
  */
 export function sanitizeStorableStrings<T>(value: T, depth = 0): T {
-  if (typeof value === "string") return sanitizeLogText(value) as T;
+  return deepStorable(value, depth, null, false) as T;
+}
+
+/**
+ * `sanitizeStorableStrings`, except that strings reached through one of `preserveKeys`
+ * keep their credentials (they are still made storable — see
+ * `storableTextPreservingSecrets`).
+ *
+ * For structured records where a field's VALUE is a command or connection string that
+ * something later has to execute. The redactor cannot tell those apart from log output,
+ * and turning `mongodb://root:pw@host` into `mongodb://***@host` inside a backup
+ * artifact's `restoreCommand` does not remove the secret from anywhere — the same
+ * command is written unredacted to the destination's manifest.json — it only makes the
+ * restore fail on authentication, at the one moment it is needed.
+ *
+ * The exemption is inherited by the whole subtree under a matching key, so a nested
+ * object of commands is covered without listing each leaf.
+ */
+export function sanitizeStorableStringsExceptKeys<T>(
+  value: T,
+  preserveKeys: ReadonlySet<string>,
+): T {
+  return deepStorable(value, 0, preserveKeys, false) as T;
+}
+
+function deepStorable(
+  value: unknown,
+  depth: number,
+  preserveKeys: ReadonlySet<string> | null,
+  preserve: boolean,
+): unknown {
+  if (typeof value === "string") {
+    return preserve ? storableTextPreservingSecrets(value) : sanitizeLogText(value);
+  }
   if (depth >= 8 || value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) {
-    return value.map((item) => sanitizeStorableStrings(item, depth + 1)) as T;
+    return value.map((item) => deepStorable(item, depth + 1, preserveKeys, preserve));
   }
   // Only plain objects — a Date (or any class instance) is left alone.
   if (Object.getPrototypeOf(value) !== Object.prototype) return value;
   const out: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    out[key] = sanitizeStorableStrings(item, depth + 1);
+    out[key] = deepStorable(
+      item,
+      depth + 1,
+      preserveKeys,
+      preserve || preserveKeys?.has(key) === true,
+    );
   }
-  return out as T;
+  return out;
 }
 
 /**

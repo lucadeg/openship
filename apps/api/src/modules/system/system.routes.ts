@@ -14,10 +14,13 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { internalAuth, requireInstanceAdmin } from "../../middleware";
 import { AgentExecBody } from "../../lib/agent-exec.schema";
-import { rateLimiterFor } from "../../middleware/rate-limiter";
 import { secureRouter } from "../../lib/secure-router";
 import * as fs from "./filesystem.controller";
 import * as setup from "./setup.controller";
+import {
+  invitationSignupBodyLimit,
+  inviteSignup,
+} from "../auth/invitation-signup.controller";
 import * as selfApp from "./self-app.controller";
 import * as serverCheck from "./server-check.controller";
 import * as serversCtrl from "./servers.controller";
@@ -28,6 +31,10 @@ import * as serverModules from "./server-modules.controller";
 import * as serverContainers from "./server-containers.controller";
 import * as migration from "./migration/migration.controller";
 import * as dataTransfer from "./data-transfer/data-transfer.controller";
+import {
+  TRANSFER_CHUNK_BYTES,
+  TRANSFER_CONTROL_BODY_BYTES,
+} from "./data-transfer/chunk-store";
 import * as systemHealth from "./system-health.controller";
 import * as edgeOrphans from "./edge-orphans.controller";
 
@@ -35,6 +42,15 @@ const r = secureRouter(new Hono(), {
   module: "system",
   basePath: "/api/system",
   localOnly: true,
+});
+
+const transferControlBodyLimit = bodyLimit({
+  maxSize: TRANSFER_CONTROL_BODY_BYTES,
+  onError: (c) =>
+    c.json(
+      { error: "Transfer control request exceeds the size limit.", code: "PAYLOAD_TOO_LARGE" },
+      413,
+    ),
 });
 
 
@@ -49,7 +65,16 @@ r.public("get", "/setup", { reason: "Electron desktop client setup read - protec
 r.public("get", "/health", { reason: "CLI `openship doctor` — internal-token gated deep health rollup (DB liveness/migrations + project/service counts); the public /api/health is only a liveness stub" }, internalAuth, systemHealth.systemHealth);
 r.public("post", "/bootstrap-admin", { reason: "CLI first-admin creation — internal-token gated, one-shot before any admin exists (openship setup)" }, internalAuth, setup.bootstrapAdmin);
 r.public("post", "/reset-admin-password", { reason: "CLI password recovery — internal-token gated; resets the local admin login for a locked-out operator (openship reset-admin-password)" }, internalAuth, setup.resetAdminPassword);
-r.public("post", "/invite-signup", { reason: "Self-host invited signup — authorized by the unguessable invitation id (token) in the emailed link, NOT a session; creates the account for the invitation's own email. Public + rate-limited because the invitee isn't logged in yet." }, rateLimiterFor("auth-tight"), setup.inviteSignup);
+r.public(
+  "post",
+  "/invite-signup",
+  {
+    reason: "Self-host invited signup — authorized by the unguessable invitation id (token) in the emailed link, NOT a session; creates the account for the invitation's own email.",
+    rateLimit: "auth-tight",
+  },
+  invitationSignupBodyLimit,
+  inviteSignup,
+);
 
 /* ── Control-plane self-registration (CLI setup wizard) ─────────────
  * After bootstrap-admin, the wizard registers Openship itself as an app
@@ -135,6 +160,9 @@ r.public(
 r.get("/servers", { tag: "server:list" }, serversCtrl.listServers);
 r.get("/servers/:id", { tag: "server:read" }, serversCtrl.getServer);
 r.get("/servers/:id/reachability", { tag: "server:read" }, serversCtrl.probeReachability);
+// Read-only blast-radius snapshot for the removal confirm: which projects and apps
+// this box currently runs, and which server-scoped records go with it.
+r.get("/servers/:id/deletion-preview", { tag: "server:read" }, serversCtrl.serverDeletionPreview);
 // Create has no :id in the URL — org scope comes from the request and the
 // row is created in the active org. collection:true keeps the permission
 // middleware from demanding a (nonexistent) :id param.
@@ -272,7 +300,87 @@ r.post("/migration/switch-back", { tag: "settings:admin" }, requireInstanceAdmin
  * that check resolves a caller-selected org and every user is owner of their
  * own personal org (GHSA-rwq6-r63g-3c8h). Do not "restore" it here.
  */
-r.post("/data-transfer/export", { tag: "settings:admin" }, requireInstanceAdmin(), dataTransfer.exportInstanceHandler);
+r.get("/data-transfer/preview", { tag: "settings:admin" }, requireInstanceAdmin(), dataTransfer.previewInstanceExportHandler);
+r.post("/data-transfer/direct/session", { tag: "settings:admin" }, requireInstanceAdmin(), transferControlBodyLimit, dataTransfer.createDirectReceiveSessionHandler);
+r.post("/data-transfer/direct/send", { tag: "settings:admin" }, requireInstanceAdmin(), transferControlBodyLimit, dataTransfer.sendDirectTransferHandler);
+r.post("/data-transfer/direct/send/stream", { tag: "settings:admin" }, requireInstanceAdmin(), transferControlBodyLimit, dataTransfer.sendDirectTransferStreamHandler);
+r.public(
+  "post",
+  "/data-transfer/direct/chunk/init",
+  {
+    reason: "Initializes an encrypted upload using the one-time receive capability.",
+    rateLimit: "auth-tight",
+  },
+  transferControlBodyLimit,
+  dataTransfer.initializeDirectChunkUploadHandler,
+);
+r.public(
+  "post",
+  "/data-transfer/direct/chunk/:sessionId/heartbeat",
+  {
+    reason: "Extends an authenticated in-progress direct-transfer lease.",
+    rateLimit: "transfer-chunk",
+  },
+  transferControlBodyLimit,
+  dataTransfer.heartbeatDirectChunkUploadHandler,
+);
+r.public(
+  "put",
+  "/data-transfer/direct/chunk/:sessionId/:index",
+  {
+    reason: "Accepts one bounded, encrypted, signed direct-transfer chunk.",
+    rateLimit: "transfer-chunk",
+  },
+  bodyLimit({
+    maxSize: TRANSFER_CHUNK_BYTES + 64,
+    onError: (c) =>
+      c.json({ error: "Transfer chunk exceeds the size limit.", code: "PAYLOAD_TOO_LARGE" }, 413),
+  }),
+  dataTransfer.receiveDirectChunkHandler,
+);
+r.public(
+  "post",
+  "/data-transfer/direct/chunk/:sessionId/finalize/stream",
+  {
+    reason: "Keeps an authenticated direct-transfer restore alive through proxy timeouts.",
+    rateLimit: "auth-tight",
+  },
+  transferControlBodyLimit,
+  dataTransfer.finalizeDirectChunkUploadStreamHandler,
+);
+r.public(
+  "post",
+  "/data-transfer/direct/receive",
+  {
+    reason: "One-time instance receive capability — payload is ECDH-encrypted and authorized by the expiring token inside it.",
+    rateLimit: "auth-tight",
+  },
+  bodyLimit({
+    maxSize: 700_000_000,
+    onError: (c) => c.json({ error: "Direct transfer exceeds the 700MB limit.", code: "PAYLOAD_TOO_LARGE" }, 413),
+  }),
+  dataTransfer.receiveDirectTransferHandler,
+);
+r.post("/data-transfer/export", { tag: "settings:admin" }, requireInstanceAdmin(), transferControlBodyLimit, dataTransfer.exportInstanceHandler);
+r.post("/data-transfer/import/session", { tag: "settings:admin" }, requireInstanceAdmin(), transferControlBodyLimit, dataTransfer.createFileUploadHandler);
+r.put(
+  "/data-transfer/import/session/:sessionId/chunk/:index",
+  { tag: "settings:admin" },
+  requireInstanceAdmin(),
+  bodyLimit({
+    maxSize: TRANSFER_CHUNK_BYTES,
+    onError: (c) =>
+      c.json({ error: "Import chunk exceeds the size limit.", code: "PAYLOAD_TOO_LARGE" }, 413),
+  }),
+  dataTransfer.uploadFileChunkHandler,
+);
+r.post(
+  "/data-transfer/import/session/:sessionId/finalize/stream",
+  { tag: "settings:admin" },
+  requireInstanceAdmin(),
+  transferControlBodyLimit,
+  dataTransfer.finalizeFileUploadStreamHandler,
+);
 r.use(
   "/data-transfer/import",
   bodyLimit({
@@ -283,4 +391,3 @@ r.use(
 r.post("/data-transfer/import", { tag: "settings:admin" }, requireInstanceAdmin(), dataTransfer.importInstanceHandler);
 
 export const systemRoutes = r.hono;
-

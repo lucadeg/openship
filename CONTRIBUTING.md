@@ -2,6 +2,23 @@
 
 Thanks for your interest in contributing! This guide covers everything you need to get started.
 
+## Before you open an issue
+
+Every issue must use exactly one of the repository's issue categories. Choose the matching form from
+the **New issue** page; blank, untyped issues are not accepted.
+
+| Category      | Title prefix    | Label           | GitHub issue type |
+| ------------- | --------------- | --------------- | ----------------- |
+| Bug           | `[Bug]`         | `bug`           | Bug               |
+| Feature       | `[Feature]`     | `enhancement`   | Feature           |
+| Improvement   | `[Improvement]` | `enhancement`   | Feature           |
+| Documentation | `[Docs]`        | `documentation` | Task              |
+| Question      | `[Question]`    | `question`      | Task              |
+
+If you create an issue through an API, CLI, or AI assistant instead of the GitHub form chooser,
+you must apply the matching title prefix, label, and GitHub issue type from the table above. Never
+create a generic or untyped issue. Issues without a category are incomplete and may be closed.
+
 ## Before you open a pull request
 
 **Bug fixes, tests, docs, and small self-contained improvements** are welcome as direct pull
@@ -45,6 +62,8 @@ Every PR is reviewed by a human, so make it easy to trust:
 
 AI tools are fine to use — but **you** are the author and are accountable for every line you submit:
 
+- **Type every issue.** When an AI assistant opens an issue, it must use one of the five issue forms
+  or apply the exact category mapping above. It must never create a generic or untyped issue.
 - **Understand your whole diff.** If you can't explain a line in review, don't submit it.
 - **Verify, don't trust.** Actually run the change and confirm it does what the PR claims. Do not
   paste generated code — or a generated PR description — that you haven't checked against the real

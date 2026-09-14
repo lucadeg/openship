@@ -43,14 +43,15 @@ import { useProjectSettings } from "@/context/ProjectSettingsContext";
 import { AppLogo } from "@/components/AppLogo";
 import { DeploymentsContent } from "@/app/(dashboard)/deployments/components";
 import { projectsApi } from "@/lib/api";
-import { getProjectStatus, PROJECT_STATUS_META, projectStatusLabel } from "@/utils/project-status";
+import { getProjectStatus } from "@/utils/project-status";
+import { ProjectStatusBadge } from "@/components/shared/ProjectStatusBadge";
 import { encodeLocalSlug, encodeRepoSlug, encodeProjectSlug } from "@/utils/repoSlug";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 import type { Dictionary } from "@/i18n";
 
 interface DraftProjectViewProps {
-  /** Deletes the project. Page passes its handleDeleteProject (defaults:
-   *  deleteApp=true, wipeVolumes=false, force=false — correct for a draft
+  /** Deletes this environment. Page passes its handleDeleteProject (defaults:
+   *  wipeVolumes=false, force=false — correct for a draft
    *  with nothing provisioned). */
   onDeleteProject: () => void | Promise<void>;
 }
@@ -76,7 +77,6 @@ export function DraftProjectView({ onDeleteProject }: DraftProjectViewProps) {
   const [deleting, setDeleting] = useState(false);
 
   const status = getProjectStatus(projectData);
-  const meta = PROJECT_STATUS_META[status] ?? PROJECT_STATUS_META.draft;
 
   const hasRepoSource = Boolean(projectData?.gitOwner && projectData?.gitRepo);
   const hasLocalSource = Boolean(projectData?.localPath);
@@ -208,11 +208,10 @@ export function DraftProjectView({ onDeleteProject }: DraftProjectViewProps) {
             <div className="min-w-0 flex-1">
               <div className="flex items-start justify-between gap-3">
                 <h2 className="text-[15px] font-semibold text-foreground">{heading}</h2>
-                <span
-                  className={`inline-flex shrink-0 items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${meta.badge}`}
-                >
-                  {projectStatusLabel(status, t)}
-                </span>
+                <ProjectStatusBadge
+                  project={projectData}
+                  className="shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold"
+                />
               </div>
               <p className="mt-1 text-sm leading-relaxed text-muted-foreground">{subtext}</p>
 

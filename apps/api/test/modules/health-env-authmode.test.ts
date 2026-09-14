@@ -69,6 +69,11 @@ afterEach(async () => {
 });
 
 describe("GET /health/env authMode", () => {
+  it("reports the running API release consumed by the dashboard sidebar", async () => {
+    const { APP_VERSION } = await import("../../src/lib/app-version");
+    expect((await getEnv()).body.version).toBe(APP_VERSION);
+  });
+
   it("reports the persisted zero-auth mode instead of hardcoding local", async () => {
     settings.authMode = "none";
 

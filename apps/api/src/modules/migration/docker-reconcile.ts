@@ -19,7 +19,7 @@ import type {
   DockerVolumeInfo,
   ProxyKind,
 } from "@repo/adapters";
-import { classifyProxy } from "@repo/adapters";
+import { classifyProxy, isBuildHelperMarkers, OPENSHIP_LABEL } from "@repo/adapters";
 import type { ComposeHealthcheck, ProxySettings } from "@repo/core";
 import type { ComposeService } from "../../lib/compose-parser";
 import type { ManifestProjectEntry } from "../../lib/openship-manifest";
@@ -60,6 +60,7 @@ export interface DiscoveredService {
   /** compose build context (set → adoption builds this Dockerfile). */
   build?: string;
   dockerfile?: string;
+  buildArgs?: Record<string, string | null>;
   /** compose-style "host:container[/proto]" strings, from actual bindings. */
   ports: string[];
   env: Record<string, string>;
@@ -93,12 +94,14 @@ export interface DiscoveredService {
   edgePorts?: number[];
   /** Routes the server's EXISTING (foreign) reverse proxy already serves for this
    *  container, matched by published host port — so the wizard can show the
-   *  current domain(s)+path+SSL and offer to keep them. ONE ENTRY PER (port,path):
+   *  current domain(s)+path+SSL and offer to keep them. ONE ENTRY PER
+   *  (port,path,match mode):
    *  a container behind a path-fan-out domain (`/ → :1010`, `/v3 → :1020`) or with
    *  several published ports collects several. Absent = no proxied route detected. */
   existingRoute?: Array<{
     port: number;
     path: string;
+    exact?: boolean;
     domains: string[];
     ssl: { enabled: boolean; certPath?: string; keyPath?: string };
     /** Adoptable reverse-proxy tunables the foreign vhost declared (upload limit,
@@ -523,8 +526,8 @@ export function toDiscoveredService(
     // IPv4 (0.0.0.0) and IPv6 (::), so detail.ports lists the same publicPort
     // twice — without deduping we'd push the same route (same domain) twice and
     // the wizard would show each domain doubled (and submit two identical
-    // endpoints). proxyRoutesByPort already holds one entry per (port,path), so
-    // visiting each port ONCE preserves path-fan-out while killing the IPv4/IPv6
+    // endpoints). proxyRoutesByPort already holds one entry per (port,path,match
+    // mode), so visiting each port ONCE preserves every match while killing the IPv4/IPv6
     // double-count. (portsToComposeStrings already dedups the same way.)
     const publicPorts = [
       ...new Set(
@@ -538,6 +541,7 @@ export function toDiscoveredService(
         routes.push({
           port: hit.port,
           path: hit.path,
+          ...(hit.exact ? { exact: true } : {}),
           domains: hit.domains,
           ssl: hit.ssl,
           ...(hit.proxy ? { proxy: hit.proxy } : {}),
@@ -568,6 +572,7 @@ export function toDiscoveredService(
     imageId: detail.imageId,
     build: declared?.build,
     dockerfile: declared?.dockerfile,
+    buildArgs: declared?.buildArgs,
     ports,
     env,
     ...(Object.keys(envImageDefaults).length > 0 && { envImageDefaults }),
@@ -726,7 +731,11 @@ export function reconcileStack(opts: {
  * real (locally-built) app containers.
  */
 export const isBuildHelper = (labels: Record<string, string>) =>
-  !!labels["openship.build"] && !labels["openship.deployment"] && !labels["openship.service"];
+  isBuildHelperMarkers({
+    build: labels[OPENSHIP_LABEL.build],
+    deployment: labels[OPENSHIP_LABEL.deployment],
+    service: labels[OPENSHIP_LABEL.service],
+  });
 
 /**
  * Reconstruct OPENSHIP-owned projects from their live containers + the server's

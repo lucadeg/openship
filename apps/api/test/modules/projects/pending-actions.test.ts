@@ -210,14 +210,62 @@ describe("deploy_blocked — the case nothing could see before", () => {
     const [action] = await getProjectPendingActions(PROJECT, ORG);
 
     expect(action.message).toContain("previous Openship deployment");
-    expect(action.message).toContain("Free Port & Continue");
+    // Describes the offer without quoting the button's words: the deploy prompt now
+    // labels it by what it stops ("Stop Container", "Stop Service"), so a literal
+    // pinned here was a copy in two places that could disagree.
+    expect(action.message).toMatch(/Openship will (free the port|stop that (container|service)) first/);
+  });
+
+  it("promises no Free Port button when the deploy refused to offer one", async () => {
+    // `stopTarget: "none"` — e.g. a Docker-published port whose container could not be
+    // identified. Redeploying raises no prompt at all, so copy that says "redeploy and
+    // choose Free Port" sends the operator to a button that will not be there.
+    findLatestByProject.mockResolvedValue(
+      blockedByPort({
+        errorMessage: "Port 3000 is published by a Docker container Openship couldn't identify",
+        errorDetails: {
+          port: 3000,
+          pid: 42,
+          command: "docker-proxy -host-port 3000 (PID 42)",
+          dockerPublished: true,
+          stopTarget: "none",
+        },
+      }),
+    );
+
+    const [action] = await getProjectPendingActions(PROJECT, ORG);
+
+    expect(action.message).not.toMatch(/Free Port/i);
+    expect(action.message).toContain("Docker container");
+    expect(action.resolveWith?.[0]?.label).toBe("Redeploy");
+  });
+
+  it("names the container, not docker-proxy, when a container holds the port", async () => {
+    findLatestByProject.mockResolvedValue(
+      blockedByPort({
+        errorDetails: {
+          port: 3000,
+          pid: 42,
+          command: "docker container openship-api-web (openship/api:latest)",
+          containerName: "openship-api-web",
+          isManagedDeployment: true,
+          dockerPublished: true,
+          stopTarget: "container",
+        },
+      }),
+    );
+
+    const [action] = await getProjectPendingActions(PROJECT, ORG);
+
+    expect(action.message).toContain("openship-api-web");
+    expect(action.message).toContain("stop that container");
   });
 
   it("says it could not tell when ownership was never probed", async () => {
-    // The nohup supervisor's PORT_IN_USE carries only {port, pid, command} — no
-    // `isManagedDeployment`. Treating absent as false would tell the operator a
-    // process is not Openship's when we simply didn't look, and that is the
-    // difference between "safe to free" and "might kill something else".
+    // A listener with no systemd unit and no container carries no `isManagedDeployment`
+    // at all. Treating absent as false would tell the operator a process is not
+    // Openship's when we simply couldn't establish it, and that is the difference
+    // between "safe to free" and "might kill something else".
     findLatestByProject.mockResolvedValue(
       blockedByPort({
         errorDetails: { port: 3000, pid: 42, command: "node server.js (PID 42)" },

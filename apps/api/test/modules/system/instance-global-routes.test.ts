@@ -76,7 +76,14 @@ const INSTANCE_GLOBAL: Array<[string, string]> = [
   ["post", "/migration/start-cloud"],
   ["post", "/migration/start-tunnel"],
   ["post", "/migration/switch-back"],
+  ["get", "/data-transfer/preview"],
+  ["post", "/data-transfer/direct/session"],
+  ["post", "/data-transfer/direct/send"],
+  ["post", "/data-transfer/direct/send/stream"],
   ["post", "/data-transfer/export"],
+  ["post", "/data-transfer/import/session"],
+  ["put", "/data-transfer/import/session/:sessionId/chunk/:index"],
+  ["post", "/data-transfer/import/session/:sessionId/finalize/stream"],
   ["post", "/data-transfer/import"],
 ];
 

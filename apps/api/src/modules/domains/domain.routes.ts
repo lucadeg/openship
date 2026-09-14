@@ -38,7 +38,15 @@ r.post("/preview", { tag: "domain:read", readOnly: true, body: PreviewDomainBody
 // a domain belonging to a cloud project is proxied to the SaaS; a local domain
 // falls through to the local handler.
 r.get("/:id", { tag: "domain:read", mcp: { description: "Read one domain's verify + SSL state." } }, cloudDomainProxy, ctrl.get);
-r.delete("/:id", { tag: "domain:admin" }, cloudDomainProxy, ctrl.remove);
+r.delete(
+  "/:id",
+  {
+    tag: "domain:admin",
+    mcp: { description: "Delete a domain by id." },
+  },
+  cloudDomainProxy,
+  ctrl.remove,
+);
 r.post("/:id/verify", { tag: "domain:write", mcp: { description: "Verify a domain's ownership / DNS." } }, cloudDomainProxy, ctrl.verify);
 // Self-hosted live-log verify (SSE): streams certbot's standalone HTTP-01 run.
 r.post("/:id/verify/stream", { tag: "domain:write" }, ctrl.verifyStream);

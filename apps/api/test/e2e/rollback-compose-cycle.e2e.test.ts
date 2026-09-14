@@ -28,8 +28,15 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
-import { DockerRuntime, NoopInfraProvider, createHostExecutor } from "@repo/adapters";
+import {
+  BuildLogger,
+  DockerRuntime,
+  NoopInfraProvider,
+  createHostExecutor,
+  type CommandExecutor,
+} from "@repo/adapters";
 import { repos } from "@repo/db";
+import { LOCAL_HOST_PORT_TARGET } from "../../src/lib/host-port-target";
 import { describeDockerE2E, requireDocker } from "../helpers/docker-e2e";
 import {
   seedOrg,
@@ -159,6 +166,9 @@ describeDockerE2E("compose rollback cycle through the real entry point", () => {
       runtimeMode: "docker" as const,
       usesManagedRouting: false,
       serverId: null,
+      // Match the real local resolver: compose and single-container deploys
+      // must contend in the same physical host-port namespace.
+      hostPortTarget: LOCAL_HOST_PORT_TARGET,
     };
     vi.doMock("../../src/lib/deployment-runtime", async (importOriginal) => {
       const actual = (await importOriginal()) as Record<string, unknown>;
@@ -178,6 +188,18 @@ describeDockerE2E("compose rollback cycle through the real entry point", () => {
     vi.doMock("../../src/lib/controller-helpers", async (importOriginal) => {
       const actual = (await importOriginal()) as Record<string, unknown>;
       return { ...actual, platform: () => localPlatform.platform };
+    });
+    // This fixture deliberately has no edge daemon. Feed the allocation path
+    // the strict scanner's authoritative empty result; all port claims,
+    // reservations, Docker binds, and rollback lifecycle remain real.
+    vi.doMock("@repo/adapters", async (importOriginal) => {
+      const actual = (await importOriginal()) as Record<string, unknown>;
+      return {
+        ...actual,
+        edgeProxyFor: () => ({
+          listLoopbackUpstreamPortsStrict: async () => new Set<number>(),
+        }),
+      };
     });
     vi.doMock("../../src/modules/deployments/service-checks", async (importOriginal) => {
       const actual = (await importOriginal()) as Record<string, unknown>;
@@ -319,6 +341,137 @@ describeDockerE2E("compose rollback cycle through the real entry point", () => {
     expect(byName.get("api")).toBe(API_V1);
   }, 600_000);
 
+  it("cancels a lost pre-activation host callback, preserves v1, and lets the next real rollout finish", async () => {
+    expect(ready).toBe(true);
+    const activeProject = (await repos.project.findById(project.id))!;
+    const beforeIds = new Set(await runtime.listProjectContainerIds(project.id));
+    expect(await get(`http://127.0.0.1:${webPort}/version.txt`)).toBe("web-v1");
+    expect(await get(`http://127.0.0.1:${apiPort}/version.txt`)).toBe("api-v1");
+
+    const baseExecutor = createHostExecutor();
+    let scopedSignal: AbortSignal | undefined;
+    let channelClosed = false;
+    const lostRead = vi.fn(() => {
+      const signal = scopedSignal;
+      if (!signal) throw new Error("preflight escaped the deployment executor scope");
+      return new Promise<string>((_resolve, reject) => {
+        const cancel = () => {
+          // The real ssh2 implementation closes SFTP first; this seam makes the
+          // Docker-level assertion depend on the same ordering contract.
+          channelClosed = true;
+          const error = new Error("lost SFTP callback cancelled after close");
+          error.name = "AbortError";
+          reject(error);
+        };
+        signal.addEventListener("abort", cancel, { once: true });
+        if (signal.aborted) cancel();
+      });
+    });
+    const executor = new Proxy(baseExecutor, {
+      get(target, prop, receiver) {
+        if (prop === "runWithAbortSignal") {
+          return async <T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> => {
+            scopedSignal = signal;
+            try {
+              return await fn();
+            } finally {
+              if (scopedSignal === signal) scopedSignal = undefined;
+            }
+          };
+        }
+        if (prop === "readFile") return lostRead;
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as CommandExecutor;
+    let injectLostCallback = true;
+    const system = {
+      ensureFeature: vi.fn(async () => {
+        if (!injectLostCallback) return;
+        injectLostCallback = false;
+        await executor.readFile("/var/lib/openship/setup-state.json");
+      }),
+    };
+    const logger = new BuildLogger(() => {});
+    const cancelledDep = await seedDeployment(activeProject, {
+      // This test invokes the deploy phase directly; keep the fixture terminal
+      // so it does not contend with the orchestrator's one-in-flight DB guard.
+      status: "ready",
+      imageRef: "compose",
+      containerId: "compose",
+      meta: composeSnapshot(WEB_V2) as never,
+    });
+    const controller = new AbortController();
+    const { deployComposeServices } = await import(
+      "../../src/modules/deployments/compose/deploy.service"
+    );
+    let activationStarted = false;
+    const cancelled = deployComposeServices(
+      activeProject,
+      cancelledDep,
+      runtime,
+      logger,
+      {
+        builtImages: new Map([
+          [web.id, WEB_V2],
+          [api.id, API_V1],
+        ]),
+        preparedLocalImages: new Map([
+          [web.id, WEB_V2],
+          [api.id, API_V1],
+        ]),
+        routing: new NoopInfraProvider(),
+        ssl: new NoopInfraProvider(),
+        system: system as never,
+        executor,
+        localHost: true,
+        hostPortTarget: LOCAL_HOST_PORT_TARGET,
+        signal: controller.signal,
+        onArtifactActivationStart: () => {
+          activationStarted = true;
+        },
+      },
+    );
+    await vi.waitFor(() => expect(lostRead).toHaveBeenCalledTimes(1));
+    const cancellation = expect(cancelled).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await cancellation;
+
+    expect(channelClosed).toBe(true);
+    expect(activationStarted).toBe(false);
+    expect(new Set(await runtime.listProjectContainerIds(project.id))).toEqual(beforeIds);
+    expect(await get(`http://127.0.0.1:${webPort}/version.txt`)).toBe("web-v1");
+    expect(await get(`http://127.0.0.1:${apiPort}/version.txt`)).toBe("api-v1");
+
+    const nextDep = await seedDeployment(activeProject, {
+      status: "ready",
+      imageRef: "compose",
+      containerId: "compose",
+      meta: composeSnapshot(WEB_V2) as never,
+    });
+    const nextResult = await deployComposeServices(activeProject, nextDep, runtime, logger, {
+      builtImages: new Map([
+        [web.id, WEB_V2],
+        [api.id, API_V1],
+      ]),
+      preparedLocalImages: new Map([
+        [web.id, WEB_V2],
+        [api.id, API_V1],
+      ]),
+      routing: new NoopInfraProvider(),
+      ssl: new NoopInfraProvider(),
+      system: system as never,
+      executor,
+      localHost: true,
+      hostPortTarget: LOCAL_HOST_PORT_TARGET,
+      signal: new AbortController().signal,
+    });
+
+    expect(nextResult.status).toBe("ready");
+    expect(await get(`http://127.0.0.1:${webPort}/version.txt`)).toBe("web-v2");
+    expect(await get(`http://127.0.0.1:${apiPort}/version.txt`)).toBe("api-v1");
+  }, 600_000);
+
   /** v2's id, from a listing (newest-first). */
   function v2Id(rows: Array<{ id: string; commitSha: string | null }>): string {
     return rows.find((r) => r.commitSha === "2".repeat(40))!.id;
@@ -344,6 +497,18 @@ describeDockerE2E("compose rollback cycle through the real entry point", () => {
               `[compose restore ${fresh.id}] ${fresh.errorMessage ?? "no error"}\n` +
                 logs.slice(-40).map((l) => l.message).join(""),
             );
+          }
+          if (fresh.status === "ready") {
+            let quiescent = false;
+            while (Date.now() < deadline) {
+              const inFlight = await repos.deployment.listInFlightByProject(projectId);
+              if (!inFlight.some((row) => row.id === fresh.id)) {
+                quiescent = true;
+                break;
+              }
+              await new Promise((r) => setTimeout(r, 100));
+            }
+            if (!quiescent) throw new Error(`deploy ${fresh.id} became ready but never quiesced`);
           }
           return fresh as never;
         }

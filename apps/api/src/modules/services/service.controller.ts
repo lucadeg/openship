@@ -9,14 +9,16 @@
  */
 
 import type { Context } from "hono";
-import { AppError } from "@repo/core";
+import { AppError, type ComposeAdvanced } from "@repo/core";
 import { streamSSE } from "../../lib/sse";
 import { param } from "../../lib/controller-helpers";
 import { getRequestContext } from "../../lib/request-context";
 import { parseRevealKeys, pickRevealed } from "../../lib/env-reveal";
+import { parseOptionalEnvironmentScope } from "../../lib/environment-scope";
 import { audit, auditContextFrom } from "../../lib/audit";
 import { sshManager } from "../../lib/ssh-manager";
 import * as serviceService from "./service.service";
+import { ServiceConfigStaleError } from "../deployments/env-drift";
 import type {
   TCreateServiceBody,
   TUpdateServiceBody,
@@ -72,11 +74,16 @@ export async function revealEnv(c: Context) {
   const serviceId = param(c, "serviceId");
   // Outside the try: a 400 from key validation must not be reported as a
   // reveal failure. Body may be absent on a malformed client call.
-  const body = await c.req.json<{ keys?: unknown }>().catch(() => ({}) as { keys?: unknown });
+  const body = await c.req
+    .json<{ keys?: unknown; environment?: unknown }>()
+    .catch(() => ({}) as { keys?: unknown; environment?: unknown });
   const keys = parseRevealKeys(body.keys);
+  const revealEnvironment = parseOptionalEnvironmentScope(body.environment);
 
   try {
-    const stored = await serviceService.revealServiceEnv(ctx, projectId, serviceId);
+    const stored = revealEnvironment
+      ? await serviceService.revealServiceEnvVars(ctx, projectId, serviceId, revealEnvironment)
+      : await serviceService.revealServiceEnv(ctx, projectId, serviceId);
     const environment = pickRevealed(stored, keys);
     c.set("auditAfter", { revealedEnvKeys: Object.keys(environment) });
     return c.json({ success: true, environment });
@@ -241,14 +248,19 @@ export async function syncFromCompose(c: Context) {
       image?: string;
       build?: string;
       dockerfile?: string;
+      buildArgs?: Record<string, string | null>;
       ports?: string[];
       dependsOn?: string[];
       environment?: Record<string, string>;
+      environmentTemplates?: Record<string, string>;
       volumes?: string[];
       command?: string;
       /** #332: exact argv — no `sh -c`. Wins over the lossy `command` string. */
       commandArgv?: string[];
       restart?: string;
+      /** Raw Compose interpolation provenance and the remaining extended
+       * compose fields accepted by the sync schema. */
+      advanced?: ComposeAdvanced;
       exposed?: boolean;
       exposedPort?: string;
       domain?: string;
@@ -306,10 +318,33 @@ export async function restartContainer(c: Context) {
   const ctx = getRequestContext(c);
   const projectId = param(c, "id");
   const serviceId = param(c, "serviceId");
+  // Read raw off the query string rather than declaring a `query` schema on the
+  // route: `RouteSpec` has no such field (secureRouter only auto-wires `body`),
+  // and declaring a body on this previously body-less POST would 400 every
+  // caller that sends `Content-Type: application/json` with no body — which the
+  // CLI's api-client does unconditionally.
+  const force = ["true", "1"].includes(c.req.query("force") ?? "");
   try {
-    await serviceService.restartServiceContainer(ctx, projectId, serviceId);
-    return c.json({ success: true });
+    const result = await serviceService.restartServiceContainer(ctx, projectId, serviceId, {
+      force,
+    });
+    return c.json({ success: true, ...result });
   } catch (err) {
+    // A stale-config refusal is a 409 with structure, not a generic 400: the
+    // caller needs the code to branch on and the key names to see WHY a restart
+    // was refused. Everything else keeps the historical 400.
+    if (err instanceof ServiceConfigStaleError) {
+      return c.json(
+        {
+          success: false,
+          error: err.message,
+          code: err.code,
+          staleEnvKeys: err.staleEnvKeys,
+          serviceName: err.serviceName,
+        },
+        409,
+      );
+    }
     const message = err instanceof Error ? err.message : "Failed to restart container";
     return c.json({ success: false, error: message }, 400);
   }

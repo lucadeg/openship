@@ -68,6 +68,8 @@ export interface UpdateDestinationInput {
   sshHost?: string | null;
   sshPort?: number | null;
   sshUser?: string | null;
+  /** Retarget an openship_server destination at a different box. */
+  serverId?: string | null;
   /** Pass undefined to leave unchanged; null to clear; string to replace. */
   accessKeyId?: string | null;
   secretAccessKey?: string | null;
@@ -247,32 +249,43 @@ export async function getDestinationUsage(ctx: RequestContext, id: string): Prom
   return { destination, policies: out };
 }
 
+/**
+ * The serverId on an openship_server destination MUST belong to the calling org.
+ *
+ * It arrives from the request body, and the destination is what a backup SSHes into —
+ * so an unchecked id lets a caller point their own destination at a victim's box and
+ * read or write it with the victim's stored credentials.
+ *
+ * Shared by create and update on purpose: the check used to live inline in create
+ * only, and update simply dropped the field. Carrying it on the patch without this
+ * would have turned a silent no-op into that exact hole.
+ */
+async function assertServerUsable(
+  ctx: RequestContext,
+  serverId: string | null | undefined,
+): Promise<void> {
+  if (!serverId) {
+    throw new Error("openship_server destinations require a serverId");
+  }
+  const server = await repos.server.get(serverId);
+  if (!server) {
+    throw new Error("Server not accessible");
+  }
+  // Cross-org check when the server has an org stamp; rows without one fall through.
+  const stamped = (server as { organizationId?: string | null }).organizationId;
+  if ("organizationId" in server && stamped && stamped !== ctx.organizationId) {
+    throw new Error("Server not accessible");
+  }
+}
+
 export async function createDestination(
   ctx: RequestContext,
   input: CreateDestinationInput,
 ): Promise<SerializedDestination> {
   await validateInput(input);
 
-  // Ownership check for openship_server: the serverId arrives from the
-  // request body and MUST belong to the calling org. Without this
-  // check, an attacker could create a destination using a victim's
-  // server row and SSH-impersonate them.
   if (input.kind === "openship_server") {
-    if (!input.serverId) {
-      throw new Error("openship_server destinations require a serverId");
-    }
-    const server = await repos.server.get(input.serverId);
-    if (!server) {
-      throw new Error("Server not accessible");
-    }
-    // Cross-org check when the server has an org stamp; rows without one fall through.
-    if (
-      "organizationId" in server &&
-      (server as { organizationId?: string | null }).organizationId &&
-      (server as { organizationId?: string | null }).organizationId !== ctx.organizationId
-    ) {
-      throw new Error("Server not accessible");
-    }
+    await assertServerUsable(ctx, input.serverId);
   }
 
   // Uniqueness check (DB has a partial unique index but we want a clean
@@ -349,6 +362,18 @@ export async function updateDestination(
   if (patch.sshPort !== undefined) update.sshPort = patch.sshPort;
   if (patch.sshUser !== undefined) update.sshUser = patch.sshUser;
   if (patch.isDefault !== undefined) update.isDefault = patch.isDefault;
+  if (patch.serverId !== undefined) {
+    // Was dropped entirely: retargeting an openship_server destination at a different
+    // box was a no-op the UI confirmed as saved, and every later run kept going to the
+    // old machine. Clearing it is refused rather than stored — `toAdapterRow` calls a
+    // serverId-less openship_server row corrupted state and every run on it fails.
+    if (existing.kind === "openship_server") {
+      await assertServerUsable(ctx, patch.serverId);
+      update.serverId = patch.serverId;
+    } else if (patch.serverId) {
+      throw new Error(`A ${existing.kind} destination does not have a server`);
+    }
+  }
 
   if (patch.accessKeyId !== undefined) {
     update.accessKeyIdEnc = encryptSecretField(patch.accessKeyId);

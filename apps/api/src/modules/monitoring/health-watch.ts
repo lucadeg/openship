@@ -277,6 +277,37 @@ interface WatchMemory {
  */
 const MEMORY = new Map<string, WatchMemory>();
 
+/** Latest authoritative observation exposed to the org-wide Monitoring → Health
+ * surface. This is deliberately fed by the existing grouped sweep/event hybrid:
+ * the dashboard never opens one watcher or one request per container. */
+export interface WorkloadHealthSnapshot {
+  organizationId: string;
+  projectId: string;
+  projectName: string;
+  projectSlug: string;
+  serviceId: string | null;
+  serviceKey: string;
+  serviceName: string;
+  serverId: string | null;
+  containerId: string;
+  state: "healthy" | "down" | "crash_loop" | "unhealthy" | "unknown";
+  observedAt: string;
+}
+
+const HEALTH_SNAPSHOTS = new Map<string, WorkloadHealthSnapshot>();
+/** Container ids owned by each watcher group. The Docker event accelerator uses
+ * this index to ignore CI/helper/unmanaged-container noise without duplicating
+ * workload resolution. It is rebuilt only by the authoritative full state read. */
+const TRACKED_CONTAINERS = new Map<string, Set<string>>();
+
+export function listWorkloadHealthSnapshots(organizationId: string): WorkloadHealthSnapshot[] {
+  return [...HEALTH_SNAPSHOTS.values()].filter((row) => row.organizationId === organizationId);
+}
+
+export function isTrackedHealthContainer(groupKey: string, containerId: string): boolean {
+  return TRACKED_CONTAINERS.get(groupKey)?.has(containerId) ?? false;
+}
+
 /** The fields of a `docker ps -a` row this module reads. */
 interface ListedContainer {
   id: string;
@@ -470,6 +501,30 @@ export interface HealthWatchOptions {
   onlyServerKeys?: ReadonlySet<string>;
 }
 
+interface HealthSweepOptions extends HealthWatchOptions {
+  /** Limit every project/runtime read to one organization. */
+  organizationId?: string;
+  /** Refresh snapshots only: no incident, hysteresis, scheduler or event state. */
+  currentOnly?: boolean;
+}
+
+export interface CurrentHealthScanResult {
+  completedAt: string;
+  summary: HealthWatchSummary;
+}
+
+/** Last explicit current-state check per organization. Snapshot rows themselves
+ * remain owned by the shared sweep; this only gives the UI honest coverage and
+ * freshness metadata after a reload. */
+const CURRENT_HEALTH_SCANS = new Map<string, CurrentHealthScanResult>();
+const CURRENT_HEALTH_SCAN_IN_FLIGHT = new Map<string, Promise<CurrentHealthScanResult>>();
+
+export function getCurrentHealthScan(
+  organizationId: string,
+): CurrentHealthScanResult | null {
+  return CURRENT_HEALTH_SCANS.get(organizationId) ?? null;
+}
+
 /** Serializes every entry point — see `runHealthWatch`. */
 let sweepChain: Promise<unknown> = Promise.resolve();
 
@@ -484,6 +539,35 @@ let sweepChain: Promise<unknown> = Promise.resolve();
  * the DB's partial unique index protects the incident ROWS, not the counters.
  */
 export function runHealthWatch(opts?: HealthWatchOptions): Promise<HealthWatchSummary> {
+  return enqueueSweep(opts);
+}
+
+/**
+ * Read current workload state for one organization without enabling or imitating
+ * the always-on watcher. This deliberately enters the SAME serialized sweep as
+ * cron and Docker events, so there is one owner for container matching and state
+ * classification. Concurrent clicks for the same organization share one read.
+ */
+export function runCurrentHealthScan(
+  organizationId: string,
+): Promise<CurrentHealthScanResult> {
+  const running = CURRENT_HEALTH_SCAN_IN_FLIGHT.get(organizationId);
+  if (running) return running;
+
+  const scan = enqueueSweep({ organizationId, currentOnly: true }).then((summary) => {
+    const result = { completedAt: new Date().toISOString(), summary };
+    CURRENT_HEALTH_SCANS.set(organizationId, result);
+    return result;
+  });
+  CURRENT_HEALTH_SCAN_IN_FLIGHT.set(organizationId, scan);
+  void scan.then(
+    () => CURRENT_HEALTH_SCAN_IN_FLIGHT.delete(organizationId),
+    () => CURRENT_HEALTH_SCAN_IN_FLIGHT.delete(organizationId),
+  );
+  return scan;
+}
+
+function enqueueSweep(opts?: HealthSweepOptions): Promise<HealthWatchSummary> {
   const next = sweepChain.then(
     () => sweepOnce(opts),
     () => sweepOnce(opts),
@@ -492,7 +576,7 @@ export function runHealthWatch(opts?: HealthWatchOptions): Promise<HealthWatchSu
   return next;
 }
 
-async function sweepOnce(opts?: HealthWatchOptions): Promise<HealthWatchSummary> {
+async function sweepOnce(opts?: HealthSweepOptions): Promise<HealthWatchSummary> {
   const summary: HealthWatchSummary = {
     servers: 0,
     projects: 0,
@@ -511,8 +595,17 @@ async function sweepOnce(opts?: HealthWatchOptions): Promise<HealthWatchSummary>
   };
 
   const base = getPlatform().target;
-  const projects = await repos.project.listAllForScan();
-  if (projects.length === 0) return summary;
+  const projects = opts?.organizationId
+    ? (await repos.project.listByOrganization(opts.organizationId, { page: 1, perPage: 5000 })).rows
+    : await repos.project.listAllForScan();
+  if (projects.length === 0) {
+    if (opts?.currentOnly && opts.organizationId) {
+      for (const [key, row] of HEALTH_SNAPSHOTS) {
+        if (row.organizationId === opts.organizationId) HEALTH_SNAPSHOTS.delete(key);
+      }
+    }
+    return summary;
+  }
 
   const activeIds = projects
     .map((p) => p.activeDeploymentId)
@@ -520,7 +613,9 @@ async function sweepOnce(opts?: HealthWatchOptions): Promise<HealthWatchSummary>
   const [activeDeps, latestDeps, openIncidents] = await Promise.all([
     repos.deployment.findManyById(activeIds),
     repos.deployment.findLatestByProjects(projects.map((p) => p.id)),
-    repos.serviceIncident.listOpen(),
+    opts?.currentOnly
+      ? Promise.resolve([] as ServiceIncident[])
+      : repos.serviceIncident.listOpen(),
   ]);
 
   const openByKey = new Map<string, ServiceIncident>();
@@ -530,6 +625,8 @@ async function sweepOnce(opts?: HealthWatchOptions): Promise<HealthWatchSummary>
 
   const now = Date.now();
   const candidates: Candidate[] = [];
+  /** Expected workloads whose current state cannot safely be read this pass. */
+  const unknownCandidates: Candidate[] = [];
   /** Projects that will never be watched again as they stand — see `stale`. */
   const retired = new Set<string>();
 
@@ -559,14 +656,26 @@ async function sweepOnce(opts?: HealthWatchOptions): Promise<HealthWatchSummary>
     }
     if (target.kind === "unresolved") {
       unresolved.push(`${project.slug} (${target.reason})`);
+      if (opts?.currentOnly) {
+        unknownCandidates.push({
+          project,
+          dep,
+          meta,
+          serverId: typeof meta.serverId === "string" ? meta.serverId : null,
+        });
+      }
       continue;
     }
     // Gate 1: a deploy in flight (or one that only just settled) is recreating
     // containers. Skipped WITHOUT retiring — an open incident stays open, because
     // we genuinely don't know anything about this project right now.
     const newest = latestDeps.get(project.id) ?? dep;
-    if (deploymentIsInFlight(newest)) continue;
-    if (now - newest.updatedAt.getTime() < DEPLOY_GRACE_MS) continue;
+    if (deploymentIsInFlight(newest) || now - newest.updatedAt.getTime() < DEPLOY_GRACE_MS) {
+      if (opts?.currentOnly) {
+        unknownCandidates.push({ project, dep, meta, serverId: target.serverId });
+      }
+      continue;
+    }
 
     candidates.push({ project, dep, meta, serverId: target.serverId });
   }
@@ -595,17 +704,38 @@ async function sweepOnce(opts?: HealthWatchOptions): Promise<HealthWatchSummary>
   summary.servers = groups.size;
 
   const sweptGroups = [...groups.values()];
-  const serviceRows = await repos.service.listByProjects(
-    sweptGroups.flat().map((c) => c.project.id),
-  );
+  const serviceRows = await repos.service.listByProjects([
+    ...new Set([
+      ...sweptGroups.flat().map((c) => c.project.id),
+      ...(opts?.currentOnly ? unknownCandidates.map((c) => c.project.id) : []),
+    ]),
+  ]);
 
   /** Projects whose container list we actually read this tick. */
   const swept = new Set<string>();
   /** Workload keys we produced a verdict for. */
   const visited = new Set<string>();
+  /** Summary ownership stays unique if a timed-out group is republished unknown. */
+  const countedProjects = new Set<string>();
+  const countedWorkloads = new Set<string>();
+
+  const groupContext = {
+    serviceRows,
+    openByKey,
+    swept,
+    visited,
+    countedProjects,
+    countedWorkloads,
+    summary,
+    currentOnly: opts?.currentOnly === true,
+  };
+
+  if (opts?.currentOnly && unknownCandidates.length > 0) {
+    await publishUnknownCandidates(groupContext, unknownCandidates);
+  }
 
   await mapWithLimit(sweptGroups, SERVER_CONCURRENCY, async (group) => {
-    await sweepServerGroup({ group, serviceRows, openByKey, swept, visited, summary });
+    await sweepServerGroup({ ...groupContext, group });
   });
 
   if (filtered) {
@@ -642,13 +772,32 @@ async function sweepOnce(opts?: HealthWatchOptions): Promise<HealthWatchSummary>
   // Deliberately scoped by `settled`. A project skipped for an unreachable server or
   // an in-flight deploy is none of those things, and its incident is left exactly as
   // it was.
-  for (const incident of openIncidents) {
-    if (!incident.projectId) continue;
-    const key = memoryKey(incident.projectId, incident.serviceKey);
-    if (visited.has(key)) continue;
-    if (!settled(incident.projectId)) continue;
-    if (await repos.serviceIncident.resolve(incident.id)) summary.stale++;
-    MEMORY.delete(key);
+  if (!opts?.currentOnly) {
+    for (const incident of openIncidents) {
+      if (!incident.projectId) continue;
+      const key = memoryKey(incident.projectId, incident.serviceKey);
+      if (visited.has(key)) continue;
+      if (!settled(incident.projectId)) continue;
+      if (await repos.serviceIncident.resolve(incident.id)) summary.stale++;
+      MEMORY.delete(key);
+    }
+  }
+
+  // Keep the dashboard snapshot aligned with the same retirement rule. Without
+  // this, deleting a compose service would leave a permanently "healthy" row in
+  // Monitoring even though the watcher correctly stopped tracking it.
+  for (const [key, row] of HEALTH_SNAPSHOTS) {
+    if (opts?.organizationId && row.organizationId !== opts.organizationId) continue;
+    if (!visited.has(key) && settled(row.projectId)) HEALTH_SNAPSHOTS.delete(key);
+  }
+
+  if (opts?.currentOnly) {
+    // A timed-out group can overwrite a partly-completed result with `unknown`.
+    // Derive this coverage count from the final snapshot once, rather than
+    // reporting the same workload twice as each phase observed it.
+    summary.indeterminate = [...visited].filter(
+      (key) => HEALTH_SNAPSHOTS.get(key)?.state === "unknown",
+    ).length;
   }
 
   // ── Forget workloads nobody will ask about again ────────────────────────────
@@ -662,9 +811,11 @@ async function sweepOnce(opts?: HealthWatchOptions): Promise<HealthWatchSummary>
   // unreachable box or an in-flight deploy keeps its baselines AND its agreement
   // counters — throwing those away would cost a tick of detection latency the
   // moment the box answers again.
-  for (const key of MEMORY.keys()) {
-    if (visited.has(key)) continue;
-    if (settled(projectIdFromMemoryKey(key))) MEMORY.delete(key);
+  if (!opts?.currentOnly) {
+    for (const key of MEMORY.keys()) {
+      if (visited.has(key)) continue;
+      if (settled(projectIdFromMemoryKey(key))) MEMORY.delete(key);
+    }
   }
 
   // The poll owns the event layer's lifecycle: each full pass renews the leases of
@@ -673,12 +824,14 @@ async function sweepOnce(opts?: HealthWatchOptions): Promise<HealthWatchSummary>
   // streams, a box that loses its last project drops its subscription — and the
   // accelerator cannot outlive the sweep it accelerates. Imported lazily because
   // the accelerator imports us back; it returns without waiting on connects.
-  try {
-    const { renewEventWatchers } = await import("./container-events");
-    await renewEventWatchers(allGroupKeys);
-  } catch (err) {
-    summary.errors++;
-    console.error(`[health-watch] event watcher renewal failed: ${safeErrorMessage(err)}`);
+  if (!opts?.currentOnly) {
+    try {
+      const { renewEventWatchers } = await import("./container-events");
+      await renewEventWatchers(allGroupKeys);
+    } catch (err) {
+      summary.errors++;
+      console.error(`[health-watch] event watcher renewal failed: ${safeErrorMessage(err)}`);
+    }
   }
 
   return summary;
@@ -690,7 +843,52 @@ interface GroupContext {
   openByKey: Map<string, ServiceIncident>;
   swept: Set<string>;
   visited: Set<string>;
+  countedProjects: Set<string>;
+  countedWorkloads: Set<string>;
   summary: HealthWatchSummary;
+  currentOnly: boolean;
+}
+
+/**
+ * Publish an honest current-state result when a project is known but its daemon
+ * cannot be read (unreachable target, deploy transition, or unsupported runtime).
+ * Workload ownership still comes from `resolveWorkloads`; this fallback does not
+ * invent a second matcher.
+ */
+async function publishUnknownCandidates(
+  ctx: Omit<GroupContext, "group">,
+  candidates: Candidate[],
+): Promise<void> {
+  for (const candidate of candidates) {
+    if (!ctx.countedProjects.has(candidate.project.id)) {
+      ctx.countedProjects.add(candidate.project.id);
+      ctx.summary.projects++;
+    }
+    ctx.swept.add(candidate.project.id);
+    try {
+      const workloads = await resolveWorkloads(
+        candidate,
+        ctx.serviceRows.get(candidate.project.id) ?? [],
+        [],
+      );
+      for (const workload of workloads) {
+        const key = memoryKey(candidate.project.id, workload.serviceKey);
+        if (!ctx.countedWorkloads.has(key)) {
+          ctx.countedWorkloads.add(key);
+          ctx.summary.workloads++;
+        }
+        ctx.visited.add(key);
+        publishHealthSnapshot(candidate, workload, "unknown");
+        ctx.summary.indeterminate++;
+      }
+    } catch (err) {
+      ctx.summary.errors++;
+      ctx.swept.delete(candidate.project.id);
+      console.error(
+        `[health-watch] ${candidate.project.slug}: could not resolve workloads: ${safeErrorMessage(err)}`,
+      );
+    }
+  }
 }
 
 /**
@@ -737,6 +935,19 @@ async function sweepServerGroup(ctx: GroupContext): Promise<void> {
     // (a project is marked swept before its workloads are evaluated, and a deadline
     // can land between the two).
     for (const candidate of group) ctx.swept.delete(candidate.project.id);
+
+    if (ctx.currentOnly) {
+      if (handle.listed && reason !== GROUP_DEADLINE_REASON) {
+        summary.errors++;
+        console.error(
+          `[health-watch] ${serverId ?? "local docker"}: current scan failed after the daemon answered: ${reason}`,
+        );
+      } else {
+        summary.unreachable++;
+      }
+      await publishUnknownCandidates(ctx, group);
+      return;
+    }
 
     // Gate 3, and the only thing it is allowed to mean: the container list never
     // came back. PAST that point the daemon has demonstrably answered, so a failure
@@ -855,7 +1066,10 @@ async function readServerGroup(
     });
     handle.runtime = resolved.runtime;
     const runtime = resolved.runtime;
-    if (!runtime.supports("hostContainerQuery") || !runtime.listAllContainers) return;
+    if (!runtime.supports("hostContainerQuery") || !runtime.listAllContainers) {
+      if (ctx.currentOnly) await publishUnknownCandidates(ctx, group);
+      return;
+    }
 
     const live = await runtime.listAllContainers();
     handle.listed = true;
@@ -864,10 +1078,12 @@ async function readServerGroup(
     // same resolver the open path uses, so a LOCAL group can close the incident it
     // opened: that one hangs on the self-server row, which keying this off `serverId`
     // alone (null, here) could never reach.
-    const incidentTarget = await incidentServerId(serverId, organizationId);
-    if (incidentTarget) {
-      const stale = await repos.serviceIncident.findOpenForServer(incidentTarget);
-      if (stale && (await resolveServerIncident(stale))) summary.resolved++;
+    if (!ctx.currentOnly) {
+      const incidentTarget = await incidentServerId(serverId, organizationId);
+      if (incidentTarget) {
+        const stale = await repos.serviceIncident.findOpenForServer(incidentTarget);
+        if (stale && (await resolveServerIncident(stale))) summary.resolved++;
+      }
     }
 
     const byContainerId = new Map(live.map((c) => [c.id, c]));
@@ -877,7 +1093,10 @@ async function readServerGroup(
     const pending: { candidate: Candidate; workload: Workload; container: ListedContainer | null }[] =
       [];
     for (const candidate of group) {
-      summary.projects++;
+      if (!ctx.countedProjects.has(candidate.project.id)) {
+        ctx.countedProjects.add(candidate.project.id);
+        summary.projects++;
+      }
       ctx.swept.add(candidate.project.id);
       let workloads: Workload[];
       try {
@@ -891,14 +1110,27 @@ async function readServerGroup(
         ctx.swept.delete(candidate.project.id);
         continue;
       }
-      summary.workloads += workloads.length;
       for (const workload of workloads) {
+        const key = memoryKey(candidate.project.id, workload.serviceKey);
+        if (!ctx.countedWorkloads.has(key)) {
+          ctx.countedWorkloads.add(key);
+          summary.workloads++;
+        }
         pending.push({
           candidate,
           workload,
           container: byContainerId.get(workload.containerId) ?? null,
         });
       }
+    }
+
+    // Publish the ownership index in one atomic replacement after workload
+    // resolution. Event handling reads this; it never derives ownership itself.
+    if (!ctx.currentOnly) {
+      TRACKED_CONTAINERS.set(
+        watchGroupKey(serverId, organizationId),
+        new Set(pending.map((entry) => entry.workload.containerId)),
+      );
     }
 
     // Spend the inspect budget where it decides something. The container list already
@@ -930,6 +1162,7 @@ async function readServerGroup(
             // because a box where this is the steady state is a box we are not
             // actually watching.
             summary.indeterminate++;
+            if (ctx.currentOnly) publishHealthSnapshot(candidate, workload, "unknown");
             return;
           }
         } else {
@@ -959,6 +1192,7 @@ async function readServerGroup(
           runtime,
           openByKey: ctx.openByKey,
           summary,
+          currentOnly: ctx.currentOnly,
         });
       } catch (err) {
         // One workload's incident write rejecting (a service row deleted mid-sweep
@@ -968,6 +1202,10 @@ async function readServerGroup(
         // of those statements run, so the agreement counter survives and the next
         // tick retries: the cost is one observation.
         summary.errors++;
+        if (ctx.currentOnly) {
+          publishHealthSnapshot(candidate, workload, "unknown");
+          summary.indeterminate++;
+        }
         console.error(
           `[health-watch] ${candidate.project.slug}/${workload.serviceName}: ${safeErrorMessage(err)}`,
         );
@@ -1025,6 +1263,10 @@ async function resolveWorkloads(
 
   const workloads: Workload[] = [];
   for (const service of services) {
+    // Explicit per-service opt-out. This is applied before the workload enters
+    // the snapshot, inspect budget or event ownership index, so "don't watch"
+    // genuinely consumes no monitoring resources and can never alert.
+    if (service.advanced?.monitoringEnabled === false) continue;
     const hint = hints.get(service.id);
     // Not part of the active release (added but never deployed, or skipped).
     if (!hint) continue;
@@ -1134,6 +1376,7 @@ async function evaluate(args: {
   runtime: RuntimeAdapter;
   openByKey: Map<string, ServiceIncident>;
   summary: HealthWatchSummary;
+  currentOnly: boolean;
 }): Promise<void> {
   const { candidate, workload, key, container, summary } = args;
   const previous = MEMORY.get(key);
@@ -1160,6 +1403,21 @@ async function evaluate(args: {
           createdTicks: sameContainer ? (previous?.createdTicks ?? 0) : 0,
         })
       : missingContainerVerdict(workload);
+
+  publishHealthSnapshot(
+    candidate,
+    workload,
+    verdict.clear === "unknown" ? "unknown" : (verdict.kind ?? "healthy"),
+    nowMs,
+  );
+
+  // An explicit check answers only "what is true now?". It shares all reads and
+  // classification above, then stops before touching the continuous watch's
+  // evidence, incidents, notification state or logs.
+  if (args.currentOnly) {
+    if (verdict.clear === "unknown") summary.indeterminate++;
+    return;
+  }
 
   // An observation that could not answer is not an observation. Any open incident
   // stays exactly where it is — the same call the sweep makes for a box that didn't
@@ -1306,6 +1564,27 @@ async function evaluate(args: {
   );
   if (transition === "opened") summary.opened++;
   else if (transition === "escalated") summary.escalated++;
+}
+
+function publishHealthSnapshot(
+  candidate: Candidate,
+  workload: Workload,
+  state: WorkloadHealthSnapshot["state"],
+  observedAtMs = Date.now(),
+): void {
+  HEALTH_SNAPSHOTS.set(memoryKey(candidate.project.id, workload.serviceKey), {
+    organizationId: candidate.project.organizationId,
+    projectId: candidate.project.id,
+    projectName: candidate.project.name,
+    projectSlug: candidate.project.slug,
+    serviceId: workload.serviceId,
+    serviceKey: workload.serviceKey,
+    serviceName: workload.serviceName,
+    serverId: candidate.serverId,
+    containerId: workload.containerId,
+    state,
+    observedAt: new Date(observedAtMs).toISOString(),
+  });
 }
 
 /**

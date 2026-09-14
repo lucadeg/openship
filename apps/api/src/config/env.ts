@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { createPrivateKey } from "crypto";
 import {
   runtimeTarget,
   runtimeTargetId,
@@ -269,8 +270,10 @@ const envSchema = z.object({
   /* ---------- GitHub Auth Strategy ---------- */
   /**
    * Controls how the API authenticates with GitHub:
-   *   - "auto"  (default) → inferred from DEPLOY_MODE / CLOUD_MODE
-   *   - "app"             → GitHub App installation tokens (cloud)
+   *   - "auto"  (default) → local GitHub App when fully configured, then
+   *                          Openship Cloud App, then the local identity
+   *   - "app"             → GitHub App installation tokens (SaaS or a
+   *                          self-hosted operator-owned App)
    *   - "oauth"           → Better Auth OAuth flow only (self-hosted with OAuth)
    *   - "cli"             → `gh auth login` token from the machine (local/desktop)
    *   - "token"           → static GITHUB_TOKEN env var (CI, scripts)
@@ -487,6 +490,67 @@ type Env = z.infer<typeof envSchema>;
 
 export const env: Env = envSchema.parse(process.env);
 
+/**
+ * One configuration verdict shared by auth mode resolution, capabilities,
+ * webhook routing and boot validation. A self-hosted App is intentionally an
+ * environment-level secret: the PEM and webhook secret never enter the DB or
+ * cross the dashboard API boundary.
+ */
+const localGitHubAppPrivateKey =
+  env.GITHUB_PRIVATE_KEY ??
+  (env.GITHUB_PRIVATE_KEY_BASE64
+    ? Buffer.from(env.GITHUB_PRIVATE_KEY_BASE64, "base64").toString("utf8")
+    : "");
+const localGitHubAppIntent =
+  !env.CLOUD_MODE &&
+  (env.GITHUB_AUTH_MODE === "app" ||
+    Boolean(env.GITHUB_APP_ID) ||
+    Boolean(env.GITHUB_PRIVATE_KEY) ||
+    Boolean(env.GITHUB_PRIVATE_KEY_BASE64));
+
+export const localGitHubAppConfiguration = (() => {
+  const missing: string[] = [];
+  if (!env.GITHUB_APP_ID?.trim()) missing.push("GITHUB_APP_ID");
+  if (!env.GITHUB_APP_SLUG?.trim()) missing.push("GITHUB_APP_SLUG");
+  if (!localGitHubAppPrivateKey.trim()) {
+    missing.push("GITHUB_PRIVATE_KEY or GITHUB_PRIVATE_KEY_BASE64");
+  }
+  if (!env.GITHUB_WEBHOOK_SECRET?.trim()) missing.push("GITHUB_WEBHOOK_SECRET");
+  // A GitHub App's client id/secret drive the user-authorization leg. That
+  // token is how the setup callback proves the reported installation really
+  // belongs to the user who initiated it (GitHub explicitly says not to trust
+  // installation_id from the browser redirect by itself).
+  if (!env.GITHUB_CLIENT_ID?.trim()) missing.push("GITHUB_CLIENT_ID");
+  if (!env.GITHUB_CLIENT_SECRET?.trim()) missing.push("GITHUB_CLIENT_SECRET");
+  return {
+    intended: localGitHubAppIntent,
+    configured: !env.CLOUD_MODE && missing.length === 0,
+    missing,
+  } as const;
+})();
+
+if (localGitHubAppConfiguration.intended && !localGitHubAppConfiguration.configured) {
+  throw new Error(
+    `Self-hosted GitHub App configuration is incomplete. Missing: ` +
+      `${localGitHubAppConfiguration.missing.join(", ")}. ` +
+      `Either configure the complete App or remove GITHUB_APP_ID/private-key settings.`,
+  );
+}
+
+if (localGitHubAppConfiguration.configured) {
+  if (!/^\d+$/.test(env.GITHUB_APP_ID!) || Number(env.GITHUB_APP_ID) <= 0) {
+    throw new Error("GITHUB_APP_ID must be a positive integer.");
+  }
+  try {
+    createPrivateKey(localGitHubAppPrivateKey);
+  } catch {
+    throw new Error(
+      "The configured GitHub App private key is not a valid PEM key. " +
+        "Use GITHUB_PRIVATE_KEY_BASE64 for a single-line environment value.",
+    );
+  }
+}
+
 // Print resolution at MODULE LOAD, before any handler runs. If
 // boot crashes (e.g. EADDRINUSE on listen), this still shows. The
 // runtime-target row is resolved in @repo/core/runtime-config from
@@ -588,16 +652,17 @@ if (
   );
 }
 
-// ─── gh CLI auth modes are forbidden on the SaaS host ─────────────────────
+// ─── non-App auth modes are forbidden on the SaaS host ────────────────────
 //
-// The multi-tenant SaaS (CLOUD_MODE=true) has no operator `gh` CLI and must
-// NEVER shell out to it or read ~/.config/gh/hosts.yml. GITHUB_AUTH_MODE in
-// {cli, token} forces a local-credential resolution path; combined with
-// CLOUD_MODE that would run the gh subprocess / a static PAT on the shared
-// host. getLocalGhToken/getLocalGhStatus/startDeviceFlow now hard-floor on
-// CLOUD_MODE too, but refusing to boot makes the misconfiguration impossible
-// rather than merely inert.
-if (env.CLOUD_MODE && (env.GITHUB_AUTH_MODE === "cli" || env.GITHUB_AUTH_MODE === "token")) {
+// Multi-tenant Cloud has one GitHub integration: the Openship App. CLI, static
+// PAT, and OAuth-only modes either use shared host credentials or bypass the
+// installation/workspace boundary. Runtime resolvers also hard-floor Cloud to
+// `app`; refusing invalid configuration at boot makes the mistake visible.
+if (
+  env.CLOUD_MODE &&
+  env.GITHUB_AUTH_MODE !== "auto" &&
+  env.GITHUB_AUTH_MODE !== "app"
+) {
   throw new Error(
     `GITHUB_AUTH_MODE="${env.GITHUB_AUTH_MODE}" is not allowed when CLOUD_MODE=true. ` +
       `The SaaS host uses the GitHub App exclusively — set GITHUB_AUTH_MODE to "auto" or "app".`,
@@ -711,34 +776,6 @@ function validateCookieDomain(raw: string): void {
     throw new Error(
       `BETTER_AUTH_COOKIE_DOMAIN "${raw}" does not end with the API's eTLD+1 "${apiSuffix}". ` +
         `The cookie domain must be a parent of the API hostname.`,
-    );
-  }
-}
-
-// ─── Self-hosted GitHub App creds are deprecated ────────────────────────────
-//
-// The GitHub App private key now lives exclusively in api.openship.io
-// (CLOUD_MODE=true). Self-hosted instances proxy all App-scoped operations
-// through cloud-client.ts. Setting these on a self-hosted instance has no
-// effect but suggests the operator hasn't seen the new flow — warn so they
-// know they can clean up their .env.
-if (!env.CLOUD_MODE) {
-  // GITHUB_APP_SLUG is intentionally NOT in this list — it IS consumed
-  // on self-hosted (by getInstallUrl in github.auth.ts to build the
-  // install link the dashboard shows). GITHUB_WEBHOOK_SECRET is also NOT
-  // listed: it's no longer REQUIRED (webhooks now mint + persist a
-  // per-project signing secret), but it stays a valid LEGACY FALLBACK the
-  // webhook verifier still accepts — so we don't nag operators to remove it.
-  // The vars below ARE App-private credentials that moved to api.openship.io.
-  const stale = [
-    env.GITHUB_APP_ID && "GITHUB_APP_ID",
-    (env.GITHUB_PRIVATE_KEY || env.GITHUB_PRIVATE_KEY_BASE64) && "GITHUB_PRIVATE_KEY",
-  ].filter(Boolean);
-  if (stale.length > 0) {
-    console.warn(
-      `[env] Self-hosted instances no longer use local GitHub App credentials. ` +
-      `These env vars are ignored: ${stale.join(", ")}. ` +
-      `Connect to Openship Cloud in Settings to enable App-scoped GitHub access.`,
     );
   }
 }

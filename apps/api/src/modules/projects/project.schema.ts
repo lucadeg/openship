@@ -104,10 +104,7 @@ const EnvironmentEnum = Type.Union([
   Type.Literal("development"),
 ]);
 
-const EnvironmentSourceModeEnum = Type.Union([
-  Type.Literal("branch"),
-  Type.Literal("manual"),
-]);
+const EnvironmentSourceModeEnum = Type.Union([Type.Literal("branch"), Type.Literal("manual")]);
 
 const PublicEndpointSchema = Type.Object({
   port: Type.Optional(Type.Number({ minimum: 1, maximum: 65535 })),
@@ -170,14 +167,27 @@ const ComposeServiceSchema = Type.Object({
   image: Type.Optional(Type.String({ maxLength: 500 })),
   build: Type.Optional(Type.String({ maxLength: 500 })),
   dockerfile: Type.Optional(Type.String({ maxLength: 500 })),
+  buildArgs: Type.Optional(Type.Record(Type.String(), Type.Union([Type.String(), Type.Null()]))),
   ports: Type.Optional(Type.Array(Type.String({ maxLength: 100 }), { maxItems: 50 })),
   dependsOn: Type.Optional(Type.Array(Type.String({ maxLength: 100 }), { maxItems: 50 })),
   environment: Type.Optional(Type.Record(Type.String(), Type.String())),
+  environmentTemplates: Type.Optional(Type.Record(Type.String(), Type.String())),
   volumes: Type.Optional(Type.Array(Type.String({ maxLength: 500 }), { maxItems: 50 })),
   command: Type.Optional(Type.String({ maxLength: 2000 })),
   // #332: structured argv passed through from folder/scan (compose Cmd, no `sh -c`).
-  commandArgv: Type.Optional(Type.Array(Type.String({ maxLength: 2000 }), { maxItems: 100 })),
+  commandArgv: Type.Optional(
+    Type.Union([Type.Array(Type.String({ maxLength: 2000 }), { maxItems: 100 }), Type.Null()]),
+  ),
   restart: Type.Optional(Type.String({ maxLength: 50 })),
+  advanced: Type.Optional(
+    Type.Object(
+      {},
+      {
+        additionalProperties: true,
+        description: "Extended compose block (including names-only build-arg template provenance).",
+      },
+    ),
+  ),
   exposed: Type.Optional(Type.Boolean()),
   exposedPort: Type.Optional(Type.String({ maxLength: 100 })),
   domain: Type.Optional(Type.String({ maxLength: 63 })),
@@ -289,7 +299,10 @@ const RoutingConfigSchema = Type.Object({
       Type.Object({
         source: Type.String({ maxLength: 2000 }),
         headers: Type.Array(
-          Type.Object({ key: Type.String({ maxLength: 200 }), value: Type.String({ maxLength: 4000 }) }),
+          Type.Object({
+            key: Type.String({ maxLength: 200 }),
+            value: Type.String({ maxLength: 4000 }),
+          }),
           { maxItems: 50 },
         ),
       }),
@@ -304,15 +317,17 @@ const RoutingConfigSchema = Type.Object({
 });
 
 /**
- * Release/dist source config (gitProvider === "release"). A prebuilt dist is
- * deployed with no build, version-tracked. `mode: "github"` pulls a release
- * asset from a repo; `mode: "url"` pulls an external HTTPS tarball (sha256
- * REQUIRED). Mirrors the `ReleaseSource` type in @repo/core.
+ * Version-tracked release source (gitProvider === "release"). Legacy/explicit
+ * archive mode downloads a release dist; image mode renders a registry image
+ * and runs it without a source build. Mirrors ReleaseSource in @repo/core.
  */
-const ReleaseSourceSchema = Type.Object({
+export const ReleaseSourceSchema = Type.Object({
   mode: Type.Union([Type.Literal("github"), Type.Literal("url")]),
+  /** Missing means the legacy archive behavior for existing rows. */
+  artifactKind: Type.Optional(Type.Union([Type.Literal("archive"), Type.Literal("image")])),
   repo: Type.Optional(Type.String({ maxLength: 200 })),
   assetTemplate: Type.Optional(Type.String({ maxLength: 200 })),
+  imageTemplate: Type.Optional(Type.String({ maxLength: 500 })),
   os: Type.Optional(Type.String({ maxLength: 32 })),
   arch: Type.Optional(Type.String({ maxLength: 32 })),
   distUrl: Type.Optional(Type.String({ maxLength: 2000 })),
@@ -324,8 +339,27 @@ const ReleaseSourceSchema = Type.Object({
   trackReleases: Type.Optional(Type.Boolean()),
 });
 
+/** Full source transition for a single-app prebuilt container release. */
+export const SetReleaseSourceBody = Type.Object({
+  ...ReleaseSourceSchema.properties,
+  artifactKind: Type.Literal("image"),
+  imageTemplate: Type.String({ minLength: 1, maxLength: 500 }),
+});
+
 export const CreateProjectBody = Type.Object({
   name: Type.String({ minLength: 1, maxLength: 100 }),
+  /**
+   * Durable deploy-target binding for a newly created project. The generic
+   * project PATCH deliberately omits this field: changing a target is a deploy
+   * operation, and the successful deployment lifecycle promotes that target
+   * atomically after the workload is live.
+   */
+  serverId: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description: "Registered server to bind this new project to.",
+    }),
+  ),
   /** Override the auto-generated slug (used as free subdomain: slug.opsh.io) */
   slug: Type.Optional(
     Type.String({ minLength: 1, maxLength: 63, pattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" }),
@@ -424,7 +458,10 @@ export const CreateProjectBody = Type.Object({
    * overlaps an existing service's `rootDirectory`.
    */
   monorepoSharedPaths: Type.Optional(
-    Type.Union([Type.Null(), Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 50 })]),
+    Type.Union([
+      Type.Null(),
+      Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 50 }),
+    ]),
   ),
   /** Routing config from the repo's vercel.json (see RoutingConfigSchema). */
   routingConfig: Type.Optional(Type.Union([Type.Null(), RoutingConfigSchema])),
@@ -445,11 +482,7 @@ export const CreateProjectBody = Type.Object({
    *     supported on Docker Desktop). Ignored by bare + cloud runtimes.
    */
   routeStrategy: Type.Optional(
-    Type.Union([
-      Type.Literal("auto"),
-      Type.Literal("loopback-port"),
-      Type.Literal("container-ip"),
-    ]),
+    Type.Union([Type.Literal("auto"), Type.Literal("loopback-port"), Type.Literal("container-ip")]),
   ),
   /**
    * Deploy-time readiness gate. Omitted/null = OFF, which is the default for
@@ -477,7 +510,9 @@ export const CreateProjectBody = Type.Object({
   internalAlias: Type.Optional(Type.Union([Type.String({ maxLength: 100 }), Type.Null()])),
 });
 
-export const UpdateProjectBody = Type.Partial(CreateProjectBody);
+// `serverId` is create/ensure-only. Keeping it out of the generic PATCH body is
+// also what keeps PROJECT_UPDATE_KEYS from becoming a target-retargeting path.
+export const UpdateProjectBody = Type.Partial(Type.Omit(CreateProjectBody, ["serverId"]));
 
 /**
  * POST /projects/ensure — CreateProjectBody plus an optional `projectId` to
@@ -510,7 +545,9 @@ export const EnsureProjectBody = Type.Composite([
 export const FolderSessionBody = Type.Object(
   {
     stack: Type.Optional(
-      Type.String({ description: "Stack hint (e.g. 'vite','nextjs'); picks the cloud build image." }),
+      Type.String({
+        description: "Stack hint (e.g. 'vite','nextjs'); picks the cloud build image.",
+      }),
     ),
     packageManager: Type.Optional(Type.String({ description: "npm | pnpm | yarn | bun." })),
     name: Type.Optional(Type.String({ description: "Project name." })),
@@ -586,13 +623,19 @@ export const UpdateResourcesBody = Type.Object({
 export const LinkRepoBody = Type.Object({
   owner: Type.String({ minLength: 1, description: "GitHub repo owner." }),
   repo: Type.String({ minLength: 1, description: "GitHub repo name." }),
-  branch: Type.Optional(Type.String({ description: "Deploy branch (defaults to the repo default)." })),
-  installationId: Type.Optional(Type.Number({ description: "GitHub App installation id, when known." })),
+  branch: Type.Optional(
+    Type.String({ description: "Deploy branch (defaults to the repo default)." }),
+  ),
+  installationId: Type.Optional(
+    Type.Number({ description: "GitHub App installation id, when known." }),
+  ),
 });
 
 /** POST /:id/auto-deploy — enable/disable auto-deploy on push. */
 export const SetAutoDeployBody = Type.Object({
-  enabled: Type.Boolean({ description: "Whether a push to the deploy branch triggers a redeploy." }),
+  enabled: Type.Boolean({
+    description: "Whether a push to the deploy branch triggers a redeploy.",
+  }),
 });
 
 /** POST /:id/branch — set the deploy branch. */
@@ -658,3 +701,4 @@ export type TUpdateProjectBody = Static<typeof UpdateProjectBody> & {
 export type TCreateProjectEnvironmentBody = Static<typeof CreateProjectEnvironmentBody>;
 export type TMergeEnvVarsBody = Static<typeof MergeEnvVarsBody>;
 export type TUpdateResourcesBody = Static<typeof UpdateResourcesBody>;
+export type TSetReleaseSourceBody = Static<typeof SetReleaseSourceBody>;

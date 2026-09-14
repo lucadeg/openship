@@ -149,7 +149,7 @@ export const notification = {
    */
   emit(input: NotificationEmitInput): void {
     // Custom jobs can also be TRIGGERED by an event (cheap no-op when unarmed).
-    fireJobTriggers(input.eventType);
+    fireJobTriggers(input.eventType, input.organizationId);
     void dispatch(input).catch((err) => {
       console.error(
         `[notification] dispatch failed for eventType=${input.eventType}:`,
@@ -164,7 +164,7 @@ export const notification = {
    * the notification is itself an incident).
    */
   async emitSync(input: NotificationEmitInput): Promise<void> {
-    fireJobTriggers(input.eventType);
+    fireJobTriggers(input.eventType, input.organizationId);
     await dispatch(input);
   },
 };

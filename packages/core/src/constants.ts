@@ -4,6 +4,35 @@
 
 export const APP_NAME = "Openship";
 
+/** Authenticated organization admins may intentionally create a shareable
+ * invitation without asking the server to deliver email. Shared by the
+ * dashboard request and the API callback so this protocol cannot drift. */
+export const INVITATION_DELIVERY_HEADER = "x-openship-invitation-delivery";
+export const INVITATION_DELIVERY_LINK_ONLY = "link-only";
+
+/** Whether an invitation claim may create its recipient's account. */
+export type InvitationAccountCreation = "existing" | "public" | "invited" | "disabled";
+
+/**
+ * Better Auth invitation ids are URL-safe opaque bearer tokens. Keep their
+ * accepted shape and canonical dashboard route shared by API validation, email
+ * delivery, copied links, and post-auth redirect validation.
+ */
+export const INVITATION_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
+
+export function isValidInvitationId(value: string): boolean {
+  return INVITATION_ID_PATTERN.test(value);
+}
+
+export function invitationClaimPath(invitationId: string): string {
+  return `/accept-invite/${encodeURIComponent(invitationId)}`;
+}
+
+export function isInvitationClaimPath(path: string): boolean {
+  const prefix = "/accept-invite/";
+  return path.startsWith(prefix) && isValidInvitationId(path.slice(prefix.length));
+}
+
 /**
  * Outbound links to our own properties — docs, support, community, socials.
  *
@@ -117,7 +146,6 @@ export const CREDIT_CONVERSION = {
  *   - `isPlaceholderPriceId` is gone with the `price_*_placeholder` defaults it
  *     existed to detect. An unset price id is now simply `null`.
  */
-
 
 /**
  * #336: the sentinel a compose-service env value is masked to on API output.

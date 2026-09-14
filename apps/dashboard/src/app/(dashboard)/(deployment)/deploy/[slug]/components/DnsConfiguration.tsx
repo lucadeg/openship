@@ -23,6 +23,8 @@ interface DnsConfigurationProps {
   /** A persisted domain's id. When set, the on-demand auto-configure panel is
    *  shown above the manual records — pre-add previews (no id) stay manual. */
   domainId?: string;
+  /** Explicit pre-deploy server; it wins over any previous project deployment. */
+  serverId?: string;
 }
 
 const DnsConfiguration: React.FC<DnsConfigurationProps> = ({
@@ -31,6 +33,7 @@ const DnsConfiguration: React.FC<DnsConfigurationProps> = ({
   mode,
   showHeader = true,
   domainId,
+  serverId,
 }) => {
   const { t } = useI18n();
   const d = t.deploy.dns;
@@ -78,9 +81,9 @@ const DnsConfiguration: React.FC<DnsConfigurationProps> = ({
     <div className="space-y-3">
       {domainId && (
         <AutoDnsPanel
-          plan={() => domainsApi.dnsPlan(domainId).then((r) => r.data)}
-          apply={() => domainsApi.dnsApply(domainId).then((r) => r.data)}
-          reloadKey={domainId}
+          plan={() => domainsApi.dnsPlan(domainId, serverId).then((r) => r.data)}
+          apply={() => domainsApi.dnsApply(domainId, serverId).then((r) => r.data)}
+          reloadKey={`${domainId}:${serverId ?? "project"}`}
         />
       )}
       {manual}

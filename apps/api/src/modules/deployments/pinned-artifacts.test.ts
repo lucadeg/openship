@@ -3,6 +3,7 @@ import {
   hasPinnedArtifacts,
   pinnedAppImage,
   pinnedImageForService,
+  refreshAppDeploymentId,
   snapshotNeedsGitSource,
   withoutPinnedArtifacts,
 } from "./pinned-artifacts";
@@ -31,11 +32,25 @@ describe("pinned artifact lookup", () => {
     expect(hasPinnedArtifacts(snapshot)).toBe(true);
     expect(hasPinnedArtifacts({ handoverImages: { web: "  " } })).toBe(false);
     expect(hasPinnedArtifacts({})).toBe(false);
+    expect(hasPinnedArtifacts({ refreshAppDeploymentId: "dep_live" })).toBe(true);
   });
 
-  it("strips both fields and leaves the rest of the snapshot alone", () => {
-    const stripped = withoutPinnedArtifacts({ ...snapshot, hasBuild: true });
+  it("strips pinned artifacts and one-deployment execution intent", () => {
+    const stripped = withoutPinnedArtifacts({
+      ...snapshot,
+      refreshAppDeploymentId: "dep_live",
+      targetServiceIds: ["svc-api"],
+      strictServiceScope: true,
+      refreshServiceIds: ["svc-api"],
+      forcePullImages: true,
+      hasBuild: true,
+    });
     expect(stripped).toEqual({ hasBuild: true });
+  });
+
+  it("normalizes the active deployment marker", () => {
+    expect(refreshAppDeploymentId({ refreshAppDeploymentId: " dep_live " })).toBe("dep_live");
+    expect(refreshAppDeploymentId({ refreshAppDeploymentId: " " })).toBeUndefined();
   });
 });
 
@@ -46,6 +61,13 @@ describe("snapshotNeedsGitSource — the clone / token / GitHub-access gate", ()
     expect(snapshotNeedsGitSource({ repoUrl: repo, hasBuild: true })).toBe(true);
     expect(
       snapshotNeedsGitSource({ repoUrl: repo, hasBuild: true, handoverAppImage: "openship/app:1" }),
+    ).toBe(false);
+    expect(
+      snapshotNeedsGitSource({
+        repoUrl: repo,
+        hasBuild: true,
+        refreshAppDeploymentId: "dep_live",
+      }),
     ).toBe(false);
   });
 
@@ -110,10 +132,7 @@ describe("snapshotNeedsGitSource — the clone / token / GitHub-access gate", ()
   it("compose: disabled services don't force a clone", () => {
     expect(
       snapshotNeedsGitSource({
-        composeServices: [
-          { name: "web", build: "./web", enabled: false },
-          { name: "db" },
-        ],
+        composeServices: [{ name: "web", build: "./web", enabled: false }, { name: "db" }],
       }),
     ).toBe(false);
   });

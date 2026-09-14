@@ -46,6 +46,10 @@ interface ScanRes {
    *  preflight uses the services branch — not single-app "missing build image"),
    *  and so per-service scoping (--service-ids) has real rows to act on. */
   services?: Array<Record<string, unknown>>;
+  /** What the server's openship.json parse refused (#641). Advisory — the deploy
+   *  ran on the fields that did parse — but printing it is the difference between
+   *  "my config did nothing" and knowing which line to fix. */
+  configDiagnostics?: { errors: string[]; warnings: string[]; wholeFile?: true };
   error?: string;
 }
 interface EnsureRes {
@@ -74,7 +78,8 @@ function detectPackageManager(dir: string): string | undefined {
 function detectStack(dir: string): string | undefined {
   if (existsSync(join(dir, "go.mod"))) return "go";
   if (existsSync(join(dir, "Cargo.toml"))) return "rust";
-  if (existsSync(join(dir, "requirements.txt")) || existsSync(join(dir, "pyproject.toml"))) return "python";
+  if (existsSync(join(dir, "requirements.txt")) || existsSync(join(dir, "pyproject.toml")))
+    return "python";
   if (existsSync(join(dir, "package.json"))) return "node";
   return undefined;
 }
@@ -82,6 +87,10 @@ function detectStack(dir: string): string | undefined {
 export interface FolderDeployResult {
   deploymentId?: string;
   projectId?: string;
+  /** Forwarded rather than printed here: the caller owns the terminal (an `ora`
+   *  spinner is live for the whole of `deployFolder`), so writing from inside
+   *  would break the spinner's line. */
+  configDiagnostics?: { errors: string[]; warnings: string[]; wholeFile?: true };
 }
 
 export async function deployFolder(opts: {
@@ -90,6 +99,8 @@ export async function deployFolder(opts: {
   /** Reuse/update an existing project instead of creating one. */
   projectId?: string;
   environment?: string;
+  /** Explicit registered-server target. */
+  serverId?: string;
   /** Scope a folder REDEPLOY to a subset of services; others carry forward
    *  untouched (no needless stateful recreate). Ignored on a first deploy. */
   serviceIds?: string[];
@@ -103,13 +114,28 @@ export async function deployFolder(opts: {
   step("Creating upload session");
   const session = await apiRequest<FolderSessionRes>("/projects/folder/session", {
     method: "POST",
-    body: JSON.stringify({ name, packageManager: detectPackageManager(cwd), stack: detectStack(cwd) }),
+    body: JSON.stringify({
+      name,
+      packageManager: detectPackageManager(cwd),
+      stack: detectStack(cwd),
+    }),
   });
   if (!session.sessionId || !session.upload) {
     throw new Error(session.error || "Failed to open upload session");
   }
 
-  // 2. Package the folder (source only — deps are reinstalled during build).
+  // 2. Package the folder.
+  //
+  // Only ever exclude what is REPRODUCIBLE from the source: dependencies (the
+  // build reinstalls them), git metadata, and OS noise. Build OUTPUT is not in
+  // that set. `./dist` and `./.next` used to be excluded unconditionally, here at
+  // step 2 — before the server-side scan at step 4 that decides whether there even
+  // is a build command. For a site that is already just files (a hand-written
+  // index.html next to a `dist/` of assets, or a committed build output) that
+  // silently dropped the actual content: the upload succeeded, detection said
+  // static, the doc-root was non-empty, the deploy went green, and every asset
+  // 404'd. When a build DOES run it overwrites its own output directory anyway, so
+  // shipping it costs upload bytes and nothing else.
   step("Packaging folder");
   const tarball = join(tmpdir(), `openship-upload-${session.sessionId}.tar.gz`);
   execFileSync(
@@ -119,8 +145,6 @@ export async function deployFolder(opts: {
       tarball,
       "--exclude=./node_modules",
       "--exclude=./.git",
-      "--exclude=./dist",
-      "--exclude=./.next",
       "--exclude=./.DS_Store",
       "-C",
       cwd,
@@ -166,6 +190,7 @@ export async function deployFolder(opts: {
     method: "POST",
     body: JSON.stringify({
       projectId: opts.projectId,
+      ...(opts.serverId ? { serverId: opts.serverId } : {}),
       name: scan.name || name,
       gitProvider: "upload",
       framework: scan.stack,
@@ -193,6 +218,7 @@ export async function deployFolder(opts: {
     body: JSON.stringify({
       projectId: ensured.project_id,
       uploadSessionId: session.sessionId,
+      ...(opts.serverId ? { deployTarget: "server", serverId: opts.serverId } : {}),
       ...(opts.environment ? { environment: opts.environment } : {}),
       // Carry the scanned compose services so a multi-service folder deploys as
       // a services project (persisted rows + services-mode preflight). Absent for
@@ -204,5 +230,9 @@ export async function deployFolder(opts: {
   });
   if (!dep.deployment_id) throw new Error(dep.error || "Failed to start deployment");
 
-  return { deploymentId: dep.deployment_id, projectId: dep.project_id };
+  return {
+    deploymentId: dep.deployment_id,
+    projectId: dep.project_id,
+    ...(scan.configDiagnostics && { configDiagnostics: scan.configDiagnostics }),
+  };
 }

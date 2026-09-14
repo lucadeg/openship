@@ -4,6 +4,70 @@
     "save": "Guardar",
     "cancel": "Cancelar"
   },
+  "releaseImageSource": {
+    "validationInvalid": "A origem da imagem de lançamento é inválida.",
+    "toast": {
+      "saved": "A origem do lançamento do contentor foi guardada.",
+      "saveFailed": "Não foi possível guardar a origem do lançamento do contentor."
+    },
+    "status": {
+      "notDeployed": "Ainda não implementada",
+      "checking": "A verificar…",
+      "unavailable": "Indisponível"
+    },
+    "switchToImage": {
+      "title": "Mudar para uma origem de imagem pré-criada",
+      "description": "Guardar substitui a origem Git ou local atual em todos os ambientes. As implementações existentes e o histórico de reversão continuam disponíveis.",
+      "keep": "Manter a origem atual"
+    },
+    "switchToGit": {
+      "title": "Mudar para uma origem Git",
+      "description": "Nada muda até ligar um repositório. Ligá-lo substitui a origem de imagem acompanhada em todos os ambientes.",
+      "back": "Voltar à origem de imagem"
+    },
+    "entry": {
+      "shortButton": "Usar imagem pré-criada",
+      "button": "Acompanhar uma imagem de contentor pré-criada",
+      "description": "Implemente diretamente uma imagem de registo versionada, sem clonar nem criar um repositório."
+    },
+    "summary": {
+      "title": "Imagem de contentor acompanhada",
+      "badge": "Pré-criada",
+      "description": "Implementa diretamente uma imagem publicada. Nenhum repositório é clonado e não é executado nenhum comando de criação.",
+      "linkGit": "Ligar repositório Git",
+      "image": "Imagem",
+      "versionSource": "Origem da versão",
+      "githubReleases": "Lançamentos do GitHub",
+      "pinnedVersion": "Versão fixada",
+      "currentVersion": "Versão atual",
+      "targetVersion": "Versão de destino",
+      "latestVersion": "Versão mais recente",
+      "updateAvailable": "Atualização disponível"
+    },
+    "editor": {
+      "trackingTitle": "Acompanhamento de lançamentos",
+      "configureTitle": "Configurar imagem pré-criada",
+      "templateHint": "Use {tag} para preservar a tag exata do publicador ou {version} para a versão normalizada.",
+      "provider": "Fornecedor da versão",
+      "githubTitle": "Lançamentos do GitHub",
+      "githubDescription": "Acompanhar a tag do lançamento publicado mais recente.",
+      "urlTitle": "URL da versão ou versão fixada",
+      "urlDescription": "Leia um ponto de extremidade de versão ou implemente uma versão fixa.",
+      "imageTemplate": "Modelo da imagem",
+      "imagePlaceholder": "ghcr.io/acme/api:{tag}",
+      "githubRepository": "Repositório GitHub",
+      "repoPlaceholder": "owner/repository",
+      "versionUrl": "URL da versão",
+      "versionUrlPlaceholder": "https://example.com/latest-version",
+      "versionUrlHint": "Ponto de extremidade HTTPS que devolve texto ou JSON com version/tag_name.",
+      "pinnedVersion": "Versão fixada",
+      "pinnedPlaceholder": "Opcional, por exemplo v2.4.1",
+      "pinnedHint": "Substitui a versão mais recente detectada; deixe em branco para acompanhar atualizações.",
+      "appliesAll": "As alterações aplicam-se a todos os ambientes deste projeto.",
+      "saving": "A guardar…",
+      "save": "Guardar origem"
+    }
+  },
   "appSettings": {
     "modeApp": "Definições da aplicação",
     "modeDeployment": "Implementação",
@@ -108,12 +172,15 @@
       "runningStatus": "Em andamento — {status}"
     },
     "cache": {
-      "title": "Cache",
-      "description": "Limpe os artefactos de compilação e as instalações de dependências em cache",
+      "title": "Cache de compilação do Docker",
+      "description": "A cache de compilação não utilizada é limitada automaticamente a 5 GB por servidor",
       "clearInstall": "Limpar cache de instalação",
       "clearInstallDesc": "Remover node_modules em cache",
       "clearBuild": "Limpar cache de compilação",
-      "clearBuildDesc": "Remover o resultado de compilação em cache"
+      "clearBuildDesc": "Remover a cache não utilizada do servidor Docker deste projeto",
+      "clearBuildConfirm": "Limpar toda a cache de compilação do Docker não utilizada neste servidor? Outros projetos poderão reconstruir dependências na próxima implantação.",
+      "clearBuildSuccess": "Foram recuperados {size} de cache de compilação",
+      "clearBuildEmpty": "Não há cache de compilação não utilizada para limpar"
     },
     "transfer": {
       "title": "Transferir e clonar",
@@ -337,28 +404,7 @@
     "close": "Fechar"
   },
   "gitInfo": {
-    "repository": "Repositório",
-    "autoDeploy": "Implementação automática",
-    "deploysOnPush": "Implementa a cada push",
-    "manualOnly": "Apenas implementações manuais",
-    "branchToDeploy": "Ramo a implementar",
-    "chooseBranch": "Escolha qual ramo do seu repositório implementar",
-    "save": "Guardar",
-    "cancel": "Cancelar",
-    "viewOnGithub": "Ver no GitHub",
-    "recentCommits": "Commits recentes",
-    "totalCommits": "{count} no total",
-    "noCommits": "Ainda não há commits",
-    "toast": {
-      "fetchBranchesFailed": "Falha ao obter os ramos",
-      "errorTitle": "Erro",
-      "branchUpdated": "Ramo atualizado com sucesso",
-      "updatedTitle": "Atualizado",
-      "branchUpdateFailed": "Falha ao atualizar o ramo",
-      "autoDeployEnabled": "Implementação automática ativada",
-      "autoDeployDisabled": "Implementação automática desativada",
-      "autoDeployFailed": "Falha ao atualizar a implementação automática"
-    }
+    "autoDeploy": "Implementação automática"
   },
   "git": {
     "connectFirst": {
@@ -508,6 +554,9 @@
     "title": "Potência da máquina",
     "description": "Limites de CPU e memória para os contêineres deste projeto.",
     "loading": "Lendo a máquina de destino…",
+    "unavailable": "Potência da máquina indisponível",
+    "loadFailed": "Não foi possível carregar a potência da máquina",
+    "retry": "Tentar novamente",
     "machineCapacity": "Máquina: {cpu} vCPU · {memory}",
     "exceedsMachine": "Excede esta máquina",
     "appliesOnNextDeploy": "Os limites são aplicados quando o contêiner é recriado — reimplante para a alteração ter efeito.",
@@ -590,10 +639,6 @@
     "cannotUndo": "Esta ação não pode ser anulada.",
     "aboutToPrefix": "Está prestes a eliminar ",
     "aboutToSuffix": ".",
-    "deleteAllAria": "Eliminar todos os ambientes",
-    "deleteAll": "Eliminar todos os ambientes",
-    "deleteAllOn": "Remove a aplicação do projeto e todos os ambientes de ramo por baixo dela.",
-    "deleteAllOff": "Remove apenas este ambiente. Os outros ramos permanecem.",
     "scanning": "A analisar os serviços e volumes associados…",
     "wipeAria": "Também apagar os dados dos serviços",
     "wipeLabelOne": "Também apagar os dados dos serviços ({count} volume)",
@@ -608,9 +653,7 @@
     "typePrefix": "Escreva ",
     "typeSuffix": " para confirmar.",
     "cancel": "Cancelar",
-    "confirmDeleteWipe": "Eliminar + apagar dados",
     "confirmDeleteEnvWipe": "Eliminar ambiente + apagar dados",
-    "confirmDelete": "Eliminar projeto",
     "confirmDeleteEnv": "Eliminar ambiente",
     "linkedTitleOne": "{count} projeto está conectado a este app",
     "linkedTitleOther": "{count} projetos estão conectados a este app",
@@ -687,6 +730,9 @@
       "defaultAppName": "minha-app",
       "mapsToPort": "Mapeia para a porta",
       "includeWww": "Incluir www",
+      "dnsChallenge": "Usar desafio DNS-01",
+      "dnsChallengeDesc": "Emita e renove o certificado pelo provedor DNS conectado. Use quando a porta 80 não estiver acessível.",
+      "dnsChallengeWildcardDesc": "Certificados curinga exigem DNS-01 e um provedor DNS conectado.",
       "includeWwwDesc": "Gerar também registos para www.{domain}",
       "includeWwwFallback": "seudominio.com",
       "adding": "A adicionar...",
@@ -802,6 +848,11 @@
     "records": {
       "failed": "Não foi possível carregar os registros DNS deste domínio.",
       "retry": "Tentar novamente"
+    },
+    "outputHint": {
+      "body": "Nenhuma saída de compilação encontrada em {path} — verifique seu diretório de saída e implante novamente.",
+      "noIndex": "Existe saída em {path}, mas não há arquivo index — as solicitações retornarão 404. Verifique seu diretório de saída.",
+      "notServed": "O proxy respondeu HTTP {status} para {path} — este caminho não está sendo servido. Verifique seu diretório de saída e a rota."
     }
   }
 }

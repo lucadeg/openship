@@ -38,6 +38,7 @@ import {
   sweepExpiredFolderSessions,
   type FolderSession,
 } from "./session-store";
+import type { ProjectSourceEnv, ResolveOptions } from "../../deployments/prepare.service";
 
 const execFileAsync = promisify(execFile);
 
@@ -174,7 +175,11 @@ export async function createFolderSession(
     } catch (err) {
       // provisionCloudWorkspace cleans up its own failures; this only runs if it
       // succeeded but the token read didn't. remove_on_exit/TTL is the backstop.
-      if (workspaceId) await client.workspace(workspaceId).delete().catch(() => {});
+      if (workspaceId)
+        await client
+          .workspace(workspaceId)
+          .delete()
+          .catch(() => {});
       throw new Error(`Failed to provision upload workspace: ${safeErrorMessage(err)}`);
     }
 
@@ -292,18 +297,19 @@ async function safeExtractTarGz(archivePath: string, destDir: string): Promise<v
     }
   }
 
-  await execFileAsync(
-    "tar",
-    ["-xzf", archivePath, "-C", destDir, "--no-same-owner"],
-    { maxBuffer: 16 * 1024 * 1024 },
-  );
+  await execFileAsync("tar", ["-xzf", archivePath, "-C", destDir, "--no-same-owner"], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
 }
 
 async function streamToFile(body: ReadableStream<Uint8Array>, dest: string): Promise<void> {
   // `pipeline` handles backpressure, propagates errors from BOTH ends, and
   // destroys the streams on failure — so a disk-full/permission error rejects
   // here instead of surfacing as an unhandled 'error' that crashes the process.
-  await pipeline(Readable.fromWeb(body as NodeWebReadableStream<Uint8Array>), createWriteStream(dest));
+  await pipeline(
+    Readable.fromWeb(body as NodeWebReadableStream<Uint8Array>),
+    createWriteStream(dest),
+  );
 }
 
 /**
@@ -311,18 +317,52 @@ async function streamToFile(body: ReadableStream<Uint8Array>, dest: string): Pro
  *   - oblien-direct: read the workspace filesystem via the runtime.
  *   - api-relay: read the staging dir via node:fs (self-hosted only).
  *
- * Any compose services found are REMEMBERED on the session: they're returned to
- * the client too, but the deploy step must not depend on the client handing them
- * back (the documented session → scan → ensure → deploy flow has no step that
- * does), and by then the uploaded compose file is no longer parsed again.
+ * Any compose services found are remembered on the session. The first scan is
+ * returned to the client and provides the baseline for detecting wizard edits;
+ * the deploy step scans the same staged bytes again with its final project env
+ * so Compose `.env` values and deploy-time values resolve in one scope.
  */
-export async function scanFolderSession(session: FolderSession) {
-  const info = await scanSource(session);
-  session.services = info.services;
+export type FolderScanOptions = ResolveOptions & {
+  /** Keep the client-visible scan as the edit baseline. Deploy-time refreshes
+   * must leave it untouched so a retry can still distinguish source state from
+   * a real wizard override. */
+  rememberServices?: boolean;
+};
+
+export async function scanFolderSession(session: FolderSession, opts: FolderScanOptions = {}) {
+  const { rememberServices = true, ...resolveOptions } = opts;
+  const info = await scanSource(session, resolveOptions);
+  if (rememberServices) {
+    session.services = info.services;
+    session.rootEnv = info.rootEnv;
+    session.openshipEnv = info.openshipEnv;
+  }
   return info;
 }
 
-async function scanSource(session: FolderSession) {
+/**
+ * Recover project env from the trusted uploaded bytes without running stack or
+ * Compose detection. Used when the wizard deliberately selected single-app
+ * mode, including its fast path where no client-visible source scan occurred.
+ */
+export async function resolveFolderSessionSourceEnv(
+  session: FolderSession,
+  rootDirectory = "",
+): Promise<ProjectSourceEnv> {
+  if (session.mode === "oblien-direct") {
+    if (!session.workspaceId) throw new Error("Session has no workspace");
+    const { client } = await getNamespaceClient(session.orgId);
+    const rt = await client.workspaces.runtime(session.workspaceId);
+    const { resolveSourceEnvFromRuntime } = await import("../../deployments/runtime-source");
+    return resolveSourceEnvFromRuntime(rt, rootDirectory);
+  }
+
+  if (!session.stagingDir) throw new Error("Session has no staging directory");
+  const { resolveSourceEnvFromLocal } = await import("../../deployments/local-source");
+  return resolveSourceEnvFromLocal(session.stagingDir, rootDirectory);
+}
+
+async function scanSource(session: FolderSession, opts: ResolveOptions = {}) {
   if (session.mode === "oblien-direct") {
     if (!session.workspaceId) throw new Error("Session has no workspace");
     // Namespace-scoped client (not the master) so the by-id runtime lookup
@@ -330,12 +370,12 @@ async function scanSource(session: FolderSession) {
     const { client } = await getNamespaceClient(session.orgId);
     const rt = await client.workspaces.runtime(session.workspaceId);
     const { resolveFromRuntime } = await import("../../deployments/runtime-source");
-    return resolveFromRuntime(rt, session.name ?? "app");
+    return resolveFromRuntime(rt, session.name ?? "app", opts);
   }
 
   if (!session.stagingDir) throw new Error("Session has no staging directory");
   const st = await stat(session.stagingDir).catch(() => null);
   if (!st?.isDirectory()) throw new Error("Uploaded source not found");
   const { resolveFromLocal } = await import("../../deployments/local-source");
-  return resolveFromLocal(session.stagingDir);
+  return resolveFromLocal(session.stagingDir, opts);
 }

@@ -46,6 +46,7 @@ import { isPublicRepo } from "./github.http";
 import { getLocalGhToken, hasLocalGitIdentity } from "./github.local-auth";
 import { resolveServerGitCredential } from "./server-github.service";
 import type { RequestContext } from "../../lib/request-context";
+import { resolveGitHubApiBaseUrl } from "./github-source.service";
 
 /**
  * Result of build-token resolution:
@@ -103,9 +104,21 @@ async function resolveLocalCredential(
   ctx: RequestContext,
   tokenCtx: TokenContext,
 ): Promise<{ token?: string }> {
-  const ghToken = await getLocalGhToken();
-  if (ghToken) return { token: ghToken };
-  const r = await tokenFor(ctx, "local", tokenCtx);
+  const customSource = tokenCtx.owner
+    ? await resolveGitHubApiBaseUrl(
+        ctx.organizationId,
+        tokenCtx.owner,
+        tokenCtx.installationId,
+      ).catch(() => null)
+    : null;
+  if (!customSource) {
+    const ghToken = await getLocalGhToken();
+    if (ghToken) return { token: ghToken };
+  }
+  const r = await tokenFor(ctx, "local", {
+    ...tokenCtx,
+    ...(customSource ? { only: ["app-installation"] } : {}),
+  });
   return r?.token ? { token: r.token } : {};
 }
 
@@ -118,6 +131,8 @@ export async function resolveBuildGitToken(opts: {
   /** Repo name — threaded to the github-access gate for PER-REPO
    *  authorization (so a member granted only repo X can build X). */
   repo?: string | null;
+  /** Server-resolved project snapshot; validated against org+owner before use. */
+  installationId?: number | null;
   buildStrategy: BuildStrategy;
   /**
    * Target server id (server deploys). When set, a per-server GitHub auth
@@ -159,6 +174,7 @@ export async function resolveBuildGitToken(opts: {
     projectId: opts.projectId,
     owner: opts.owner ?? undefined,
     repo: opts.repo ?? undefined,
+    installationId: opts.installationId ?? undefined,
   };
 
   if (opts.buildStrategy === "local") {

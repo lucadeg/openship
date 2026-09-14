@@ -358,6 +358,14 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                     dp.stopDeployment
                   )}
                 </button>
+              ) : state.cancellationPending ? (
+                <button
+                  disabled
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl transition-all font-medium text-sm bg-muted text-muted-foreground cursor-not-allowed"
+                >
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  {dp.stopping}
+                </button>
               ) : (deploymentStatus === "failed" || deploymentStatus === "cancelled") ? (
                 <div className="space-y-2">
                   <button

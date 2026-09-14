@@ -20,6 +20,7 @@ export const APP_LOGO: Record<
   microsoftteams: { src: "https://www.google.com/s2/favicons?domain=teams.microsoft.com&sz=128" },
   // Supabase's official mark, rendered in its brand green by the simpleicons CDN.
   supabase: { slug: "supabase" },
+  pocketbase: { slug: "pocketbase" },
   mongodb: { slug: "mongodb" },
   n8n: { slug: "n8n" },
   // Ghost's brand mark is near-black — invert it on the dark themes so it
@@ -83,6 +84,9 @@ export const APP_LOGO: Record<
   // The control plane self-registered as an app (CLI self-deploy) — Openship's
   // own brand mark, a full-bleed square icon.
   openship: { src: "/apple-touch-icon.png", fill: true },
+  // MindWire's own monochrome mark is vendored so the catalog works offline and
+  // the brand stays legible on both dashboard themes.
+  mindwire: { src: "/app-logos/mindwire.svg", fill: true },
 };
 
 /**

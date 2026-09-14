@@ -4,6 +4,70 @@
     "save": "حفظ",
     "cancel": "إلغاء"
   },
+  "releaseImageSource": {
+    "validationInvalid": "مصدر صورة الإصدار غير صالح.",
+    "toast": {
+      "saved": "تم حفظ مصدر إصدار الحاوية.",
+      "saveFailed": "تعذّر حفظ مصدر إصدار الحاوية."
+    },
+    "status": {
+      "notDeployed": "لم يُنشر بعد",
+      "checking": "جارٍ التحقق…",
+      "unavailable": "غير متاح"
+    },
+    "switchToImage": {
+      "title": "التبديل إلى مصدر صورة جاهزة",
+      "description": "يستبدل الحفظ مصدر Git أو المصدر المحلي الحالي في كل البيئات. تبقى عمليات النشر الحالية وسجل التراجع متاحين.",
+      "keep": "الاحتفاظ بالمصدر الحالي"
+    },
+    "switchToGit": {
+      "title": "التبديل إلى مصدر Git",
+      "description": "لن يتغير شيء حتى تربط مستودعًا. يستبدل الربط مصدر الصورة المتتبع في كل البيئات.",
+      "back": "العودة إلى مصدر الصورة"
+    },
+    "entry": {
+      "shortButton": "استخدام صورة جاهزة",
+      "button": "تتبع صورة حاوية جاهزة",
+      "description": "انشر صورة ذات إصدار من السجل مباشرةً، بدون نسخ مستودع أو بنائه."
+    },
+    "summary": {
+      "title": "صورة حاوية متتبعة",
+      "badge": "جاهزة",
+      "description": "ينشر صورة منشورة مباشرةً. لا يُنسخ أي مستودع ولا يُشغّل أي أمر بناء.",
+      "linkGit": "ربط مستودع Git",
+      "image": "الصورة",
+      "versionSource": "مصدر الإصدار",
+      "githubReleases": "إصدارات GitHub",
+      "pinnedVersion": "إصدار مثبّت",
+      "currentVersion": "الإصدار الحالي",
+      "targetVersion": "الإصدار المستهدف",
+      "latestVersion": "أحدث إصدار",
+      "updateAvailable": "يتوفر تحديث"
+    },
+    "editor": {
+      "trackingTitle": "تتبع الإصدارات",
+      "configureTitle": "إعداد صورة جاهزة",
+      "templateHint": "استخدم {tag} للاحتفاظ بوسم الناشر الدقيق، أو {version} للإصدار الموحّد.",
+      "provider": "مزوّد الإصدار",
+      "githubTitle": "إصدارات GitHub",
+      "githubDescription": "تابع أحدث وسم إصدار منشور.",
+      "urlTitle": "رابط الإصدار أو تثبيته",
+      "urlDescription": "اقرأ نقطة نهاية للإصدار أو انشر إصدارًا ثابتًا.",
+      "imageTemplate": "قالب الصورة",
+      "imagePlaceholder": "ghcr.io/acme/api:{tag}",
+      "githubRepository": "مستودع GitHub",
+      "repoPlaceholder": "owner/repository",
+      "versionUrl": "رابط الإصدار",
+      "versionUrlPlaceholder": "https://example.com/latest-version",
+      "versionUrlHint": "نقطة نهاية HTTPS تُعيد نصًا أو JSON يحتوي على version/tag_name.",
+      "pinnedVersion": "إصدار مثبّت",
+      "pinnedPlaceholder": "اختياري، مثل v2.4.1",
+      "pinnedHint": "يتجاوز أحدث إصدار مكتشف؛ اتركه فارغًا لتتبّع التحديثات.",
+      "appliesAll": "تسري التغييرات على كل بيئات هذا المشروع.",
+      "saving": "جارٍ الحفظ…",
+      "save": "حفظ المصدر"
+    }
+  },
   "appSettings": {
     "modeApp": "إعدادات التطبيق",
     "modeDeployment": "النشر",
@@ -108,12 +172,15 @@
       "runningStatus": "قيد التنفيذ — {status}"
     },
     "cache": {
-      "title": "ذاكرة التخزين المؤقت",
-      "description": "امسح مخرجات البناء والتبعيات المخزّنة مؤقتًا",
+      "title": "ذاكرة بناء Docker",
+      "description": "يتم تقييد ذاكرة البناء غير المستخدمة تلقائيًا إلى 5 غيغابايت لكل خادم",
       "clearInstall": "مسح ذاكرة التثبيت",
       "clearInstallDesc": "إزالة node_modules المخزّنة مؤقتًا",
       "clearBuild": "مسح ذاكرة البناء",
-      "clearBuildDesc": "إزالة مخرجات البناء المخزّنة مؤقتًا"
+      "clearBuildDesc": "إزالة الذاكرة غير المستخدمة من خادم Docker الخاص بهذا المشروع",
+      "clearBuildConfirm": "هل تريد مسح كل ذاكرة بناء Docker غير المستخدمة على هذا الخادم؟ قد تعيد المشاريع الأخرى بناء التبعيات عند النشر التالي.",
+      "clearBuildSuccess": "تم استرداد {size} من ذاكرة البناء",
+      "clearBuildEmpty": "لا توجد ذاكرة بناء غير مستخدمة لمسحها"
     },
     "transfer": {
       "title": "النقل والاستنساخ",
@@ -344,28 +411,7 @@
     "unlink": "إزالة الاتصال"
   },
   "gitInfo": {
-    "repository": "المستودع",
-    "autoDeploy": "النشر التلقائي",
-    "deploysOnPush": "ينشر عند كل دفع",
-    "manualOnly": "النشر اليدوي فقط",
-    "branchToDeploy": "الفرع المراد نشره",
-    "chooseBranch": "اختر الفرع الذي تريد النشر منه من مستودعك",
-    "save": "حفظ",
-    "cancel": "إلغاء",
-    "viewOnGithub": "عرض على GitHub",
-    "recentCommits": "الالتزامات الأخيرة",
-    "totalCommits": "{count} إجمالًا",
-    "noCommits": "لا توجد التزامات بعد",
-    "toast": {
-      "fetchBranchesFailed": "تعذّر جلب الفروع",
-      "errorTitle": "خطأ",
-      "branchUpdated": "تم تحديث الفرع بنجاح",
-      "updatedTitle": "تم التحديث",
-      "branchUpdateFailed": "تعذّر تحديث الفرع",
-      "autoDeployEnabled": "تم تفعيل النشر التلقائي",
-      "autoDeployDisabled": "تم تعطيل النشر التلقائي",
-      "autoDeployFailed": "تعذّر تحديث النشر التلقائي"
-    }
+    "autoDeploy": "النشر التلقائي"
   },
   "git": {
     "connectFirst": {
@@ -515,6 +561,9 @@
     "title": "قوة الجهاز",
     "description": "حدود المعالج والذاكرة لحاويات هذا المشروع.",
     "loading": "جارٍ قراءة الجهاز الهدف…",
+    "unavailable": "قوة الجهاز غير متاحة",
+    "loadFailed": "تعذّر تحميل إعدادات قوة الجهاز",
+    "retry": "إعادة المحاولة",
     "machineCapacity": "الجهاز: {cpu} vCPU · {memory}",
     "exceedsMachine": "يتجاوز سعة هذا الجهاز",
     "appliesOnNextDeploy": "تُطبَّق الحدود عند إعادة إنشاء الحاوية — أعد النشر ليصبح التغيير ساريًا.",
@@ -597,10 +646,6 @@
     "cannotUndo": "لا يمكن التراجع عن هذا الإجراء.",
     "aboutToPrefix": "أنت على وشك حذف ",
     "aboutToSuffix": ".",
-    "deleteAllAria": "حذف جميع البيئات",
-    "deleteAll": "حذف جميع البيئات",
-    "deleteAllOn": "يزيل تطبيق المشروع وكل بيئة فرعية تحته.",
-    "deleteAllOff": "يزيل هذه البيئة فقط. تبقى الفروع الأخرى.",
     "scanning": "جارٍ فحص الخدمات ووحدات التخزين المرفقة…",
     "wipeAria": "مسح بيانات الخدمة أيضًا",
     "wipeLabelOne": "مسح بيانات الخدمة أيضًا (وحدة تخزين واحدة، {count})",
@@ -615,9 +660,7 @@
     "typePrefix": "اكتب ",
     "typeSuffix": " للتأكيد.",
     "cancel": "إلغاء",
-    "confirmDeleteWipe": "حذف + مسح البيانات",
     "confirmDeleteEnvWipe": "حذف البيئة + مسح البيانات",
-    "confirmDelete": "حذف المشروع",
     "confirmDeleteEnv": "حذف البيئة",
     "linkedTitleOne": "مشروع واحد مرتبط بهذا التطبيق",
     "linkedTitleOther": "{count} مشاريع مرتبطة بهذا التطبيق",
@@ -694,6 +737,9 @@
       "defaultAppName": "my-app",
       "mapsToPort": "يُوجَّه إلى المنفذ",
       "includeWww": "تضمين www",
+      "dnsChallenge": "استخدام تحدي DNS-01",
+      "dnsChallengeDesc": "إصدار الشهادة وتجديدها عبر مزود DNS المتصل. استخدمه عندما يتعذر الوصول إلى المنفذ 80.",
+      "dnsChallengeWildcardDesc": "تتطلب شهادات النطاق الشامل DNS-01 ومزود DNS متصلًا.",
       "includeWwwDesc": "أنشئ أيضًا سجلات لـ www.{domain}",
       "includeWwwFallback": "yourdomain.com",
       "adding": "جارٍ الإضافة...",
@@ -809,6 +855,11 @@
     "records": {
       "failed": "تعذّر تحميل سجلات DNS لهذا النطاق.",
       "retry": "إعادة المحاولة"
+    },
+    "outputHint": {
+      "body": "لم يتم العثور على مخرجات بناء في {path} — تحقق من دليل المخرجات وأعد النشر.",
+      "noIndex": "توجد مخرجات في {path} لكن لا يوجد ملف index — ستُرجع الطلبات الخطأ 404. تحقق من دليل المخرجات.",
+      "notServed": "أجابت الحافة بالرمز HTTP {status} للمسار {path} — هذا المسار لا يقدّم أي محتوى. تحقق من دليل المخرجات ومن التوجيه."
     }
   }
 }

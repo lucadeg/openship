@@ -81,10 +81,10 @@ describe("POST /projects/:id/services/sync body schema", () => {
     // command is a lossy join: `["sh","-c","a && b"]` → "sh -c a && b" → 5 words.
     // An MCP agent reads this schema to know what it may send.
     const entry = (
-      (SyncServicesBody as unknown as {
+      SyncServicesBody as unknown as {
         properties: { services: { items: { properties: Record<string, unknown> } } };
-      }).properties.services.items.properties
-    );
+      }
+    ).properties.services.items.properties;
     expect(entry.commandArgv).toBeDefined();
 
     expect(
@@ -97,12 +97,26 @@ describe("POST /projects/:id/services/sync body schema", () => {
       true,
     );
     // argv entries are strings, like every other compose scalar here.
-    expect(Value.Check(SyncServicesBody, { services: [{ name: "web", commandArgv: [8080] }] })).toBe(
-      false,
-    );
+    expect(
+      Value.Check(SyncServicesBody, { services: [{ name: "web", commandArgv: [8080] }] }),
+    ).toBe(false);
     expect(
       Value.Check(SyncServicesBody, { services: [{ name: "web", commandArgv: "node server.js" }] }),
     ).toBe(false);
+  });
+
+  it("accepts explicit Compose environment template provenance (#751)", () => {
+    expect(
+      Value.Check(SyncServicesBody, {
+        services: [
+          {
+            name: "web",
+            environment: { APP_URL: "https://${APP_HOST}" },
+            environmentTemplates: { APP_URL: "https://${APP_HOST}" },
+          },
+        ],
+      }),
+    ).toBe(true);
   });
 
   it("accepts compose restart policies outside the four-value enum", () => {

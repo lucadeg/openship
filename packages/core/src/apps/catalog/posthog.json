@@ -1,6 +1,7 @@
 {
   "available": true,
   "verified": false,
+  "minEngine": "0.6.6",
   "minResources": {
     "memoryMb": 16384,
     "cpuCores": 4

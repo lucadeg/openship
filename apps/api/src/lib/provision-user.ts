@@ -29,10 +29,12 @@
  * single row at each table — no double-membership, no orphan org.
  */
 
-import { db, schema } from "@repo/db";
+import { db, schema, type Database } from "@repo/db";
 import { generateId } from "@repo/core";
 
-const { user, organization, member } = schema;
+const { user, organization, member, account } = schema;
+
+export type ProvisionTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 export interface ProvisionUserInput {
   id: string;
@@ -44,13 +46,18 @@ export interface ProvisionUserInput {
   image?: string | null;
 }
 
-/**
- * Ensure the user row + personal org + owner membership all exist.
- * Returns the personal org id (deterministic: `org_${userId}`).
- *
- * Call from any code path that creates or first-touches a user identity.
- */
-export async function provisionUser(input: ProvisionUserInput): Promise<string> {
+export interface ProvisionCredentialInput {
+  /** Better Auth's credential password hash, never the plaintext password. */
+  passwordHash: string;
+  /** Optional deterministic id for migrations/tests; generated in normal use. */
+  accountId?: string;
+}
+
+/** Insert the identity invariant using an existing transaction. */
+async function provisionUserRows(
+  tx: ProvisionTransaction,
+  input: ProvisionUserInput,
+): Promise<string> {
   const personalOrgId = `org_${input.id}`;
   const displayName = input.name?.trim() || input.email.split("@")[0];
   const slugSeed = input.email
@@ -60,39 +67,87 @@ export async function provisionUser(input: ProvisionUserInput): Promise<string> 
     .replace(/^-+|-+$/g, "");
   const slug = `ws-${slugSeed}-${input.id.slice(0, 8)}`;
 
-  await db.transaction(async (tx) => {
-    await tx
-      .insert(user)
-      .values({
-        id: input.id,
-        name: displayName,
-        email: input.email,
-        emailVerified: input.emailVerified ?? false,
-        role: input.role ?? "user",
-        autoProvisioned: input.autoProvisioned ?? false,
-        image: input.image ?? null,
-      })
-      .onConflictDoNothing({ target: user.id });
+  await tx
+    .insert(user)
+    .values({
+      id: input.id,
+      name: displayName,
+      email: input.email,
+      emailVerified: input.emailVerified ?? false,
+      role: input.role ?? "user",
+      autoProvisioned: input.autoProvisioned ?? false,
+      image: input.image ?? null,
+    })
+    .onConflictDoNothing({ target: user.id });
 
-    await tx
-      .insert(organization)
-      .values({
-        id: personalOrgId,
-        name: `${displayName}'s workspace`,
-        slug,
-      })
-      .onConflictDoNothing({ target: organization.id });
+  await tx
+    .insert(organization)
+    .values({
+      id: personalOrgId,
+      name: `${displayName}'s workspace`,
+      slug,
+    })
+    .onConflictDoNothing({ target: organization.id });
 
-    await tx
-      .insert(member)
-      .values({
-        id: generateId("mem"),
-        organizationId: personalOrgId,
-        userId: input.id,
-        role: "owner",
-      })
-      .onConflictDoNothing();
+  await tx
+    .insert(member)
+    .values({
+      id: generateId("mem"),
+      organizationId: personalOrgId,
+      userId: input.id,
+      role: "owner",
+    })
+    .onConflictDoNothing();
+
+  return personalOrgId;
+}
+
+/**
+ * Ensure the user row + personal org + owner membership all exist.
+ * Returns the personal org id (deterministic: `org_${userId}`).
+ *
+ * Call from any code path that creates or first-touches a user identity.
+ */
+export async function provisionUser(input: ProvisionUserInput): Promise<string> {
+  return db.transaction((rawTx) => provisionUserRows(rawTx as ProvisionTransaction, input));
+}
+
+/**
+ * Create an invited password user as one database commit.
+ *
+ * This is intentionally separate from Better Auth's public signup handler: a
+ * self-hosted invitation is the authorization, and public signup is disabled.
+ * The user, personal workspace, owner membership, and credential either all
+ * commit or all roll back. A process/database failure can no longer leave an
+ * accountless user that permanently turns a retry into a 409.
+ */
+export async function provisionUserWithCredential(
+  input: ProvisionUserInput,
+  credential: ProvisionCredentialInput,
+): Promise<string> {
+  return db.transaction(async (rawTx) => {
+    return provisionUserWithCredentialInTransaction(
+      rawTx as ProvisionTransaction,
+      input,
+      credential,
+    );
   });
+}
 
+/** Transaction-aware variant used when another authorization row must be
+ * locked and validated in the same commit as the new identity. */
+export async function provisionUserWithCredentialInTransaction(
+  tx: ProvisionTransaction,
+  input: ProvisionUserInput,
+  credential: ProvisionCredentialInput,
+): Promise<string> {
+  const personalOrgId = await provisionUserRows(tx, input);
+  await tx.insert(account).values({
+    id: credential.accountId ?? generateId("acc"),
+    accountId: input.id,
+    providerId: "credential",
+    userId: input.id,
+    password: credential.passwordHash,
+  });
   return personalOrgId;
 }

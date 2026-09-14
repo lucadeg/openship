@@ -22,12 +22,12 @@ import UpdatesBlock from "@/components/overview/UpdatesBlock";
 import SystemStatusRow from "@/components/overview/SystemStatusRow";
 import HomeWelcome from "@/components/overview/HomeWelcome";
 import { useI18n, interpolate } from "@/components/i18n-provider";
-import { getProjectStatus, PROJECT_STATUS_META, projectStatusLabel } from "@/utils/project-status";
 import type { Dictionary } from "@/i18n";
 import { PageContainer } from "@/components/ui/PageContainer";
 import ProjectCard from "./projects/components/ProjectCard";
 import { type Project } from "@/constants/mock";
 import { AppLogo } from "@/components/AppLogo";
+import { ProjectStatusBadge } from "@/components/shared/ProjectStatusBadge";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -361,31 +361,30 @@ export default function DashboardHomeClient({ initialData }: DashboardHomeClient
                   </div>
                 ) : (
                   <div className="overflow-hidden rounded-xl border border-border/50 bg-muted/10">
-                    {appProjects.slice(0, 3).map((p, i) => {
-                      const status = getProjectStatus(p);
-                      const statusMeta = PROJECT_STATUS_META[status];
-                      return (
+                    {appProjects.slice(0, 3).map((p, i) => (
+                      <div
+                        key={p.id}
+                        className={`group relative flex w-full items-center gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted/40 ${
+                          i > 0 ? "border-t border-border/50" : ""
+                        }`}
+                      >
                         <Link
-                          key={p.id}
                           href={`/projects/${p.id}`}
-                          className={`group flex w-full items-center gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted/40 ${
-                            i > 0 ? "border-t border-border/50" : ""
-                          }`}
-                        >
-                          <div className="flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border/50 bg-background">
-                            <AppLogo appId={p.appTemplateId ?? undefined} className="size-5" />
-                          </div>
-                          <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground transition-colors group-hover:text-primary">
-                            {p.name}
-                          </span>
-                          <span
-                            className={`shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-medium ${statusMeta.badge}`}
-                          >
-                            {projectStatusLabel(status, t)}
-                          </span>
-                        </Link>
-                      );
-                    })}
+                          aria-label={p.name}
+                          className="absolute inset-0 z-0"
+                        />
+                        <div className="flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border/50 bg-background">
+                          <AppLogo appId={p.appTemplateId ?? undefined} className="size-5" />
+                        </div>
+                        <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground transition-colors group-hover:text-primary">
+                          {p.name}
+                        </span>
+                        <ProjectStatusBadge
+                          project={p}
+                          className="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-medium"
+                        />
+                      </div>
+                    ))}
                     {appProjects.length > 3 && (
                       <Link
                         href="/apps"

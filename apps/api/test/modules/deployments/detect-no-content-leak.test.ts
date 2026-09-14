@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { projectInfoToScanResponse } from "../../../src/modules/deployments/prepare.service";
+import {
+  projectInfoToPublicResponse,
+  projectInfoToScanResponse,
+} from "../../../src/modules/deployments/prepare.service";
 
 /**
  * `/github/repos/:owner/:repo/detect` sits at METADATA tier — it is what makes
@@ -20,6 +23,7 @@ import { projectInfoToScanResponse } from "../../../src/modules/deployments/prep
 
 const SENTINELS = {
   rootEnv: "ROOT_ENV_SECRET_a1b2c3",
+  openshipEnv: "OPENSHIP_ENV_SECRET_j1k2l3",
   serviceEnv: "SERVICE_ENV_SECRET_d4e5f6",
   secondService: "SECOND_SERVICE_SECRET_g7h8i9",
 };
@@ -47,6 +51,17 @@ function infoWithSecrets() {
     productionPaths: ["dist"],
     port: 3000,
     rootEnv: { DATABASE_URL: SENTINELS.rootEnv, PUBLIC_NAME: "fine" },
+    openshipEnv: {
+      DATABASE_URL: SENTINELS.rootEnv,
+      DECLARED_TOKEN: { value: SENTINELS.openshipEnv, secret: true },
+    },
+    // #641: what the openship.json parse refused. These are field paths and enum
+    // lists, never file values — but the whole payload is scanned above, so a
+    // future change that started quoting the file back would fail here.
+    configDiagnostics: {
+      errors: ["framework: must be one of: nextjs, vite, static"],
+      warnings: ['Unknown field "buildComand" (ignored)'],
+    },
     services: [
       {
         name: "api",
@@ -80,11 +95,23 @@ describe("detect cannot leak file content through env values", () => {
     }
   });
 
+  it("uses the same no-plaintext projection for /deployments/prepare", () => {
+    const out = projectInfoToPublicResponse(infoWithSecrets());
+    const serialised = JSON.stringify(out);
+
+    expect(out).not.toHaveProperty("openshipEnv");
+    expect(out.openshipEnvKeys).toEqual(["DATABASE_URL", "DECLARED_TOKEN"]);
+    for (const secret of Object.values(SENTINELS)) {
+      expect(serialised).not.toContain(secret);
+    }
+  });
+
   it("masks EVERY service, not just the first", () => {
     // A mapper that masked services[0] and passed the rest through would satisfy a
     // single-service fixture. Two services with distinct secrets catches it.
     const out = projectInfoToScanResponse(infoWithSecrets());
-    const services = (out as { services?: Array<{ environment?: Record<string, string> }> }).services;
+    const services = (out as { services?: Array<{ environment?: Record<string, string> }> })
+      .services;
     expect(services).toHaveLength(2);
     for (const svc of services ?? []) {
       for (const value of Object.values(svc.environment ?? {})) {
@@ -106,6 +133,16 @@ describe("detect cannot leak file content through env values", () => {
     // Service NAMES and images are config, not content — the wizard needs them.
     const services = out.services as Array<{ name: string; image?: string }>;
     expect(services.map((s) => s.name)).toEqual(["api", "db"]);
+  });
+
+  it("echoes configDiagnostics so a refused openship.json field is visible (#641)", () => {
+    // The counterpart of the scan above: this field has to survive masking, or
+    // #641 is not fixed — a silently-ignored config stays silently ignored.
+    const out = projectInfoToScanResponse(infoWithSecrets()) as {
+      configDiagnostics?: { errors: string[]; warnings: string[] };
+    };
+    expect(out.configDiagnostics?.errors[0]).toContain("framework:");
+    expect(out.configDiagnostics?.warnings[0]).toContain("buildComand");
   });
 
   it("keeps env KEYS while dropping their values", () => {

@@ -20,8 +20,13 @@ vi.mock("../../../lib/ssh-manager", () => ({
   sshManager: { withHostExecutor: h.withHostExecutor },
 }));
 
-const { APP_CONFIG_HOST_ROOT, appConfigHostPath, withAppConfigHost, writeAppConfigFile } =
-  await import("./app-config-host");
+const {
+  APP_CONFIG_HOST_ROOT,
+  appConfigHostPath,
+  appConfigHostServiceRoot,
+  withAppConfigHost,
+  writeAppConfigFile,
+} = await import("./app-config-host");
 
 const LOCAL = { tag: "local-executor" } as unknown as CommandExecutor;
 const REMOTE = { tag: "remote-ssh" } as unknown as CommandExecutor;
@@ -67,9 +72,9 @@ describe("withAppConfigHost", () => {
 
   it("runs nothing on cloud, which mounts no host paths", async () => {
     const fn = vi.fn();
-    expect(await withAppConfigHost({ executor: LOCAL, localHost: true, isCloud: true }, fn)).toEqual(
-      { ran: false },
-    );
+    expect(
+      await withAppConfigHost({ executor: LOCAL, localHost: true, isCloud: true }, fn),
+    ).toEqual({ ran: false });
     expect(fn).not.toHaveBeenCalled();
   });
 
@@ -93,36 +98,106 @@ describe("appConfigHostPath", () => {
     expect(appConfigHostPath("proj1", "a/b c", "/x.yml")).toBe(
       `${APP_CONFIG_HOST_ROOT}/proj1/a_b_c/x.yml`,
     );
+    expect(appConfigHostPath("proj1", "..", "/x.yml")).toBe(
+      `${APP_CONFIG_HOST_ROOT}/proj1/_/x.yml`,
+    );
+  });
+
+  it("sanitizes both ownership segments for the private service root", () => {
+    expect(appConfigHostServiceRoot("../project", "..")).toBe(
+      `${APP_CONFIG_HOST_ROOT}/.._project/_`,
+    );
   });
 
   it("refuses a traversal in the template-supplied container path", () => {
     // Template-authored and written on the HOST — escaping the root would write
     // anywhere root can.
-    expect(() => appConfigHostPath("proj1", "kong", "/../../etc/cron.d/x")).toThrow(/traversal/);
+    expect(() => appConfigHostPath("proj1", "kong", "/../../etc/cron.d/x")).toThrow(
+      /generated-config-path-invalid/,
+    );
+  });
+
+  it.each(["relative.yml", "/etc/app.yml:rw", "/etc/app.yml\nnext", "/"])(
+    "refuses unsafe bind target %j",
+    (path) => {
+      expect(() => appConfigHostPath("proj1", "kong", path)).toThrow(
+        /generated-config-path-invalid/,
+      );
+    },
+  );
+
+  it("refuses non-normalized targets before deriving a host path", () => {
+    expect(() => appConfigHostPath("proj1", "kong", "/etc//kong.yml")).toThrow(
+      /generated-config-path-invalid/,
+    );
   });
 });
 
 describe("writeAppConfigFile", () => {
   it("names the requirement, the file and the underlying error on failure", async () => {
     const writer = {
+      exec: async () => "",
+      mkdir: async () => undefined,
+      rename: async () => undefined,
+      rm: async () => undefined,
       writeFile: async () => {
         throw new Error("Timed out while waiting for handshake");
       },
     } as unknown as CommandExecutor;
 
     await expect(
-      writeAppConfigFile(writer, "/var/lib/openship/app-config/p/kong/kong.yml", "x", "kong", "/kong.yml"),
+      writeAppConfigFile(
+        writer,
+        "/var/lib/openship/app-config/p/kong/kong.yml",
+        "x",
+        "kong",
+        "/kong.yml",
+      ),
     ).rejects.toThrow(
       /Service "kong".*\/kong\.yml.*HOST path.*Timed out while waiting for handshake/s,
     );
   });
 
-  it("passes the content straight through on success", async () => {
-    const calls: Array<[string, string]> = [];
+  it("atomically replaces the target and protects its host directory", async () => {
+    const writes: Array<[string, string, { mode?: number } | undefined]> = [];
+    const renames: Array<[string, string]> = [];
+    const removals: string[] = [];
+    const mkdir = vi.fn(async () => undefined);
+    const exec = vi.fn(async () => "");
     const writer = {
-      writeFile: async (p: string, c: string) => void calls.push([p, c]),
+      exec,
+      mkdir,
+      writeFile: async (p: string, c: string, opts?: { mode?: number }) =>
+        void writes.push([p, c, opts]),
+      rename: async (from: string, to: string) => void renames.push([from, to]),
+      rm: async (path: string) => void removals.push(path),
     } as unknown as CommandExecutor;
-    await writeAppConfigFile(writer, "/host/kong.yml", "_format_version: '3.0'", "kong", "/kong.yml");
-    expect(calls).toEqual([["/host/kong.yml", "_format_version: '3.0'"]]);
+    await writeAppConfigFile(
+      writer,
+      "/host/kong.yml",
+      "_format_version: '3.0'",
+      "kong",
+      "/kong.yml",
+    );
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.[0]).toMatch(/^\/host\/kong\.yml\.openship-[\w-]+\.tmp$/);
+    expect(writes[0]?.slice(1)).toEqual(["_format_version: '3.0'", { mode: 0o644 }]);
+    expect(mkdir).toHaveBeenCalledWith("/host");
+    expect(exec).toHaveBeenCalledWith("chmod 0700 -- '/host'");
+    expect(renames).toEqual([[writes[0]![0], "/host/kong.yml"]]);
+    expect(removals).toEqual([writes[0]![0]]);
+  });
+
+  it("fails closed when the target file channel cannot rename atomically", async () => {
+    const writeFile = vi.fn(async () => undefined);
+    const rm = vi.fn(async () => undefined);
+    const writer = { writeFile, rm } as unknown as CommandExecutor;
+
+    await expect(
+      writeAppConfigFile(writer, "/host/kong.yml", "secret", "kong", "/kong.yml"),
+    ).rejects.toThrow(/does not support atomic rename/);
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(rm).toHaveBeenCalledOnce();
   });
 });

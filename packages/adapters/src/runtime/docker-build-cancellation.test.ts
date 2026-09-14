@@ -18,8 +18,13 @@ vi.mock("./docker-build-context", async (importOriginal) => {
     ...actual,
     createDockerBuildContext: vi.fn(async () => ({
       contextDir: fakeBuildContext.current!.contextDir,
+      // Root context: the build context IS the tree, so both paths coincide and
+      // there is no per-context `.dockerignore` filter to apply.
+      buildContextDir: fakeBuildContext.current!.contextDir,
+      contextSubdir: "",
       contextEntries: ["Dockerfile"],
       dockerfileName: "Dockerfile",
+      rootDirectory: "",
       usesRepositoryDockerfile: true,
       cleanup: fakeBuildContext.current!.cleanup,
     })),
@@ -66,7 +71,10 @@ describe("DockerRuntime build cancellation", () => {
         listContainers: vi.fn(async () => []),
       },
       cloneSourceOnRemote,
-      resolveRemoteDockerfile: vi.fn(async () => "Dockerfile"),
+      resolveRemoteDockerfile: vi.fn(async (_config: BuildConfig, remoteContextDir: string) => ({
+        remoteBuildDir: remoteContextDir,
+        dockerfileName: "Dockerfile",
+      })),
       verifyImageBuilt,
       ...extra,
     });
@@ -344,17 +352,29 @@ describe("DockerRuntime build cancellation — dockerode path", () => {
     fakeBuildContext.current = { contextDir, cleanup: async () => {} };
 
     const verifyImageBuilt = vi.fn(async () => {});
-    const runtime = Object.create(DockerRuntime.prototype) as DockerRuntime &
-      Record<string, unknown>;
+    const buildImage = vi.fn(
+      async (body: { resume?: () => void }, _options: { extrahosts?: string }) => {
+        body.resume?.();
+        return {};
+      },
+    );
+    let runtime!: DockerRuntime & Record<string, unknown>;
+    const streamDockerodeBuild = vi.fn(
+      async (
+        _stream: unknown,
+        _logger: unknown,
+        _options: { legacyBuilder?: { ownershipHost?: string } },
+      ) => {
+        await (runtime as DockerRuntime).cancelBuild("session-late-abort");
+      },
+    );
+    runtime = Object.create(DockerRuntime.prototype) as DockerRuntime & Record<string, unknown>;
     Object.assign(runtime, {
       connectionOptions: {},
       transport: { kind: "socket", description: "local socket" },
       systemManager: null,
       _docker: {
-        buildImage: vi.fn(async (body: { resume?: () => void }) => {
-          body.resume?.();
-          return {};
-        }),
+        buildImage,
         listContainers: vi.fn(async () => []),
       },
       estimateContextSize: vi.fn(async () => 0),
@@ -363,9 +383,7 @@ describe("DockerRuntime build cancellation — dockerode path", () => {
       // cleanly, and the cancel lands during that drain. So the ONLY thing that can
       // stop a usable image from being reported "deploying" is build()'s last gate —
       // the branch that keeps a cancelled deployment from being deployed.
-      streamDockerodeBuild: vi.fn(async () => {
-        await (runtime as DockerRuntime).cancelBuild("session-late-abort");
-      }),
+      streamDockerodeBuild,
     });
 
     const config = { ...buildConfig("session-late-abort"), cloneOnServer: false };
@@ -375,6 +393,11 @@ describe("DockerRuntime build cancellation — dockerode path", () => {
       status: "cancelled",
     });
     expect(verifyImageBuilt).not.toHaveBeenCalled();
+    const ownershipEntry = buildImage.mock.calls[0]?.[1].extrahosts;
+    expect(ownershipEntry).toMatch(/^openship-build-[0-9a-f-]+\.invalid:127\.0\.0\.1$/);
+    expect(streamDockerodeBuild.mock.calls[0]?.[2]).toMatchObject({
+      legacyBuilder: { ownershipHost: ownershipEntry?.split(":")[0] },
+    });
   });
 });
 
@@ -404,6 +427,23 @@ describe("packBuildContext", () => {
     await writeFile(join(contextDir, "Dockerfile"), "FROM scratch\n");
 
     const packed = packBuildContext(contextDir, ["Dockerfile"], AbortSignal.abort());
+    expect(packed.abortSignal.aborted).toBe(true);
+    packed.body.resume();
+  });
+
+  it("hands cancellation ownership to the progress-stream phase after upload", async () => {
+    contextDir = await mkdtemp(join(tmpdir(), "openship-pack-"));
+    await writeFile(join(contextDir, "Dockerfile"), "FROM scratch\n");
+
+    const cancel = new AbortController();
+    const packed = packBuildContext(contextDir, ["Dockerfile"], cancel.signal);
+    packed.detachCancellation();
+    cancel.abort();
+
+    // streamDockerodeBuild now owns this phase and uses its short id-capture
+    // grace before invoking packed.abort itself.
+    expect(packed.abortSignal.aborted).toBe(false);
+    packed.abort();
     expect(packed.abortSignal.aborted).toBe(true);
     packed.body.resume();
   });

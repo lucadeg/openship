@@ -40,10 +40,16 @@ export function mapRepositories(repos: GitHubRepository[]): MappedRepository[] {
 }
 
 export function mapAccounts(installations: GitHubInstallation[]): MappedAccount[] {
-  return installations.map((i) => ({
-    login: i.account.login,
-    id: i.account.id,
-    avatar_url: i.account.avatar_url,
-    type: i.account.type,
-  }));
+  const accounts = new Map<string, MappedAccount>();
+  for (const installation of installations) {
+    const key = installation.account.login.toLowerCase();
+    if (accounts.has(key)) continue;
+    accounts.set(key, {
+      login: installation.account.login,
+      id: installation.account.id,
+      avatar_url: installation.account.avatar_url,
+      type: installation.account.type,
+    });
+  }
+  return [...accounts.values()];
 }

@@ -176,6 +176,24 @@ export function MailboxesTab({
     });
   };
 
+  const openRotatePlatform = () => {
+    const id = showModal({
+      maxWidth: "520px",
+      showCloseButton: false,
+      customContent: (
+        <RotatePlatformMailboxConfirm
+          serverId={serverId}
+          email={`openship@${primaryDomain}`}
+          onCancel={() => hideModal(id)}
+          onRotated={() => {
+            hideModal(id);
+            void reloadMailboxes();
+          }}
+        />
+      ),
+    });
+  };
+
   const columns: DataTableColumn<AdminMailbox>[] = [
     {
       key: "user",
@@ -234,6 +252,9 @@ export function MailboxesTab({
           {r.username.startsWith("postmaster@") && (
             <StatusPill tone="info">{t.emailsAdmin.mailboxes.postmaster}</StatusPill>
           )}
+          {r.isPlatform && (
+            <StatusPill tone="info">{t.emailsAdmin.mailboxes.platform}</StatusPill>
+          )}
         </div>
       ),
     },
@@ -252,14 +273,25 @@ export function MailboxesTab({
             </p>
           </div>
         )}
-        <button
-          onClick={openCreate}
-          disabled={!activeDomain}
-          className="inline-flex items-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground text-sm font-medium rounded-xl hover:bg-primary/90 transition-all hover:shadow-lg hover:shadow-primary/25 disabled:opacity-50 disabled:hover:shadow-none shrink-0"
-        >
-          <Plus className="size-4" />
-          {t.emailsAdmin.mailboxes.addMailbox}
-        </button>
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          {activeDomain.toLowerCase() === primaryDomain.toLowerCase() && (
+            <button
+              onClick={openRotatePlatform}
+              className="inline-flex items-center gap-2 px-4 py-2.5 bg-muted text-foreground text-sm font-medium rounded-xl hover:bg-muted/80 border border-border transition-colors shrink-0"
+            >
+              <KeyRound className="size-4" />
+              {t.emailsAdmin.mailboxes.rotateAction}
+            </button>
+          )}
+          <button
+            onClick={openCreate}
+            disabled={!activeDomain}
+            className="inline-flex items-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground text-sm font-medium rounded-xl hover:bg-primary/90 transition-all hover:shadow-lg hover:shadow-primary/25 disabled:opacity-50 disabled:hover:shadow-none shrink-0"
+          >
+            <Plus className="size-4" />
+            {t.emailsAdmin.mailboxes.addMailbox}
+          </button>
+        </div>
       </div>
 
       <DomainPicker
@@ -291,27 +323,29 @@ export function MailboxesTab({
         rows={mailboxes}
         rowKey={(r) => r.username}
         loading={loadingMailboxes}
-        rowActions={(row) => (
-          <RowActionsMenu
-            label={interpolate(t.emailsAdmin.shared.rowActions, { name: row.username })}
-            actions={[
-              {
-                id: "edit",
-                label: t.emailsAdmin.mailboxes.editAction,
-                icon: <Pencil className="size-4" />,
-                onClick: () => openEdit(row),
-              },
-              { id: "sep", divider: true },
-              {
-                id: "delete",
-                label: t.emailsAdmin.mailboxes.deleteAction,
-                icon: <Trash2 className="size-4" />,
-                variant: "danger",
-                onClick: () => openDelete(row),
-              },
-            ]}
-          />
-        )}
+        rowActions={(row) =>
+          row.isPlatform ? null : (
+            <RowActionsMenu
+              label={interpolate(t.emailsAdmin.shared.rowActions, { name: row.username })}
+              actions={[
+                {
+                  id: "edit",
+                  label: t.emailsAdmin.mailboxes.editAction,
+                  icon: <Pencil className="size-4" />,
+                  onClick: () => openEdit(row),
+                },
+                { id: "sep", divider: true },
+                {
+                  id: "delete",
+                  label: t.emailsAdmin.mailboxes.deleteAction,
+                  icon: <Trash2 className="size-4" />,
+                  variant: "danger",
+                  onClick: () => openDelete(row),
+                },
+              ]}
+            />
+          )
+        }
         empty={{
           icon: UserRound,
           title: t.emailsAdmin.mailboxes.emptyTitle,
@@ -329,6 +363,44 @@ export function MailboxesTab({
         }}
       />
     </div>
+  );
+}
+
+function RotatePlatformMailboxConfirm({
+  serverId,
+  email,
+  onCancel,
+  onRotated,
+}: {
+  serverId: string;
+  email: string;
+  onCancel: () => void;
+  onRotated: () => void;
+}) {
+  const { t } = useI18n();
+
+  const submit = async () => {
+    try {
+      await mailAdminApi.mailboxes.rotatePlatform(serverId);
+    } catch (err) {
+      throw new Error(getApiErrorMessage(err, t.emailsAdmin.mailboxes.rotateFailed));
+    }
+    onRotated();
+  };
+
+  return (
+    <FormModalContent
+      title={t.emailsAdmin.mailboxes.rotateTitle}
+      description={interpolate(t.emailsAdmin.mailboxes.rotateDescription, { email })}
+      submitLabel={t.emailsAdmin.mailboxes.rotateSubmit}
+      submittingLabel={t.emailsAdmin.mailboxes.rotateSubmitting}
+      onSubmit={submit}
+      onCancel={onCancel}
+    >
+      <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+        {t.emailsAdmin.mailboxes.rotateNote}
+      </div>
+    </FormModalContent>
   );
 }
 

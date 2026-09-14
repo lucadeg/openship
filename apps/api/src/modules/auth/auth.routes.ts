@@ -16,6 +16,7 @@ import { db, eq, repos, schema } from "@repo/db";
 import { env } from "../../config/env";
 import { auth, isSaasDeployment } from "../../lib/auth";
 import { normalizeMcpRedirectUri } from "../../lib/oauth-redirect";
+import { invitationLifecycleMiddleware } from "../../lib/invitation-lifecycle-lock";
 import { internalAuth } from "../../middleware/internal-auth";
 import { isLoopbackRequest } from "../../middleware/loopback-peer";
 import * as ctrl from "./auth.controller";
@@ -30,6 +31,23 @@ if (env.DEPLOY_MODE === "desktop") {
   authRoutes.post("/desktop-auth-start", internalAuth, ctrl.desktopAuthStart);
   authRoutes.get("/desktop-auth-poll", ctrl.desktopAuthPoll);
   authRoutes.get("/desktop-claim", ctrl.desktopClaim);
+}
+
+// Public by design: the invitation id is an unguessable bearer token and this
+// route returns only its claim-page projection. Better Auth's own invitation
+// lookup requires a session, which a brand-new invitee cannot have yet.
+authRoutes.get("/invitation-preview/:id", ctrl.invitationPreview);
+
+// Better Auth's invitation lifecycle is a read + write + (for acceptance)
+// membership insert rather than one database transaction. Serialize every
+// terminal mutation by invitation id so accept cannot cross cancel/reject, and
+// use the same lock as token-bound account creation.
+for (const path of [
+  "/organization/accept-invitation",
+  "/organization/reject-invitation",
+  "/organization/cancel-invitation",
+]) {
+  authRoutes.on("POST", path, invitationLifecycleMiddleware);
 }
 
 // Invite-only sign-up guard (runs BEFORE the Better Auth catch-all). SaaS keeps
@@ -61,11 +79,10 @@ authRoutes.on("POST", "/sign-up/*", async (c, next) => {
 authRoutes.get("/mcp/jwks", async (c) => {
   const { getMcpSigningKey } = await import("../../lib/mcp-oidc-keys");
   const key = await getMcpSigningKey();
-  return c.json(
-    { keys: [key.publicJwk] },
-    200,
-    { "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" },
-  );
+  return c.json({ keys: [key.publicJwk] }, 200, {
+    "Cache-Control": "public, max-age=3600",
+    "Access-Control-Allow-Origin": "*",
+  });
 });
 
 authRoutes.get("/mcp/userinfo", async (c) => {

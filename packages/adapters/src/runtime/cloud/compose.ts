@@ -1,6 +1,11 @@
 import type { Oblien, WorkspaceHandle } from "oblien";
 
-import { DEFAULT_RESOURCE_CONFIG, cloudCpus, type LogCallback, type ResourceConfig } from "../../types";
+import {
+  DEFAULT_RESOURCE_CONFIG,
+  cloudCpus,
+  type LogCallback,
+  type ResourceConfig,
+} from "../../types";
 import type { WorkspaceRuntimePlan } from "../../dockerfile";
 import { sq, type BuildLogger } from "../build-pipeline";
 import { SYSTEM, safeErrorMessage } from "@repo/core";
@@ -94,13 +99,27 @@ export function resolveCloudWorkloadCmd(opts: {
   commandArgv?: string[] | null;
   startCommand?: string;
   workdir: string;
+  /**
+   * `export PATH=...` prelude from nodeBinPathExport, for a start command that
+   * names a dependency binary (`next start`). Applies ONLY to the string
+   * start-command branch: a compose service runs its own image's argv, where
+   * the image — not our buildpack — owns PATH. Empty string = nothing to add.
+   */
+  binPathExport?: string;
 }): string[] | undefined {
-  const { commandArgv, startCommand, workdir } = opts;
+  const { commandArgv, startCommand, workdir, binPathExport } = opts;
   if (commandArgv != null) return commandArgv.length > 0 ? commandArgv : undefined;
-  return startCommand ? ["sh", "-c", `cd ${sq(workdir)} && ${startCommand}`] : undefined;
+  if (!startCommand) return undefined;
+  const body = `cd ${sq(workdir)} && ${startCommand}`;
+  return ["sh", "-c", binPathExport ? `${binPathExport} && ${body}` : body];
 }
 
-function exposeTarget(port: number, serviceName: string, slug?: string, domain: string = SYSTEM.DOMAINS.CLOUD_DOMAIN) {
+function exposeTarget(
+  port: number,
+  serviceName: string,
+  slug?: string,
+  domain: string = SYSTEM.DOMAINS.CLOUD_DOMAIN,
+) {
   const service = `service "${serviceName}" on port ${port}`;
   return slug ? `${service} for slug "${slug}" (${slug}.${domain})` : service;
 }
@@ -192,6 +211,19 @@ export class CloudComposeSupport {
 
     const builtArtifact = this.deps.builtArtifacts.get(config.image);
     let workspaceId: string | undefined;
+
+    // An image-backed cloud service normally reuses its existing workspace so
+    // its only durable disk survives. Reuse cannot refresh the workspace's base
+    // image, while replacing the workspace would silently discard that data.
+    // Fail closed instead of claiming a mutable-tag webhook redeploy succeeded
+    // with the old image. A source build is exempt because its newly-built
+    // workspace is present in builtArtifacts and becomes the replacement.
+    if (config.forcePull && config.previousWorkspaceId && !builtArtifact) {
+      throw new Error(
+        `Cannot refresh image "${config.image}" for cloud service "${config.serviceName}" ` +
+          "without replacing its persistent workspace. Use a self-hosted Docker target for forced image refreshes.",
+      );
+    }
 
     try {
       workspaceId =
@@ -629,9 +661,7 @@ rm -f "$tmp"`;
 
     for (const service of group.services.values()) {
       if (service.ip) continue;
-      const ip = await this.resolveWorkspaceIpWithRetry(
-        this.deps.workspace(service.workspaceId),
-      );
+      const ip = await this.resolveWorkspaceIpWithRetry(this.deps.workspace(service.workspaceId));
       if (ip) {
         service.ip = ip;
       } else {

@@ -106,7 +106,7 @@ namespace boundary natively, so there is no SaaS-side ownership ledger. The `pub
 | `GET /api/cloud/github/oauth-bridge` | public | Consume the bridge token and redirect the browser into GitHub OAuth. |
 | `GET /api/cloud/github/oauth-success` | public | Friendly "GitHub connected" close-window page. |
 | `POST /api/cloud/github/install-url` | `cloud:write` | Build the App install URL with a one-time state token. |
-| `GET /api/cloud/github/install-callback` | public | GitHub install callback — attribute the install to the starting user. |
+| `GET /api/cloud/github/install-callback` | public | GitHub install callback — atomically claim a durable user/workspace nonce after matching user-token and Openship App-JWT verification. |
 | `GET /api/cloud/github/installations` | `cloud:read` | List the org owner's GitHub App installations. |
 | `POST /api/cloud/github/installation-token` | `cloud:write` | Mint a short-lived (~60min) installation access token. |
 | `GET /api/cloud/github/user-status` | `cloud:read` | Cloud-resolved GitHub OAuth identity (login, avatar) for the caller. |

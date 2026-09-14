@@ -20,6 +20,7 @@ import { verifyHmacSha256 } from "../webhooks/webhook.service";
 import { handleInstallation } from "./webhook-installation";
 import { handlePush } from "./webhook-push";
 import { handleCheckRun } from "./webhook-check-run";
+import { collectGitHubSourceWebhookSecrets } from "./github-source.service";
 import type {
   WebhookProvider,
   WebhookVerifyResult,
@@ -131,12 +132,46 @@ export const githubWebhookProvider: WebhookProvider = {
     // fallback. Deliveries without a routable repo (installation/ping) yield no
     // per-project candidates and rely on env — the SaaS App secret.
     const candidates = await collectDeliverySecrets(payload, headers);
+    let installationId: number | undefined;
+    let appId: number | undefined;
+    try {
+      const text = Buffer.isBuffer(payload) ? payload.toString("utf8") : payload;
+      const parsed = JSON.parse(text) as {
+        installation?: { id?: unknown; app_id?: unknown };
+        hook?: { app_id?: unknown };
+      };
+      const rawInstallationId = parsed.installation?.id;
+      if (
+        typeof rawInstallationId === "number" &&
+        Number.isSafeInteger(rawInstallationId) &&
+        rawInstallationId > 0
+      ) {
+        installationId = rawInstallationId;
+      }
+      const rawAppId = parsed.installation?.app_id ?? parsed.hook?.app_id;
+      if (typeof rawAppId === "number" && Number.isSafeInteger(rawAppId) && rawAppId > 0) {
+        appId = rawAppId;
+      }
+    } catch {
+      // Malformed JSON is rejected by signature verification below.
+    }
+    const sourceSecrets = await collectGitHubSourceWebhookSecrets({
+      installationId,
+      appId,
+      allowAllFallback: headers["x-github-event"] === "ping",
+    });
+    candidates.push(...sourceSecrets);
     // env.GITHUB_WEBHOOK_SECRET is the legacy/App fallback — append it ONLY when
     // this delivery has no per-project or cloud-binding candidate of its own
     // (installation/ping, or a repo Openship doesn't manage). Appending it for a
     // routable delivery that already has a per-project secret would make it a
     // cross-repo skeleton key that validates any managed repo's webhook.
-    if (candidates.length === 0 && env.GITHUB_WEBHOOK_SECRET) {
+    const customAppDelivery = sourceSecrets.length > 0;
+    if (
+      !customAppDelivery &&
+      (candidates.length === 0 || installationId !== undefined) &&
+      env.GITHUB_WEBHOOK_SECRET
+    ) {
       candidates.push(env.GITHUB_WEBHOOK_SECRET);
     }
 

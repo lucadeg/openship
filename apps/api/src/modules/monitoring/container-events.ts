@@ -51,7 +51,7 @@ import {
 import { env } from "../../config/env";
 import { resolveDeploymentRuntimeForRead } from "../../lib/deployment-runtime";
 import { sshManager } from "../../lib/ssh-manager";
-import { parseWatchGroupKey, runHealthWatch } from "./health-watch";
+import { isTrackedHealthContainer, parseWatchGroupKey, runHealthWatch } from "./health-watch";
 
 /**
  * How long one `renewEventWatchers` call vouches for a group. Comfortably more
@@ -257,12 +257,15 @@ async function connect(sub: Subscription): Promise<void> {
   }
 }
 
-function onEvent(sub: Subscription, _event: ContainerLifecycleEvent): void {
-  // The event's action and container id are deliberately unused: the sweep re-reads
-  // the state of everything on this box anyway, and an event for a container no
-  // project of ours owns still means the daemon is answering, which costs one
-  // `docker ps -a`. Filtering here would need a container→workload index that
-  // duplicates `resolveWorkloads`.
+function onEvent(sub: Subscription, event: ContainerLifecycleEvent): void {
+  // Ownership comes from the authoritative sweep's index — no second copy of
+  // container matching lives here. Ignore unrelated host containers and the
+  // noisy kill/stop precursors (`die` follows them); each accepted transition can
+  // materially change a workload verdict or recovery.
+  if (!isTrackedHealthContainer(sub.key, event.containerId)) return;
+  if (!(["die", "oom", "restart", "start", "unhealthy", "healthy", "destroy"] as const).includes(
+    event.action as "die" | "oom" | "restart" | "start" | "unhealthy" | "healthy" | "destroy",
+  )) return;
   //
   // An event arriving a full floor-interval after the last run is a NEW burst, not
   // the tail of the one we're still following up on — only then does the follow-up

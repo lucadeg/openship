@@ -25,12 +25,7 @@ import {
   resolveInstallUrl,
 } from "../github.auth";
 import { tokenFor, canResolveTokenFor } from "../github.token";
-import type {
-  GitHubPurpose,
-  GitHubTokenSource,
-  TokenContext,
-  TokenResult,
-} from "../github.token";
+import type { GitHubPurpose, GitHubTokenSource, TokenContext, TokenResult } from "../github.token";
 import { mapAccounts, mapRepositories } from "./mappers";
 import type { RequestContext } from "../../../lib/request-context";
 import type {
@@ -48,11 +43,13 @@ import type {
   GitHubSource,
   GitHubUserStatus,
 } from "./types";
+import { hasActiveGitHubSource, resolveGitHubApiBaseUrl } from "../github-source.service";
 
 export class GitHubAppSource implements GitHubSource {
   constructor(
     private readonly ctx: RequestContext,
-    /** "app" on the SaaS, "cloud-app" in local+cloud mode. */
+    /** "app" when this process owns the App (SaaS or self-hosted),
+     *  "cloud-app" when a self-host proxies through Openship Cloud. */
     readonly mode: GitHubMode = "app",
   ) {}
 
@@ -94,19 +91,20 @@ export class GitHubAppSource implements GitHubSource {
     owner: string,
     installationId?: number,
   ): Promise<MappedRepository[]> {
-    const token = await getInstallationToken(this.ctx, owner, installationId).catch(
-      () => null,
-    );
+    const token = await getInstallationToken(this.ctx, owner, installationId).catch(() => null);
     if (!token) return [];
     const perPage = 100;
     const MAX_PAGES = 50; // 5000 repos — a safety backstop, never a real limit
     const collected: GitHubRepository[] = [];
+    const apiBaseUrl =
+      (await resolveGitHubApiBaseUrl(this.ctx.organizationId, owner, installationId)) ??
+      "https://api.github.com";
     let total = Infinity;
     for (let page = 1; collected.length < total && page <= MAX_PAGES; page++) {
       const data = await ghFetch<{ total_count?: number; repositories: GitHubRepository[] }>(
         token,
         {
-          url: "https://api.github.com/installation/repositories",
+          url: `${apiBaseUrl}/installation/repositories`,
           params: { per_page: perPage, page },
         },
       );
@@ -127,8 +125,11 @@ export class GitHubAppSource implements GitHubSource {
 
   // ── Connection status ──────────────────────────────────────────────────
   async getConnectionState(): Promise<GitHubConnectionState> {
-    const status = await this.userStatus();
-    const connected = status.connected && status.tokenSource !== "cli";
+    const [status, customConfigured] = await Promise.all([
+      this.userStatus(),
+      hasActiveGitHubSource(this.ctx.organizationId).catch(() => false),
+    ]);
+    const connected = customConfigured || (status.connected && status.tokenSource !== "cli");
     let hasInstallations: boolean | undefined;
     if (connected) {
       try {
@@ -139,14 +140,17 @@ export class GitHubAppSource implements GitHubSource {
     }
     return {
       sources: {
-        openshipApp: connected && status.connected
-          ? {
-              connected: true,
-              login: status.login,
-              avatarUrl: status.avatar_url,
-              hasInstallations,
-            }
-          : { connected: false },
+        openshipApp:
+          connected && status.connected && !customConfigured
+            ? {
+                connected: true,
+                login: status.login,
+                avatarUrl: status.avatar_url,
+                hasInstallations,
+              }
+            : connected
+              ? { connected: true, hasInstallations }
+              : { connected: false },
         // No gh on the App source (the SaaS has no gh binary). The merge
         // overlays the real gh side when present.
         ghCli: { available: false },
@@ -184,8 +188,7 @@ export class GitHubAppSource implements GitHubSource {
       if (installs.length > 0) {
         const status = await this.userStatus();
         const primary =
-          (status.connected &&
-            installs.find((i) => i.account.login === status.login)) ||
+          (status.connected && installs.find((i) => i.account.login === status.login)) ||
           installs[0];
         repos = await this.listInstallationRepos(primary.account.login, primary.id);
       }

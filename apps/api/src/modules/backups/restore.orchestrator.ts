@@ -32,13 +32,8 @@
 import crypto from "node:crypto";
 import { Writable, pipeline as streamPipeline } from "node:stream";
 import { promisify } from "node:util";
-import {
-  repos,
-  type BackupRestore,
-  type BackupRun,
-  type BackupRestoreStatus,
-} from "@repo/db";
-import { liveContainerIdForService } from "../services/service-container";
+import { repos, type BackupRestore, type BackupRun, type BackupRestoreStatus } from "@repo/db";
+import { liveContainerForService } from "../services/service-container";
 import {
   HashingPassthrough,
   matchBackupSource,
@@ -54,13 +49,21 @@ import {
   type ServiceHandle,
 } from "@repo/adapters";
 import { staticReleaseDir, usableRef } from "../deployments/rollback/restore-plan";
-import { serviceHandleFor } from "./service-handle";
+import { serviceHandleFor, withContainerEnv } from "./service-handle";
+import { resolveSourceExecutor } from "./source-platform";
 import {
   disposeRuntime,
   resolveDeploymentPlatform,
   resolveTargetPlatform,
 } from "../../lib/deployment-runtime";
-import { safeErrorMessage } from "@repo/core";
+import {
+  isPayloadKind,
+  restoreAppliesAfterBounce,
+  restoreClearsTarget,
+  restoreFailureLeavesTargetIntact,
+  restoreNeedsLiveContainer,
+  safeErrorMessage,
+} from "@repo/core";
 import { assertResourceInOrg } from "../../lib/controller-helpers";
 import type { RequestContext } from "../../lib/request-context";
 import { toAdapterRow } from "../backup-destinations/hydrate-server";
@@ -73,24 +76,45 @@ const TRUNCATE_ERROR = 4096;
 const pipelineP = promisify(streamPipeline);
 
 /**
- * How long an unanswered cancel has to sit before a second press force-terminals
- * the row. The operator pressed cancel, watched nothing happen, pressed again —
- * that is the signal, and it needs no second endpoint. Long enough that a normal
- * cooperative cancel (which lands at the next checkpoint) always wins the race.
- */
-const FORCE_CANCEL_AFTER_MS = 2 * 60 * 1000;
-
-/**
- * The one sentence an operator reads after a cancel that landed mid-write, used
- * verbatim on both the cooperative and the forced path. Identical wording is the
- * point: a forced cancel has strictly LESS certainty about the target's state,
- * so it must never read as the reassuring outcome.
+ * The sentence an operator reads after cooperative cancellation landed during
+ * a write. The applying worker records this only after it has unwound, so the
+ * terminal row is also proof the old writer stopped touching the target.
  */
 function partialWriteSentence(source: string): string {
   return (
     `Cancelled after the restore had begun writing ${source}. That volume now holds ` +
     `partial data — re-run this restore (or a newer one) to completion before starting ` +
     `the service.`
+  );
+}
+
+/**
+ * The same warning for a restore that FAILED rather than one that was cancelled.
+ *
+ * Split because the consequence is identical but the cause is not, and reusing the
+ * cancel wording made a tar failure report itself as "Cancelled …" — which points the
+ * operator at something they did rather than at what broke.
+ */
+function partialWriteFailureSentence(source: string): string {
+  return (
+    `The restore had already begun writing ${source}, so that volume now holds partial ` +
+    `data — re-run this restore (or a newer one) to completion before starting the service.`
+  );
+}
+
+/**
+ * The counterpart, for a cancel that landed mid-write on a kind whose apply is
+ * all-or-nothing (`restoreFailureLeavesTargetIntact`).
+ *
+ * Said explicitly rather than left silent: an operator who cancels a restore halfway
+ * assumes the worst by default, and "the database is exactly as it was" is the whole
+ * difference between closing the dialog and restoring again on top of it.
+ */
+function cleanCancelSentence(source: string): string {
+  return (
+    `Cancelled after the restore had begun writing ${source}. That write is ` +
+    `all-or-nothing and was rolled back, so the target holds exactly what it held ` +
+    `before the restore started.`
   );
 }
 
@@ -102,18 +126,47 @@ class RestoreCancelled extends Error {
 }
 
 /**
- * Payload kinds whose restore() writes through `executor.pipeIntoCommand` — i.e.
- * INTO a running process inside the container, which the docker executor cannot
- * do without a containerId. Volume restores are the exception: they mount the
- * volume into a separate helper, so they work with the container gone.
+ * Both of these were `Set`s of payload kinds written out here.
+ *
+ * A `Set` is not exhaustive, so a new producer compiled clean and got both answers
+ * wrong by OMISSION — silently defaulting to "no live container needed, no bounce
+ * needed", which is the pair of answers that makes a restore report success without
+ * writing anything. That is not hypothetical: it is precisely how every `redis_rdb`
+ * restore was a no-op before the bounce set existed at all.
+ *
+ * They now read the catalog (`@repo/core`, backup-catalog.ts), which is a
+ * `Record<PayloadKind, …>` — so adding a kind is a compile error until both facts are
+ * stated for it, once, next to the rest of what the kind means.
+ *
+ * Both tolerate a kind the catalog does not know, which `payloadSpec` itself refuses
+ * to. That asymmetry is deliberate: a POLICY holding an unknown kind must not silently
+ * back up the wrong thing, but these two read an ARTIFACT, and `run.artifacts` is jsonb
+ * — a row written by an older build, or by a newer one before a downgrade, can carry a
+ * kind with no spec here. Throwing out of prepare for that replaced the operator's real
+ * failure with a catalog error about their own history. Answering `false` only decides
+ * container and bounce handling; the artifact itself is still refused BY NAME one layer
+ * down, where `resolveProducer` has to find something to restore it with.
  */
-const NEEDS_LIVE_CONTAINER: ReadonlySet<PayloadKind> = new Set<PayloadKind>([
-  "pg_dump",
-  "mysql_dump",
-  "redis_rdb",
-  "mongo_dump",
-  "custom_command",
-]);
+const needsLiveContainer = (kind: PayloadKind): boolean =>
+  isPayloadKind(kind) && restoreNeedsLiveContainer(kind);
+const needsBounceAfterWrite = (kind: PayloadKind): boolean =>
+  isPayloadKind(kind) && restoreAppliesAfterBounce(kind);
+/**
+ * Whether a FAILED apply of this kind leaves its target as it was — the one fact that
+ * may SUPPRESS the partial-data warning, so its tolerance points the other way from the
+ * rest: an unknown kind answers `false`, i.e. assume the target may hold partial data
+ * and leave the service down. Under-warning is the dangerous direction here.
+ */
+const failureLeavesTargetIntact = (kind: PayloadKind): boolean =>
+  isPayloadKind(kind) && restoreFailureLeavesTargetIntact(kind);
+/**
+ * Same tolerance, and here it is the one that matters most: an artifact whose kind this
+ * build does not know answers `false`, i.e. do not destroy. It is refused by name one
+ * layer down anyway, and "we do not recognise this" must never resolve to "empty the
+ * target first".
+ */
+const clearsTarget = (kind: PayloadKind, config: Record<string, unknown> | null): boolean =>
+  isPayloadKind(kind) && restoreClearsTarget(kind, config);
 
 /**
  * A failure that happened after the restore began writing the target.
@@ -145,7 +198,10 @@ function recordedArtifacts(run: BackupRun): RecordedArtifact[] {
  *  differ between what we record and what a destination reports back. */
 function normalizeDigest(value: unknown): string | null {
   if (typeof value !== "string") return null;
-  const bare = value.trim().replace(/^sha256:/i, "").toLowerCase();
+  const bare = value
+    .trim()
+    .replace(/^sha256:/i, "")
+    .toLowerCase();
   return /^[0-9a-f]{64}$/.test(bare) ? bare : null;
 }
 
@@ -187,9 +243,17 @@ export class RestoreOrchestrator {
    */
   private readonly inFlight = new Map<string, AbortController>();
 
-  /** Begin a restore — create the row in queued state and kick off
-   *  the prepare step in the background. Returns the restoreId. */
-  async beginPrepare(opts: PrepareRestoreInput): Promise<{ restoreId: string }> {
+  /**
+   * Begin a restore — create the row in queued state and kick off the prepare step
+   * in the background.
+   *
+   * Returns the confirmation token that is IN FORCE for the returned restore, which
+   * is not always the one the caller minted: an already-active restore of the same
+   * run is reused, and it keeps its own token.
+   */
+  async beginPrepare(
+    opts: PrepareRestoreInput,
+  ): Promise<{ restoreId: string; confirmationToken: string }> {
     const sourceRun = await repos.backupRun.findById(opts.runId);
     if (!sourceRun) throw new Error(`Backup run ${opts.runId} not found`);
     if (sourceRun.status !== "succeeded") {
@@ -217,7 +281,20 @@ export class RestoreOrchestrator {
     // staging area and confuse the SSE channel.
     const existing = await repos.backupRestore.findActiveByRunId(opts.runId);
     if (existing) {
-      return { restoreId: existing.id };
+      /**
+       * Reusing the ROW means reusing ITS token. The caller mints a fresh one per
+       * request and hands whatever comes back to the client, so returning the freshly
+       * minted one here made every echo fail the compare — and this branch is exactly
+       * what a second prepare hits, so the restore could never be applied and could
+       * never be re-prepared out of it either. The only way out was a new backup run.
+       */
+      const inForce =
+        existing.confirmationToken ||
+        (await repos.backupRestore.adoptConfirmationToken(existing.id, opts.confirmationToken));
+      if (!inForce) {
+        throw new Error("This restore has no confirmation token — cancel it and start again");
+      }
+      return { restoreId: existing.id, confirmationToken: inForce };
     }
 
     const restoreId = `bks_${crypto.randomUUID()}`;
@@ -243,7 +320,7 @@ export class RestoreOrchestrator {
       );
     });
 
-    return { restoreId };
+    return { restoreId, confirmationToken: opts.confirmationToken };
   }
 
   /**
@@ -251,11 +328,7 @@ export class RestoreOrchestrator {
    * stops, target volume is wiped + replaced, service restarts.
    * Verifies the confirmation token from beginPrepare.
    */
-  async apply(
-    ctx: RequestContext,
-    restoreId: string,
-    confirmationToken: string,
-  ): Promise<void> {
+  async apply(ctx: RequestContext, restoreId: string, confirmationToken: string): Promise<void> {
     const restore = await repos.backupRestore.findById(restoreId);
     try {
       assertResourceInOrg(restore, "Restore", ctx.organizationId, restoreId);
@@ -280,10 +353,36 @@ export class RestoreOrchestrator {
       throw new Error("Confirmation token mismatch");
     }
     if (restore.status !== "prepared") {
+      throw new Error(`Restore is in status=${restore.status}, must be 'prepared' to apply`);
+    }
+
+    // A prepared row can wait for hours, so its creation-time admission lock no
+    // longer proves the target project is still available. Claim the destructive
+    // phase through the same project-row lock as deletion BEFORE acknowledging
+    // this request or scheduling any work. Whichever side wins establishes a
+    // durable fact the other side observes: `applying`, or deletion-in-progress.
+    const sourceRun = await repos.backupRun.findById(restore.runId);
+    if (!sourceRun) throw new Error("Source backup run disappeared");
+    const projectId = sourceRun.sourceKind === "mail_server" ? null : restore.projectId;
+    if (sourceRun.sourceKind !== "mail_server" && !projectId) {
+      throw new Error("Cannot apply restore: target project no longer exists");
+    }
+    const claim = await repos.backupRestore.claimApply(
+      restoreId,
+      projectId,
+      restore.organizationId,
+    );
+    if (claim === "project_unavailable") {
+      throw new Error("Cannot apply restore: project is being deleted or no longer exists");
+    }
+    if (claim !== "claimed") {
+      const current = await repos.backupRestore.findById(restoreId).catch(() => undefined);
       throw new Error(
-        `Restore is in status=${restore.status}, must be 'prepared' to apply`,
+        `Restore is in status=${current?.status ?? "unknown"} or cancellation was requested; ` +
+          "it can no longer be applied",
       );
     }
+    this.publishTransitionEvent(restoreId, "applying");
 
     setImmediate(() => {
       void this.runApply(restoreId).catch((err) =>
@@ -307,6 +406,10 @@ export class RestoreOrchestrator {
    * Phases that have not touched the target still transition immediately.
    * Returns what actually happened rather than throwing, so the UI can say
    * "cancelling…" instead of showing an error for a cancel that was accepted.
+   *
+   * An applying restore is never force-terminalized here: changing only the row
+   * cannot prove its writer stopped. The worker owns its terminal transition;
+   * after process death, the boot stale-restore sweep owns recovery.
    */
   async cancel(
     ctx: RequestContext,
@@ -343,7 +446,14 @@ export class RestoreOrchestrator {
     this.inFlight.get(restoreId)?.abort();
     this.publishTransitionalCancel(restoreId, this.metaFlag(flagged ?? restore, "destructive"));
 
-    if (restore.status !== "applying") {
+    // `requestCancel` returns the row as it existed under the UPDATE lock. The
+    // earlier read may still say `prepared` even when an apply claim won between
+    // that read and this write; branching on it would terminalize an active
+    // writer before the writer acknowledged its abort. Conversely, if cancel won
+    // first, claimApply's `cancelRequested=false` predicate prevents apply from
+    // crossing this point.
+    const current = flagged ?? restore;
+    if (current.status !== "applying") {
       // Nothing was stopped and nothing written — the free cancel. runPrepare
       // checks the flag before its own `prepared` transition, so this cannot be
       // overwritten the way it used to be.
@@ -353,44 +463,15 @@ export class RestoreOrchestrator {
       return { accepted: true, status: "cancelled", destructive: false, forced: false };
     }
 
-    const requestedAt = flagged?.cancelRequestedAt ?? restore.cancelRequestedAt;
-    const stale =
-      requestedAt instanceof Date && Date.now() - requestedAt.getTime() >= FORCE_CANCEL_AFTER_MS;
-    if (stale) {
-      // The cooperative path had its window and did not answer. Force the row
-      // terminal so it stops blocking project deletion — with the SAME
-      // partial-data wording, because a forced cancel knows LESS about the
-      // target's state than a cooperative one, not more.
-      const destructive = this.metaFlag(flagged ?? restore, "destructive");
-      const source =
-        (this.metaValue(flagged ?? restore, "destructiveSource") as string | undefined) ??
-        "the restore target";
-      console.error(
-        `[restore-orchestrator] force-cancelling wedged apply ${restoreId} ` +
-          `(no checkpoint answered in ${Math.round(FORCE_CANCEL_AFTER_MS / 1000)}s)`,
-      );
-      await this.transition(restoreId, "cancelled", {
-        errorMessage: boundedStorableText(
-          destructive
-            ? `${partialWriteSentence(source)} The apply was still running when it was ` +
-                `force-cancelled, so the write may have continued past this point.`
-            : "Cancelled before any data was written. The apply was force-cancelled after " +
-                "it stopped responding; the service may have been left stopped.",
-          TRUNCATE_ERROR,
-        ),
-        meta: await this.mergedMeta(restoreId, {
-          forced: true,
-          destructive,
-          ...(destructive ? { partialWrite: true, serviceLeftStopped: true } : {}),
-        }),
-      });
-      return { accepted: true, status: "cancelled", destructive, forced: true };
-    }
-
+    // Never terminalize an applying row from the request path. An abort signal
+    // is a request, not proof that the executor stopped; changing only the row
+    // would let project teardown destroy a target while the old writer still
+    // mutates it. runApply owns the terminal transition after it unwinds. If the
+    // process died, the boot stale-restore sweep is the out-of-process proof.
     return {
       accepted: true,
       status: "applying",
-      destructive: this.metaFlag(flagged ?? restore, "destructive"),
+      destructive: this.metaFlag(current, "destructive"),
       forced: false,
     };
   }
@@ -473,9 +554,7 @@ export class RestoreOrchestrator {
       const sourceRun = await repos.backupRun.findById(restore.runId);
       if (!sourceRun) throw new Error("Source backup run disappeared");
 
-      const destinationRow = await repos.backupDestination.findById(
-        restore.destinationId,
-      );
+      const destinationRow = await repos.backupDestination.findById(restore.destinationId);
       if (!destinationRow) throw new Error("Destination disappeared");
       this.assertDestinationOrg(destinationRow, restore.organizationId);
 
@@ -553,81 +632,84 @@ export class RestoreOrchestrator {
     // A prepare-time PROBE only — nothing here outlives the method, so the
     // transport goes back when it returns (including on a throw).
     try {
+      // A probe that FAILED is not the same fact as a target with nothing in it,
+      // and conflating them would report an unreachable host as a misconfigured
+      // service — sending the operator to fix the wrong thing.
+      let sources: Awaited<ReturnType<BackupExecutor["listSources"]>> = [];
+      let probeError: string | null = null;
+      try {
+        sources = await executor.listSources(serviceHandle);
+      } catch (err) {
+        probeError = safeErrorMessage(err);
+      }
+      const restorable = sources.filter((s) => s.type !== "tmpfs");
+      const needsContainer = artifacts.filter((a) => needsLiveContainer(a.payloadKind));
+      const volumeArtifacts = artifacts.filter((a) => a.payloadKind === "volume");
 
-    // A probe that FAILED is not the same fact as a target with nothing in it,
-    // and conflating them would report an unreachable host as a misconfigured
-    // service — sending the operator to fix the wrong thing.
-    let sources: Awaited<ReturnType<BackupExecutor["listSources"]>> = [];
-    let probeError: string | null = null;
-    try {
-      sources = await executor.listSources(serviceHandle);
-    } catch (err) {
-      probeError = safeErrorMessage(err);
-    }
-    const restorable = sources.filter((s) => s.type !== "tmpfs");
-    const needsContainer = artifacts.filter((a) => NEEDS_LIVE_CONTAINER.has(a.payloadKind));
-    const volumeArtifacts = artifacts.filter((a) => a.payloadKind === "volume");
-
-    if (restorable.length === 0 && volumeArtifacts.length > 0) {
-      if (probeError) {
+      if (restorable.length === 0 && volumeArtifacts.length > 0) {
+        if (probeError) {
+          throw new Error(
+            `Could not enumerate restore targets for service "${serviceHandle.name}" on the ` +
+              `host: ${probeError}. The restore was not started — fix host access and prepare ` +
+              `it again.`,
+          );
+        }
         throw new Error(
-          `Could not enumerate restore targets for service "${serviceHandle.name}" on the ` +
-            `host: ${probeError}. The restore was not started — fix host access and prepare ` +
-            `it again.`,
+          `Nothing to restore into for service "${serviceHandle.name}": it has no running ` +
+            `container on the host AND no volumes recorded on the service row. Redeploy the ` +
+            `project (or re-declare its volumes) and prepare the restore again.`,
         );
       }
-      throw new Error(
-        `Nothing to restore into for service "${serviceHandle.name}": it has no running ` +
-          `container on the host AND no volumes recorded on the service row. Redeploy the ` +
-          `project (or re-declare its volumes) and prepare the restore again.`,
-      );
-    }
 
-    // Two different failures, and the operator's next step differs: an artifact
-    // that never recorded which volume it came from can't be placed by anyone
-    // (the volume producer refuses it too, one layer down), while a recorded id
-    // that no longer matches means the service's volumes changed under it.
-    const unlabelled = volumeArtifacts.filter(
-      (a) => typeof a.metadata.volumeId !== "string" || !a.metadata.volumeId,
-    );
-    if (unlabelled.length > 0) {
-      throw new Error(
-        `Artifact${unlabelled.length > 1 ? "s" : ""} ` +
-          `${unlabelled.map((a) => `"${a.name ?? a.key}"`).join(", ")} ` +
-          `record${unlabelled.length > 1 ? "" : "s"} no volume id, so ` +
-          `there is no way to tell which volume to restore into. This run was captured by an ` +
-          `incompatible producer and cannot be restored in place.`,
+      // Two different failures, and the operator's next step differs: an artifact
+      // that never recorded which volume it came from can't be placed by anyone
+      // (the volume producer refuses it too, one layer down), while a recorded id
+      // that no longer matches means the service's volumes changed under it.
+      const unlabelled = volumeArtifacts.filter(
+        (a) => typeof a.metadata.volumeId !== "string" || !a.metadata.volumeId,
       );
-    }
-    const unresolved = volumeArtifacts.filter(
-      (a) => !matchBackupSource(restorable, a.metadata.volumeId as string),
-    );
-    if (unresolved.length > 0) {
-      throw new Error(
-        `Backed-up volume${unresolved.length > 1 ? "s" : ""} ` +
-          `${unresolved.map((a) => `"${a.metadata.volumeId}"`).join(", ")} ` +
-          `no longer exist${unresolved.length > 1 ? "" : "s"} on service ` +
-          `"${serviceHandle.name}". Visible targets: ` +
-          `${restorable.map((s) => s.id).join(", ") || "none"}. The service's volumes changed ` +
-          `since this backup was taken, so it cannot be restored in place.`,
+      if (unlabelled.length > 0) {
+        throw new Error(
+          `Artifact${unlabelled.length > 1 ? "s" : ""} ` +
+            `${unlabelled.map((a) => `"${a.name ?? a.key}"`).join(", ")} ` +
+            `record${unlabelled.length > 1 ? "" : "s"} no volume id, so ` +
+            `there is no way to tell which volume to restore into. This run was captured by an ` +
+            `incompatible producer and cannot be restored in place.`,
+        );
+      }
+      const unresolved = volumeArtifacts.filter(
+        (a) => !matchBackupSource(restorable, a.metadata.volumeId as string),
       );
-    }
+      if (unresolved.length > 0) {
+        throw new Error(
+          `Backed-up volume${unresolved.length > 1 ? "s" : ""} ` +
+            `${unresolved.map((a) => `"${a.metadata.volumeId}"`).join(", ")} ` +
+            `no longer exist${unresolved.length > 1 ? "" : "s"} on service ` +
+            `"${serviceHandle.name}". Visible targets: ` +
+            `${restorable.map((s) => s.id).join(", ") || "none"}. The service's volumes changed ` +
+            `since this backup was taken, so it cannot be restored in place.`,
+        );
+      }
 
-    if (needsContainer.length > 0 && executor.runtimeName === "docker" && !serviceHandle.containerId) {
-      throw new Error(
-        `Cannot restore ${needsContainer.map((a) => a.payloadKind).join(", ")} into service ` +
-          `"${serviceHandle.name}": this payload is replayed INTO the running database process, ` +
-          `and the service has no live container on the host. Deploy the service first, then ` +
-          `prepare the restore again.`,
-      );
-    }
+      if (
+        needsContainer.length > 0 &&
+        executor.runtimeName === "docker" &&
+        !serviceHandle.containerId
+      ) {
+        throw new Error(
+          `Cannot restore ${needsContainer.map((a) => a.payloadKind).join(", ")} into service ` +
+            `"${serviceHandle.name}": this payload is replayed INTO the running database process, ` +
+            `and the service has no live container on the host. Deploy the service first, then ` +
+            `prepare the restore again.`,
+        );
+      }
 
-    return {
-      meta: {
-        targetContainer: serviceHandle.containerId ? "live" : "none",
-        targetSources: restorable.length,
-      },
-    };
+      return {
+        meta: {
+          targetContainer: serviceHandle.containerId ? "live" : "none",
+          targetSources: restorable.length,
+        },
+      };
     } finally {
       disposeRuntime(runtime);
     }
@@ -641,6 +723,30 @@ export class RestoreOrchestrator {
    * restore that matters. Default ON, and a run whose policy is gone still
    * verifies — absence of a policy is not consent to skip the check.
    */
+  /**
+   * Does this artifact's target get EMPTIED before the write, or written over?
+   *
+   * Was the literal `clearTarget: true` at the apply call site, for every kind. With
+   * only volumes and logical dumps in the table that was the volume default spelled in
+   * the wrong place; it became a defect the moment a kind existed whose default is the
+   * opposite. A `path` artifact restored under it emptied a folder the operator never
+   * asked to replace — and for the paths `validateClearPath` refuses outright
+   * (`/etc/nginx`, the ordinary case for a config tree) the producer threw instead,
+   * turning a perfectly good capture into one that could never be restored.
+   *
+   * Per ARTIFACT, not per restore: one run can hold a volume artifact and a path
+   * artifact, and they do not want the same answer.
+   *
+   * Policy-level like `shouldVerifyOnPrepare`, and for the same reason — a per-request
+   * "wipe the target" checkbox is one an operator clicks past at 3am. A run whose policy
+   * is gone falls back to the KIND's default, never to clearing.
+   */
+  private async shouldClearTarget(run: BackupRun, kind: PayloadKind): Promise<boolean> {
+    if (!run.policyId) return clearsTarget(kind, null);
+    const policy = await repos.backupPolicy.findById(run.policyId).catch(() => undefined);
+    return clearsTarget(kind, (policy?.payloadConfig ?? null) as Record<string, unknown> | null);
+  }
+
   private async shouldVerifyOnPrepare(run: BackupRun): Promise<boolean> {
     if (!run.policyId) return true;
     const policy = await repos.backupPolicy.findById(run.policyId).catch(() => undefined);
@@ -830,16 +936,42 @@ export class RestoreOrchestrator {
   }
 
   private async runApply(restoreId: string): Promise<void> {
-    // Registered BEFORE the applying transition, so a cancel racing the very
-    // first millisecond of apply still finds a handle to abort.
+    // The durable applying transition was claimed synchronously by apply(). The
+    // local handle is registered before this worker re-reads the row or touches
+    // the target; a cancel that landed before registration is still carried by
+    // the durable cancelRequested flag checked below.
     const controller = new AbortController();
     this.inFlight.set(restoreId, controller);
     // Released alongside the in-flight handle at the bottom — see resolveTarget.
     let targetRuntime: RuntimeAdapter | null = null;
+    // The two facts the terminal row reports, hoisted to the function because the outer
+    // catch is what writes them and they are decided deep inside the apply.
+    //
+    // They are SEPARATE facts and used to be one pair of booleans stamped together:
+    // `partialWrite: true, serviceLeftStopped: true`, either both or neither. That
+    // collapse made the banner wrong on every kind that restores THROUGH a live
+    // container — nothing stops those services, so "the service was deliberately left
+    // stopped" described a service that was up and serving; and it made a complete
+    // restore whose only failure was bringing the service back read as partial data,
+    // which points the operator at re-running a restore they do not need.
+    //
+    // `unfinishedTarget` — a target that may hold data this run did not finish putting
+    // there, or null when nothing is half-applied. Also the label the warning names.
+    //
+    // `serviceDown` — whether the service is NOT RUNNING when the row is written, for
+    // any reason, tracked at every stop and start rather than inferred afterwards. It is
+    // deliberately not "did we stop it": the operator reads this flag to answer "may I
+    // start it", and a service that was ALREADY down before the restore and now holds
+    // partial data needs that warning just as much as one we stopped ourselves. Whether
+    // we may start it back is the separate question, and `stoppedByUs` answers that one.
+    let unfinishedTarget: string | null = null;
+    let serviceDown = false;
     try {
       const restore = await repos.backupRestore.findById(restoreId);
-      if (!restore) return;
-      await this.transition(restoreId, "applying");
+      // `apply()` owns the atomic prepared→applying claim. Starting from any
+      // other state means this callback is stale (cancelled/finished) and must
+      // not resolve a target, stop a service, or write bytes.
+      if (!restore || restore.status !== "applying") return;
 
       const sourceRun = await repos.backupRun.findById(restore.runId);
       if (!sourceRun) throw new Error("Source backup run disappeared");
@@ -863,25 +995,78 @@ export class RestoreOrchestrator {
       // Checkpoint 1 — before anything is stopped. Free.
       await this.throwIfCancelRequested(restoreId, null);
 
-      // Only stop what is actually running, and only start back what WE stopped.
-      // The old code stopped unconditionally and always started: on a service
-      // with no container that start throws (docker), which is the second half
-      // of #434 — and on a deliberately-stopped service it resurrected something
-      // the operator had taken down. A volume restore doesn't need the container
-      // down anyway; the volume is mounted into a separate helper.
+      // Only stop what is actually running, only start back what WE stopped — and do not
+      // stop a service whose payload has to be restored THROUGH it.
+      //
+      // That last clause is the one this file was missing. `needsLiveContainer` already
+      // names the payload kinds whose `restore()` goes through `pipeIntoCommand`, i.e.
+      // `docker exec` — pg_dump, mysql_dump, mongo_dump, redis_rdb, custom_command — but it
+      // was only ever consulted in `prepare`, as a precondition that a container EXISTS.
+      // Apply then stopped that container and exec'd into it anyway, and the daemon
+      // answered `409 container stopped/paused - … is not running`. So every logical-dump
+      // restore failed on a service that was running, which is the normal case; it happened
+      // to work only if the operator had already stopped it. Found by the payload-matrix
+      // E2E, which is the first thing to drive a custom_command restore end to end.
+      //
+      // A volume restore is the opposite: it wants the writer stopped, and it does not need
+      // the container at all because the volume is mounted into a separate helper.
+      const artifactKinds = recordedArtifacts(sourceRun).map((a) => a.payloadKind);
+      const restoresThroughContainer = artifactKinds.some(needsLiveContainer);
       const wasRunning = await executor.isRunning(serviceHandle).catch(() => false);
-      if (wasRunning) await executor.stopService(serviceHandle);
+      // Seeded from the service's actual state, so a restore into something that was
+      // already down reports it. `catch(() => false)` above means an executor we could
+      // not ask reads as running, which keeps an unknown from producing a "your service
+      // is down" claim we cannot support.
+      serviceDown = !wasRunning;
+      const stoppedByUs = wasRunning && !restoresThroughContainer;
+      if (stoppedByUs) {
+        await executor.stopService(serviceHandle);
+        serviceDown = true;
+      }
 
       // Checkpoint 2 — stopped, still nothing written.
       await this.throwIfCancelRequested(restoreId, null, async () => {
-        if (wasRunning) await executor.startService(serviceHandle).catch(() => {});
+        if (stoppedByUs) {
+          await executor
+            .startService(serviceHandle)
+            .then(() => {
+              serviceDown = false;
+            })
+            .catch(() => {});
+        }
       });
 
+      // Declared OUTSIDE the try below, because the catch has to read it. `wroteInto`
+      // is the target we last BEGAN writing; it drives `destructive`, which is what the
+      // cancel path and the UI mean by "this restore touched data".
+      //
+      // Distinct from `unfinishedTarget` above, which is the narrower and more
+      // consequential fact: a target that may now hold data this run did not FINISH
+      // putting there. They were one variable, and the collapse was wrong in both
+      // directions:
+      //
+      //   - Reading the exception TYPE alone (before `wroteInto` was hoisted out here)
+      //     under-warned: `clearTarget: true` empties the volume in the docker helper's
+      //     PRELUDE, so by the time any ordinary Error escapes `producer.restore` the
+      //     target is already gone — and an ordinary Error is exactly what a tar
+      //     failure, an ENOSPC or the idle watchdog produces. Those all took the
+      //     restart branch, on an empty volume.
+      //
+      //   - Reading "did we reach producer.restore" over-warned, on the one kind whose
+      //     apply is all-or-nothing. An aborted `pg_restore --single-transaction`
+      //     changes nothing, and the service was never stopped for it either — yet the
+      //     operator got "the target holds partial data and the service was deliberately
+      //     left stopped" about an untouched database and a running service. A warning
+      //     that fires on a healthy outcome is how the real one stops being read.
+      //
+      // Which kinds can leave a half-written target is a CATALOG fact
+      // (`restoreFailureLeavesTargetIntact`), stated once next to the rest of what each
+      // kind means, rather than inferred here from control flow.
+      let wroteInto: string | null = null;
       try {
         const artifacts = recordedArtifacts(sourceRun);
 
         let bytesRestored = 0;
-        let wroteInto: string | null = null;
         for (const [index, recorded] of artifacts.entries()) {
           // Checkpoint 3 — between producers. Honored, and it carries whatever
           // the previous artifact already wrote, so a multi-volume restore
@@ -899,6 +1084,10 @@ export class RestoreOrchestrator {
           const targetLabel = this.artifactTargetLabel(recorded, serviceHandle);
           await this.markDestructive(restoreId, targetLabel);
           wroteInto = targetLabel;
+          // Before the write, because for these kinds the destruction starts with it:
+          // the volume helper's clear happens in its prelude, `tar -x` writes file by
+          // file, `mysql` commits statement by statement.
+          if (!failureLeavesTargetIntact(recorded.payloadKind)) unfinishedTarget = targetLabel;
           try {
             await producer.restore(
               serviceHandle,
@@ -911,7 +1100,10 @@ export class RestoreOrchestrator {
                 sizeBytes: recorded.sizeBytes,
                 open: async () => (await destination.get(recorded.key)).pipe(hasher),
               },
-              { clearTarget: true, signal: this.signalFor(restoreId) },
+              {
+                clearTarget: await this.shouldClearTarget(sourceRun, recorded.payloadKind),
+                signal: this.signalFor(restoreId),
+              },
             );
           } catch (err) {
             // The abort signal we hand the executor surfaces here as an ordinary
@@ -935,7 +1127,20 @@ export class RestoreOrchestrator {
             );
           }
           bytesRestored += recorded.sizeBytes;
+          // This artifact is fully applied. If a LATER one fails, the service holds a
+          // half-applied restore even when every individual target is internally
+          // consistent — which is the only way an all-atomic run can still be partial,
+          // and the same reading checkpoint 3 above already takes for a cancel.
+          unfinishedTarget ??= targetLabel;
         }
+
+        // Every artifact applied in full, so nothing is half-applied any more — and a
+        // failure from here on is about the SERVICE, not the data. Clearing this is what
+        // keeps "the restore finished but the container would not come back up" from
+        // telling the operator their data is partial and to re-run the restore. The one
+        // exception raises its own `PartialWriteError` with its own precise wording: a
+        // failed bounce means the bytes are down but the server has not loaded them.
+        unfinishedTarget = null;
 
         // Checkpoint 4 DECLINES: every byte is written and the only thing left is
         // starting the service. Honoring a cancel here would leave a complete
@@ -943,7 +1148,31 @@ export class RestoreOrchestrator {
         // request arrived too late.
         const lateCancel = await this.cancelRequested(restoreId);
 
-        if (wasRunning) await executor.startService(serviceHandle);
+        // Make the write take effect where writing it was not enough. Deliberately
+        // NOT best-effort: an un-bounced Redis is a restore that did not happen, and
+        // reporting that as success is the exact failure this module exists to remove.
+        // It runs after the last checkpoint because the bytes are already down — the
+        // service is in the "restored but not yet loaded" state until this completes,
+        // which is why a failure here has to be loud.
+        if (wasRunning && artifactKinds.some(needsBounceAfterWrite)) {
+          try {
+            await executor.stopService(serviceHandle);
+            serviceDown = true;
+            await executor.startService(serviceHandle);
+            serviceDown = false;
+          } catch (bounceErr) {
+            throw new PartialWriteError(
+              `The artifact was written, but restarting ${serviceHandle.name} to load it ` +
+                `failed: ${safeErrorMessage(bounceErr)}. The service holds the restored file ` +
+                `but has not loaded it — restart it to complete the restore.`,
+            );
+          }
+        }
+
+        if (stoppedByUs) {
+          await executor.startService(serviceHandle);
+          serviceDown = false;
+        }
 
         await this.transition(restoreId, "succeeded", {
           bytesRestored,
@@ -968,32 +1197,75 @@ export class RestoreOrchestrator {
         // container — UNLESS the target now holds partial data. Starting a
         // service on a half-written volume turns a clear failure into a silently
         // corrupt running app, which is strictly worse than staying down.
-        const partial =
-          innerErr instanceof PartialWriteError ||
-          (innerErr instanceof RestoreCancelled && innerErr.destructiveSource !== null);
+        //
+        // One fact decides it, and it is a fact rather than an inference: did a write
+        // start that this run did not finish. A `PartialWriteError` only ADDS to it —
+        // it is raised where the code knows something the flag cannot see (an artifact
+        // that was corrupt in transit, a bounce that did not complete).
+        const partial = unfinishedTarget !== null || innerErr instanceof PartialWriteError;
         if (partial) {
           console.error(
-            `[restore-orchestrator] apply ${restoreId} left partial data — leaving the service stopped`,
+            `[restore-orchestrator] apply ${restoreId} left partial data — ` +
+              (serviceDown
+                ? "leaving the service stopped"
+                : "the service restores through its own container and is still running"),
           );
-        } else if (wasRunning) {
+        } else if (stoppedByUs) {
+          // Only what WE stopped: a service that was already down when the restore
+          // started must stay down, whatever the outcome.
           try {
             await executor.startService(serviceHandle);
+            serviceDown = false;
           } catch {
-            // best-effort
+            // best-effort: the row then reports the service as down, which is true.
           }
+        }
+        // Re-thrown AS a partial write so the terminal row says so. The outer catch
+        // stamps `partialWrite` off this type, and without the conversion an operator
+        // would read a bare failure on a volume that is now empty — no worse than
+        // before for the service (it stays down either way), but it hides the one fact
+        // they need before starting it by hand.
+        if (
+          unfinishedTarget !== null &&
+          !(innerErr instanceof PartialWriteError) &&
+          !(innerErr instanceof RestoreCancelled)
+        ) {
+          throw new PartialWriteError(
+            `${safeErrorMessage(innerErr)} — ${partialWriteFailureSentence(unfinishedTarget)}`,
+          );
         }
         throw innerErr;
       }
     } catch (err) {
+      // Two INDEPENDENT facts, stamped independently — see the declarations at the top
+      // of this method. `partialWrite` is about the data, `serviceLeftStopped` about the
+      // container, and a restore can be any combination of the two: a cancelled volume
+      // extract is both; an aborted `pg_restore --single-transaction` is neither; a
+      // complete restore whose service would not start again is only the second.
+      const partialWrite = unfinishedTarget !== null || err instanceof PartialWriteError;
+      const stateMeta = {
+        ...(partialWrite ? { partialWrite: true } : {}),
+        ...(serviceDown ? { serviceLeftStopped: true } : {}),
+      };
       if (err instanceof RestoreCancelled) {
         const source = err.destructiveSource;
         await this.transition(restoreId, "cancelled", {
-          ...(source
-            ? { errorMessage: boundedStorableText(partialWriteSentence(source), TRUNCATE_ERROR) }
-            : {}),
+          ...(partialWrite
+            ? {
+                errorMessage: boundedStorableText(
+                  partialWriteSentence(unfinishedTarget ?? source ?? "the restore target"),
+                  TRUNCATE_ERROR,
+                ),
+              }
+            : source
+              ? { errorMessage: boundedStorableText(cleanCancelSentence(source), TRUNCATE_ERROR) }
+              : {}),
           meta: await this.mergedMeta(restoreId, {
+            // Still `destructive`: it began writing, which is what the flag has always
+            // meant and what the UI uses to decide whether to warn at all.
             destructive: source !== null,
-            ...(source ? { partialWrite: true, serviceLeftStopped: true, destructiveSource: source } : {}),
+            ...(source ? { destructiveSource: source } : {}),
+            ...stateMeta,
           }),
         });
         return;
@@ -1002,14 +1274,12 @@ export class RestoreOrchestrator {
       console.error(`[restore-orchestrator] apply ${restoreId} failed: ${message}`);
       await this.transition(restoreId, "failed", {
         errorMessage: boundedStorableText(message, TRUNCATE_ERROR),
-        ...(err instanceof PartialWriteError
-          ? {
-              meta: await this.mergedMeta(restoreId, {
-                partialWrite: true,
-                serviceLeftStopped: true,
-              }),
-            }
-          : {}),
+        // Unconditional, unlike before: the flags are computed from what happened, so
+        // "no flags" is a statement (the data is intact and the service is up), not an
+        // absence. Gating the whole meta write on the error TYPE also meant a failure
+        // that left the service down said nothing about it unless it happened to be a
+        // PartialWriteError.
+        meta: await this.mergedMeta(restoreId, stateMeta),
       });
     } finally {
       this.inFlight.delete(restoreId);
@@ -1090,29 +1360,7 @@ export class RestoreOrchestrator {
     patch?: Parameters<typeof repos.backupRestore.transition>[2],
   ): Promise<void> {
     await repos.backupRestore.transition(restoreId, status, patch);
-    try {
-      restoreRunBus.publish(restoreId, {
-        type: "transition",
-        status,
-        bytesRestored:
-          typeof patch?.bytesRestored === "number" ? patch.bytesRestored : undefined,
-      });
-      const TERMINAL: BackupRestoreStatus[] = [
-        "succeeded",
-        "failed",
-        "cancelled",
-        "server_error",
-      ];
-      if (TERMINAL.includes(status)) {
-        restoreRunBus.publish(restoreId, {
-          type: "complete",
-          status: status as "succeeded" | "failed" | "cancelled" | "server_error",
-          errorMessage: typeof patch?.errorMessage === "string" ? patch.errorMessage : undefined,
-        });
-      }
-    } catch {
-      // bus failures never block the FSM
-    }
+    this.publishTransitionEvent(restoreId, status, patch);
 
     // Notify on the terminal restore outcome (best-effort; never blocks the
     // FSM). `cancelled` is user-initiated — no notification. succeeded/failed
@@ -1124,7 +1372,8 @@ export class RestoreOrchestrator {
           const project = await repos.project.findById(row.projectId).catch(() => null);
           notification.emit({
             organizationId: row.organizationId,
-            eventType: status === "succeeded" ? "backup_restore.completed" : "backup_restore.failed",
+            eventType:
+              status === "succeeded" ? "backup_restore.completed" : "backup_restore.failed",
             resourceType: "backup_restore",
             resourceId: restoreId,
             payload: {
@@ -1136,8 +1385,36 @@ export class RestoreOrchestrator {
           });
         }
       } catch (err) {
-        console.error(`[restore-orchestrator] notify failed for ${restoreId}: ${safeErrorMessage(err)}`);
+        console.error(
+          `[restore-orchestrator] notify failed for ${restoreId}: ${safeErrorMessage(err)}`,
+        );
       }
+    }
+  }
+
+  /** Publish a transition whose durable write may be owned by either the
+   * ordinary FSM path or the atomic apply-admission claim. */
+  private publishTransitionEvent(
+    restoreId: string,
+    status: BackupRestoreStatus,
+    patch?: Parameters<typeof repos.backupRestore.transition>[2],
+  ): void {
+    try {
+      restoreRunBus.publish(restoreId, {
+        type: "transition",
+        status,
+        bytesRestored: typeof patch?.bytesRestored === "number" ? patch.bytesRestored : undefined,
+      });
+      const TERMINAL: BackupRestoreStatus[] = ["succeeded", "failed", "cancelled", "server_error"];
+      if (TERMINAL.includes(status)) {
+        restoreRunBus.publish(restoreId, {
+          type: "complete",
+          status: status as "succeeded" | "failed" | "cancelled" | "server_error",
+          errorMessage: typeof patch?.errorMessage === "string" ? patch.errorMessage : undefined,
+        });
+      }
+    } catch {
+      // bus failures never block the FSM
     }
   }
 
@@ -1179,16 +1456,25 @@ export class RestoreOrchestrator {
     if (!serviceRow) throw new Error("Target service disappeared");
     const project = await repos.project.findById(serviceRow.projectId);
     if (!project) throw new Error("Project disappeared");
-    const platform = await resolveDeploymentPlatform(
-      (await this.activeDeploymentMeta(project.id)) as Parameters<
-        typeof resolveDeploymentPlatform
-      >[0],
-      { organizationId: destinationRow.organizationId },
-    );
+    // Resolved through the SAME rule the backup used (source-platform.ts): a
+    // container-backed service whose adopt deployment says `runtimeMode: "bare"`
+    // must restore through Docker, exactly as it was captured through Docker. If
+    // these two diverged, a dump taken with `pg_dump` inside the container would be
+    // handed to a host that has no `pg_restore`.
+    const serviceHandle = await this.buildServiceHandle(serviceRow);
+    const target = await resolveSourceExecutor({
+      meta: await this.activeDeploymentMeta(project.id),
+      organizationId: destinationRow.organizationId,
+      containerId: serviceHandle.containerId,
+      serviceName: serviceRow.name,
+    });
     return {
-      executor: resolveExecutor(platform.platform.runtime.name, platform.platform.runtime),
-      serviceHandle: await this.buildServiceHandle(serviceRow),
-      runtime: platform.platform.runtime,
+      executor: target.executor,
+      // Same env enrichment the capture used, for the same reason: the producer's
+      // restore() authenticates with these values, and they have to be the ones the
+      // dump was taken with.
+      serviceHandle: await withContainerEnv(serviceHandle, target.executor),
+      runtime: target.runtime,
     };
   }
 
@@ -1214,10 +1500,7 @@ export class RestoreOrchestrator {
       mailServerId,
       organizationId,
     );
-    const executor = resolveExecutor(
-      targetPlatform.runtime.name,
-      targetPlatform.runtime,
-    );
+    const executor = resolveExecutor(targetPlatform.runtime.name, targetPlatform.runtime);
 
     const handle: ServiceHandle = {
       id: mailServerId,
@@ -1278,19 +1561,37 @@ export class RestoreOrchestrator {
     if (!project) throw new Error(`Project ${serviceRow.projectId} not found`);
 
     let containerId: string | null = null;
+    let containerRunning: boolean | null = null;
+    // Must match what CAPTURE resolved, for the reason this module exists: a dump
+    // taken as `$POSTGRES_USER` has to be replayed as the same one.
+    let environment: string | undefined;
     if (project.activeDeploymentId) {
       const dep = await repos.deployment.findById(project.activeDeploymentId);
       // Verified against the host — a restore into a container a redeploy has
       // since replaced would write into nothing (or the wrong thing).
       if (dep) {
-        containerId = await liveContainerIdForService(project, dep, serviceRow, {
+        environment = dep.environment ?? undefined;
+        const live = await liveContainerForService(project, dep, serviceRow, {
           projectId: project.id,
         });
-        containerId ??= await this.deploymentManagedContainerId(project, dep, serviceRow);
+        containerId = live.containerId;
+        containerRunning = live.running;
+        if (!containerId) {
+          // The narrow fallback the module doc names. We never observed this
+          // container's state, so it stays UNKNOWN rather than inheriting the
+          // miss above as "stopped".
+          containerId = await this.deploymentManagedContainerId(project, dep, serviceRow);
+          containerRunning = null;
+        }
       }
     }
 
-    return serviceHandleFor(serviceRow, { projectSlug: project.slug, containerId });
+    return serviceHandleFor(serviceRow, {
+      projectSlug: project.slug,
+      containerId,
+      containerRunning,
+      environment,
+    });
   }
 }
 

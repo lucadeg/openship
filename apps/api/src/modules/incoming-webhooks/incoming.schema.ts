@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { MAX_DEPLOY_SERVICE_TARGETS } from "./incoming-action";
 
 /**
  * Request-body schemas for the per-project incoming-webhook routes (declared in
@@ -8,8 +9,24 @@ import { Type } from "@sinclair/typebox";
 
 const ActionConfig = Type.Object(
   {
-    serviceId: Type.Optional(Type.String({ description: "deploy: restrict the redeploy to this service." })),
-    jobKey: Type.Optional(Type.String({ description: "job: the job to run (required when actionType='job')." })),
+    serviceId: Type.Optional(
+      Type.String({
+        minLength: 1,
+        pattern: "\\S",
+        description: "deploy: restrict the redeploy to this service.",
+      }),
+    ),
+    serviceIds: Type.Optional(
+      Type.Array(Type.String({ minLength: 1, pattern: "\\S" }), {
+        minItems: 1,
+        maxItems: MAX_DEPLOY_SERVICE_TARGETS,
+        uniqueItems: true,
+        description: "deploy: redeploy these services together once (omit = whole project).",
+      }),
+    ),
+    jobKey: Type.Optional(
+      Type.String({ description: "job: the job to run (required when actionType='job')." }),
+    ),
   },
   { additionalProperties: true },
 );

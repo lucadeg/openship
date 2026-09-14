@@ -172,7 +172,17 @@ const cancel = new Command("cancel")
   .argument("<id>", "Deployment ID")
   .action(
     run(async (id: string) => {
-      const res = await apiRequest(`/deployments/${id}/cancel`, { method: "POST" });
+      const res = await apiRequest<{
+        success: boolean;
+        pending?: boolean;
+        message?: string;
+      }>(`/deployments/${id}/cancel`, { method: "POST" });
+      if (res.pending || !res.success) {
+        throw new Error(
+          res.message ||
+            "Cancellation is still pending; wait for the deployment worker to stop before redeploying.",
+        );
+      }
       report(res, `Cancelled ${id}`);
     }),
   );

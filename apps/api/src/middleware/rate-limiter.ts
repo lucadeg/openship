@@ -31,10 +31,7 @@ import { POLICIES } from "../lib/rate-limit/policies";
 import { getRequestContext } from "../lib/request-context";
 import { env } from "../config";
 
-function resolveSubjectId(
-  c: Context,
-  subject: "ip" | "user" | "org" | "global",
-): string | null {
+function resolveSubjectId(c: Context, subject: "ip" | "user" | "org" | "global"): string | null {
   if (subject === "global") return "global";
   if (subject === "ip") {
     const ip = c.var.clientIp;
@@ -72,17 +69,19 @@ async function enforce(c: Context, policyId: PolicyId): Promise<Response | null>
   // brute-force throttling. The auth gate always enforces (proxied traffic
   // buckets under one loopback key when no client IP is trustable).
   const isAuthGate = policyId === "auth-tight" || policyId === "auth-loose";
-  if (!isAuthGate && !env.TRUST_PROXY && !env.OPENSHIP_PUBLIC_URL && isLoopbackPeer(peerAddress(c))) {
+  if (
+    !isAuthGate &&
+    !env.TRUST_PROXY &&
+    !env.OPENSHIP_PUBLIC_URL &&
+    isLoopbackPeer(peerAddress(c))
+  ) {
     return null;
   }
 
   const policy = POLICIES[policyId];
   const subjectId = resolveSubjectId(c, policy.subject);
   if (!subjectId) {
-    return c.json(
-      { error: "Missing client IP — request must come through the proxy" },
-      400,
-    );
+    return c.json({ error: "Missing client IP — request must come through the proxy" }, 400);
   }
   const result = await rateLimit({ policy: policyId, subjectId });
   if (!result.allowed) {
@@ -112,6 +111,26 @@ export function rateLimiterFor(policyId: PolicyId): MiddlewareHandler {
     await next();
   };
 }
+
+/**
+ * The Better Auth tree is a raw Hono catch-all rather than a secureRouter, so
+ * its one limiter must choose a policy centrally. POSTs are credential writes;
+ * the public invitation preview is also tight because its path contains a
+ * bearer claim. Ordinary session/OAuth GETs retain the anonymous read limit.
+ */
+export function authRouteRateLimitPolicy(method: string, path: string): PolicyId {
+  if (method.toUpperCase() === "POST") return "auth-tight";
+  if (path.startsWith("/api/auth/invitation-preview/")) return "auth-tight";
+  return "default-anon";
+}
+
+export const authRouteLimiter: MiddlewareHandler = async (c, next) => {
+  const policy = authRouteRateLimitPolicy(c.req.method, c.req.path);
+  const rejected = await enforce(c, policy);
+  if (rejected) return rejected;
+  c.set("rateLimitApplied" as never, true);
+  await next();
+};
 
 /**
  * Global default rate-limiter mounted on `/api`. Routes that set

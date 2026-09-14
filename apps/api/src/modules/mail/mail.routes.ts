@@ -131,6 +131,11 @@ r.delete(
   { tag: "mail_server:admin" },
   admin.deleteMailboxHandler,
 );
+r.post(
+  "/admin/:serverId/platform-mailbox/rotate",
+  { tag: "mail_server:admin" },
+  admin.rotatePlatformMailboxHandler,
+);
 
 /* ── Admin panel - aliases / forwards / catch-all ─────────────────── */
 r.get(
@@ -279,4 +284,3 @@ r.post(
 );
 
 export const mailRoutes = r.hono;
-

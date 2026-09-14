@@ -2,6 +2,7 @@ import { Navbar, Footer } from "@/components/landing";
 import {
   CUSTOM_TIERS,
   SELF_HOSTED,
+  STANDARD,
   TIERS,
   UI,
   chooseLabel,
@@ -181,6 +182,12 @@ export default function PricingPage() {
                       {free ? UI.ctaStart : chooseLabel(plan.name)}
                     </a>
 
+                    {/* A lead-in, not a bullet — it used to carry a checkmark, which
+                        made a sentence ending in a colon read as a feature. */}
+                    {plan.inheritedFrom && (
+                      <p className="pp-plan-inherits">{plan.inheritedFrom}</p>
+                    )}
+
                     <ul className="pp-plan-features">
                       {plan.features.map((f) => (
                         <li key={f}>
@@ -194,22 +201,45 @@ export default function PricingPage() {
               })}
             </div>
 
+            {/* What every tier includes, stated ONCE.
+                A tier's own bullets are its numbers; anything true on all of them
+                belongs here instead of repeated down each column — repeating it was
+                what made the audit log read as a Scale-only feature. */}
+            <div className="pp-standard">
+              <h3 className="pp-standard-title">{STANDARD.title}</h3>
+              <ul className="pp-standard-features">
+                {STANDARD.features.map((f) => (
+                  <li key={f}>
+                    <Check />
+                    <span>{f}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
             {CUSTOM_TIERS.map((plan) => (
               <div key={plan.id} className="pp-ent">
                 <div>
                   <h3 className="pp-ent-name">{plan.name}</h3>
                   <p className="pp-ent-lead">{plan.description}</p>
+                  {/* Name → lead → price, the same order as the four tier cards, so
+                      the eye finds "how much" in the same place it just left. */}
                   <p className="pp-ent-price">{UI.custom}</p>
                 </div>
 
-                <ul className="pp-ent-features">
-                  {plan.features.map((f) => (
-                    <li key={f}>
-                      <Check />
-                      <span>{f}</span>
-                    </li>
-                  ))}
-                </ul>
+                <div>
+                  {plan.inheritedFrom && (
+                    <p className="pp-ent-inherits">{plan.inheritedFrom}</p>
+                  )}
+                  <ul className="pp-ent-features">
+                    {plan.features.map((f) => (
+                      <li key={f}>
+                        <Check />
+                        <span>{f}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
 
                 <a href={plan.contactSales ?? CLOUD_CTA_HREF} className="pp-solid-cta">
                   {UI.ctaContact}

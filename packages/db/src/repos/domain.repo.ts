@@ -1,47 +1,75 @@
 import { eq, and, ne, lt, asc, inArray, sql } from "drizzle-orm";
-import { generateId } from "@repo/core";
+import { ConflictError, generateId } from "@repo/core";
 import type { Database } from "../client";
-import { domain, project, service } from "../schema";
+import { domain, orphanedResource, project, service } from "../schema";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export type Domain = typeof domain.$inferSelect;
 export type NewDomain = typeof domain.$inferInsert;
+type RepoTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 // ─── Repository ──────────────────────────────────────────────────────────────
 
 export function createDomainRepo(db: Database) {
   /**
-   * A project has exactly ONE primary domain: promoting one demotes the rest.
+   * A project has at most ONE primary domain: promoting one demotes the rest.
    *
-   * The single implementation behind both `setPrimary` (explicit switch) and
-   * `findOrCreate` (a write that asks for `isPrimary`). `findOrCreate` used to
-   * only SET the flag, so adding a second primary — the CLI attaching a real
-   * custom domain after a free `*.opsh.io` had been registered — left two rows
-   * flagged, and readers took whichever came back first: the Domains tab showed a
-   * stale, never-verified subdomain as the project's address while the box was
-   * served on the custom one.
+   * Every path that writes `isPrimary: true` comes through this helper. The
+   * project-row lock serializes competing promotions across API replicas, while
+   * the partial unique index is the final guard against writes outside this
+   * repository. Demotion and promotion share one transaction, so a failed
+   * promotion cannot commit after clearing the previous primary.
    */
-  async function promotePrimary(projectId: string, domainId: string) {
-    await db
+  async function promotePrimaryInTransaction(
+    tx: RepoTransaction,
+    projectId: string,
+    domainId: string,
+    patch: Partial<NewDomain> = {},
+  ): Promise<boolean> {
+    await tx
+      .select({ id: project.id })
+      .from(project)
+      .where(eq(project.id, projectId))
+      .for("update");
+
+    const [target] = await tx
+      .select({ projectId: domain.projectId })
+      .from(domain)
+      .where(eq(domain.id, domainId))
+      .for("update");
+    const targetProjectId = patch.projectId === undefined ? target?.projectId : patch.projectId;
+    if (!target || targetProjectId !== projectId) return false;
+
+    const now = new Date();
+    await tx
       .update(domain)
-      .set({ isPrimary: false, updatedAt: new Date() })
+      .set({ isPrimary: false, updatedAt: now })
       .where(
         and(eq(domain.projectId, projectId), eq(domain.isPrimary, true), ne(domain.id, domainId)),
       );
-    await db
+    await tx
       .update(domain)
-      .set({ isPrimary: true, updatedAt: new Date() })
+      .set({ ...patch, isPrimary: true, updatedAt: now })
       .where(eq(domain.id, domainId));
+    return true;
+  }
+
+  async function promotePrimary(
+    projectId: string,
+    domainId: string,
+    patch: Partial<NewDomain> = {},
+  ): Promise<boolean> {
+    return db.transaction((tx) => promotePrimaryInTransaction(tx, projectId, domainId, patch));
   }
 
   /**
    * Insert a row and return it as the DB actually stored it.
    *
    * `{ ...values } as Domain` was a lie for every column the caller didn't pass:
-   * `sslStatus`, `status`, `verified`, `verifyAttempts`, `externalIngress`,
-   * `manualSsl` and `ownerType` are NOT-NULL columns with DB DEFAULTS, so the
-   * returned object satisfied the type while carrying `undefined` for each of
+   * `sslStatus`, `sslChallenge`, `status`, `verified`, `verifyAttempts`,
+   * `externalIngress`, `manualSsl` and `ownerType` are NOT-NULL columns with DB
+   * DEFAULTS, so the returned object satisfied the type while carrying `undefined`
    * them. Readers that compare against the default then quietly take the wrong
    * branch — the deploy's first-issuance gate asks `row.sslStatus === "none"`, got
    * `undefined === "none"` → false, and skipped the certificate for every
@@ -51,7 +79,29 @@ export function createDomainRepo(db: Database) {
    * as the schema's defaults change.
    */
   async function insertAndRead(row: NewDomain & { id: string }): Promise<Domain> {
-    await db.insert(domain).values(row);
+    await db.transaction(async (tx) => {
+      await tx.insert(domain).values(row);
+      // A force-deleted project's route orphan owns the hostname until its
+      // physical vhost and managed registration are actually reclaimed. Check
+      // AFTER the unique domain insert: if this insert waited for the old
+      // project's cascade delete, READ COMMITTED now sees the orphan persisted
+      // immediately before it. Rolling back keeps GC from deleting a reused host.
+      const [pendingCleanup] = await tx
+        .select({ id: orphanedResource.id })
+        .from(orphanedResource)
+        .where(
+          and(
+            eq(orphanedResource.resourceType, "route"),
+            eq(orphanedResource.ref, row.hostname.toLowerCase()),
+          ),
+        )
+        .limit(1);
+      if (pendingCleanup) {
+        throw new ConflictError(
+          `Hostname ${row.hostname} is still being cleaned up from a deleted project`,
+        );
+      }
+    });
     // NON-THROWING on purpose. The INSERT has already landed, so a rejecting
     // read-back (connection blip, statement timeout, pool exhaustion) must not
     // turn a SUCCESSFUL create into a create failure — the caller would then
@@ -65,7 +115,7 @@ export function createDomainRepo(db: Database) {
     return created ?? ({ ...row, createdAt: new Date(), updatedAt: new Date() } as Domain);
   }
 
-  return {
+  const repository = {
     async findById(id: string) {
       return db.query.domain.findFirst({
         where: eq(domain.id, id),
@@ -104,10 +154,7 @@ export function createDomainRepo(db: Database) {
      * `limit`/`offset` and a deterministic order. The default (no
      * args) keeps the every-row contract for the internal callers.
      */
-    async listByProject(
-      projectId: string,
-      opts?: { limit?: number; offset?: number },
-    ) {
+    async listByProject(projectId: string, opts?: { limit?: number; offset?: number }) {
       return db.query.domain.findMany({
         where: eq(domain.projectId, projectId),
         ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
@@ -145,10 +192,7 @@ export function createDomainRepo(db: Database) {
      */
     async findByHostnameForProject(projectId: string, hostname: string) {
       return db.query.domain.findFirst({
-        where: and(
-          eq(domain.projectId, projectId),
-          eq(domain.hostname, hostname.toLowerCase()),
-        ),
+        where: and(eq(domain.projectId, projectId), eq(domain.hostname, hostname.toLowerCase())),
       });
     },
 
@@ -159,7 +203,11 @@ export function createDomainRepo(db: Database) {
      * Feeds the audit feed's search: a domain row stores `dom_…`, so "example.com"
      * only finds it once the hostname is resolved to ids.
      */
-    async searchIdsByHostname(organizationId: string, term: string, limit = 200): Promise<string[]> {
+    async searchIdsByHostname(
+      organizationId: string,
+      term: string,
+      limit = 200,
+    ): Promise<string[]> {
       const rows = await db
         .select({ id: domain.id })
         .from(domain)
@@ -198,12 +246,7 @@ export function createDomainRepo(db: Database) {
         .select({ hostname: domain.hostname })
         .from(domain)
         .innerJoin(project, eq(domain.projectId, project.id))
-        .where(
-          and(
-            eq(project.organizationId, organizationId),
-            sql`${project.deletedAt} IS NULL`,
-          ),
-        );
+        .where(and(eq(project.organizationId, organizationId), sql`${project.deletedAt} IS NULL`));
       return rows.map((r) => r.hostname);
     },
 
@@ -247,12 +290,7 @@ export function createDomainRepo(db: Database) {
         })
         .from(domain)
         .innerJoin(project, eq(domain.projectId, project.id))
-        .where(
-          and(
-            eq(project.organizationId, organizationId),
-            sql`${project.deletedAt} IS NULL`,
-          ),
-        )
+        .where(and(eq(project.organizationId, organizationId), sql`${project.deletedAt} IS NULL`))
         .orderBy(asc(project.name), asc(domain.hostname));
     },
 
@@ -267,6 +305,11 @@ export function createDomainRepo(db: Database) {
     },
 
     async update(id: string, data: Partial<NewDomain>) {
+      if (data.isPrimary === true) {
+        const row = await db.query.domain.findFirst({ where: eq(domain.id, id) });
+        const targetProjectId = data.projectId === undefined ? row?.projectId : data.projectId;
+        if (targetProjectId && (await promotePrimary(targetProjectId, id, data))) return;
+      }
       await db
         .update(domain)
         .set({ ...data, updatedAt: new Date() })
@@ -304,19 +347,35 @@ export function createDomainRepo(db: Database) {
 
     async create(data: Omit<NewDomain, "id"> & { verificationToken?: string }) {
       const id = generateId("dom");
-      return insertAndRead({
+      const wantsPrimary = data.isPrimary === true && !!data.projectId;
+      const created = await insertAndRead({
         id,
         ...data,
+        // Insert as secondary so the unique invariant remains true until the
+        // serialized promotion transaction can switch ownership.
+        ...(wantsPrimary ? { isPrimary: false } : {}),
         hostname: data.hostname.toLowerCase(),
         verificationToken: data.verificationToken ?? id,
       });
+      if (wantsPrimary && (await promotePrimary(data.projectId!, id))) {
+        return { ...created, isPrimary: true };
+      }
+      return created;
     },
 
     /**
-     * Return an existing domain by hostname, or create it if missing.
-     * Safe against unique-constraint races (concurrent deploys).
+     * Return an existing domain by hostname, or create it if missing, together
+     * with authoritative creation provenance.
+     *
+     * Callers that compensate/roll back a create must use this method instead
+     * of comparing against an earlier list query. That comparison has a TOCTOU
+     * window: another request can insert the hostname after the list and before
+     * this insert, causing the loser of the race to delete a row it did not
+     * create.
      */
-    async findOrCreate(data: Omit<NewDomain, "id"> & { verificationToken?: string }) {
+    async findOrCreateWithStatus(
+      data: Omit<NewDomain, "id"> & { verificationToken?: string },
+    ): Promise<{ domain: Domain; created: boolean }> {
       const hostname = data.hostname.toLowerCase();
       const existing = await db.query.domain.findFirst({
         where: eq(domain.hostname, hostname),
@@ -328,39 +387,59 @@ export function createDomainRepo(db: Database) {
           // just get the flag, there are no siblings to demote.
           if (existing.projectId) await promotePrimary(existing.projectId, existing.id);
           else {
-            await db.update(domain)
+            await db
+              .update(domain)
               .set({ isPrimary: true, updatedAt: new Date() })
               .where(eq(domain.id, existing.id));
           }
-          return { ...existing, isPrimary: true };
+          return { domain: { ...existing, isPrimary: true }, created: false };
         }
-        return existing;
+        return { domain: existing, created: false };
       }
 
       const id = generateId("dom");
+      const wantsPrimary = data.isPrimary === true && !!data.projectId;
       const row = {
         id,
         ...data,
+        ...(wantsPrimary ? { isPrimary: false } : {}),
         hostname,
         verificationToken: data.verificationToken ?? id,
       };
       try {
         const created = await insertAndRead(row);
-        if (row.isPrimary && row.projectId) {
-          await promotePrimary(row.projectId, id);
-          return { ...created, isPrimary: true };
+        if (wantsPrimary && row.projectId && (await promotePrimary(row.projectId, id))) {
+          return { domain: { ...created, isPrimary: true }, created: true };
         }
-        return created;
+        return { domain: created, created: true };
       } catch (err: any) {
         // Handle race: another deploy inserted between our check and insert
         if (err?.message?.includes("unique") || err?.code === "23505") {
           const raced = await db.query.domain.findFirst({
             where: eq(domain.hostname, hostname),
           });
-          if (raced) return raced;
+          if (raced) {
+            if (data.isPrimary && !raced.isPrimary) {
+              if (raced.projectId) await promotePrimary(raced.projectId, raced.id);
+              else {
+                await db
+                  .update(domain)
+                  .set({ isPrimary: true, updatedAt: new Date() })
+                  .where(eq(domain.id, raced.id));
+              }
+              return { domain: { ...raced, isPrimary: true }, created: false };
+            }
+            return { domain: raced, created: false };
+          }
         }
         throw err;
       }
+    },
+
+    /** Return an existing domain by hostname, or create it if missing. */
+    async findOrCreate(data: Omit<NewDomain, "id"> & { verificationToken?: string }) {
+      const result = await repository.findOrCreateWithStatus(data);
+      return result.domain;
     },
 
     async markVerified(id: string) {
@@ -406,32 +485,23 @@ export function createDomainRepo(db: Database) {
       const { promote, ...ssl } = data;
       await db.transaction(async (tx) => {
         const now = new Date();
+        const patch: Partial<NewDomain> = {
+          verified: true,
+          verifiedAt: now,
+          status: "active",
+          verifyAttempts: 0,
+          lastVerifyError: null,
+          lastCheckedAt: now,
+          ...ssl,
+        };
+        if (promote) {
+          const promoted = await promotePrimaryInTransaction(tx, promote.projectId, id, patch);
+          if (promoted) return;
+        }
         await tx
           .update(domain)
-          .set({
-            verified: true,
-            verifiedAt: now,
-            status: "active",
-            verifyAttempts: 0,
-            lastVerifyError: null,
-            lastCheckedAt: now,
-            ...ssl,
-            updatedAt: now,
-          })
+          .set({ ...patch, updatedAt: now })
           .where(eq(domain.id, id));
-        if (promote) {
-          await tx
-            .update(domain)
-            .set({ isPrimary: false, updatedAt: now })
-            .where(
-              and(
-                eq(domain.projectId, promote.projectId),
-                eq(domain.isPrimary, true),
-                ne(domain.id, id),
-              ),
-            );
-          await tx.update(domain).set({ isPrimary: true, updatedAt: now }).where(eq(domain.id, id));
-        }
       });
     },
 
@@ -441,11 +511,7 @@ export function createDomainRepo(db: Database) {
      * (so a still-propagating domain stays `pending`, a misconfigured one
      * eventually reads `failed`). Returns the new attempt count.
      */
-    async recordVerifyFailure(
-      id: string,
-      error: string,
-      failAfter = 8,
-    ): Promise<number> {
+    async recordVerifyFailure(id: string, error: string, failAfter = 8): Promise<number> {
       const row = await db.query.domain.findFirst({ where: eq(domain.id, id) });
       const attempts = (row?.verifyAttempts ?? 0) + 1;
       await db
@@ -523,10 +589,7 @@ export function createDomainRepo(db: Database) {
     /** Find all domains needing SSL renewal */
     async findExpiringSsl(beforeDate: Date) {
       return db.query.domain.findMany({
-        where: and(
-          eq(domain.sslStatus, "active"),
-          lt(domain.sslExpiresAt, beforeDate),
-        ),
+        where: and(eq(domain.sslStatus, "active"), lt(domain.sslExpiresAt, beforeDate)),
       });
     },
 
@@ -569,7 +632,11 @@ export function createDomainRepo(db: Database) {
           ),
         );
       }
-      return db.select().from(domain).where(and(...conds)).limit(limit);
+      return db
+        .select()
+        .from(domain)
+        .where(and(...conds))
+        .limit(limit);
     },
 
     async findPendingVerification(
@@ -608,4 +675,6 @@ export function createDomainRepo(db: Database) {
       await promotePrimary(projectId, domainId);
     },
   };
+
+  return repository;
 }

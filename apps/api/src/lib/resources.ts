@@ -23,6 +23,7 @@ import {
   detectTier,
   validateAgainstCapacity,
   type HostCapacity,
+  type ProjectResources,
   type ResourceTier,
 } from "@repo/core";
 
@@ -42,25 +43,6 @@ function extractCpuCores(raw: Record<string, unknown>): number | undefined {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
-export interface DeploymentResources {
-  build: ResourceConfig;
-  production: ResourceConfig;
-  sleepMode: string;
-  port: number;
-  /** Which preset the saved production values correspond to, so a picker can
-   *  highlight the current selection without re-deriving it client-side. */
-  tier: ResourceTier;
-  /** What the target machine actually has — the ceiling for a custom value.
-   *  Only present when a capacity was actually probed (the resources endpoint);
-   *  ABSENT on the project list/info, which must not open an SSH connection per
-   *  row just to fill a field nothing reads there. `source: "unknown"` means the
-   *  probe ran and failed, so no ceiling is enforced — distinct from absent. */
-  capacity?: HostCapacity;
-  /** False on self-hosted, where "no limit" is a valid (and default) choice.
-   *  True on cloud, where a metered workspace must be sized. */
-  requiresLimit: boolean;
-}
-
 /**
  * Encode ResourceConfig → display format (for API responses).
  *
@@ -73,7 +55,7 @@ export function encodeResources(
   sleepMode = "auto_sleep",
   port = 3000,
   opts?: { isCloud?: boolean; capacity?: HostCapacity },
-): DeploymentResources {
+): ProjectResources {
   const isCloud = opts?.isCloud ?? false;
   const prod = production ?? (isCloud ? { ...DEFAULT_RESOURCE_CONFIG } : { ...UNLIMITED_RESOURCES });
   return {

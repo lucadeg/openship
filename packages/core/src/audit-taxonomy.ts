@@ -55,7 +55,8 @@ export const AUDIT_CATEGORIES = [
   {
     id: "agent",
     label: "AI agents",
-    description: "What connected assistants did over MCP — every tool call, and the scope they hold.",
+    description:
+      "What connected assistants did over MCP — every tool call, and the scope they hold.",
   },
   {
     id: "security",
@@ -165,6 +166,20 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     label: "App deletion refused",
     tone: "warning",
     description: "A delete was refused — something still depends on this app.",
+  },
+  "project.deletion.failed": {
+    category: "apps",
+    action: "failed to delete",
+    label: "App deletion failed",
+    tone: "warning",
+    description: "Cleanup did not complete, so the app record was kept for a safe retry.",
+  },
+  "project.build_cache.cleared": {
+    category: "apps",
+    action: "cleared the Docker build cache for",
+    label: "Build cache cleared",
+    tone: "warning",
+    description: "Unused build cache was removed from the app's Docker host.",
   },
   "project:write": {
     category: "apps",
@@ -399,6 +414,14 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     action: "removed the server",
     label: "Server removed",
     tone: "danger",
+  },
+  "server.removal.rejected": {
+    category: "servers",
+    action: "tried to remove the server",
+    label: "Server removal refused",
+    tone: "warning",
+    description:
+      "A removal was refused because a workload could not be torn down, or was destroyed but left a resource behind for cleanup. The server row was kept so those resources can still be reclaimed.",
   },
   "server.exec": {
     category: "servers",
@@ -661,6 +684,20 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     tone: "warning",
     description: "A full database dump left this instance.",
   },
+  "instance.data.receive_code_created": {
+    category: "security",
+    action: "created a direct data-transfer receive code",
+    label: "Data-transfer receive code created",
+    tone: "warning",
+    description: "A short-lived code was created to receive instance data directly.",
+  },
+  "instance.data.sent": {
+    category: "security",
+    action: "sent instance data to another instance",
+    label: "Instance data sent",
+    tone: "warning",
+    description: "Selected instance data was transferred directly to another instance.",
+  },
   "instance.data.imported": {
     category: "security",
     action: "imported instance data",
@@ -789,6 +826,41 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     action: "installed the GitHub app on",
     label: "GitHub app installed",
     tone: "info",
+  },
+  "github.source.created": {
+    category: "system",
+    action: "registered the GitHub App source",
+    label: "GitHub App source registered",
+    tone: "info",
+    description:
+      "An organization-owned GitHub App was verified and stored. Secret values are never recorded.",
+  },
+  "github.source.updated": {
+    category: "system",
+    action: "updated the GitHub App source",
+    label: "GitHub App source updated",
+    tone: "info",
+    description: "A GitHub App's identity, endpoint, or encrypted credentials changed.",
+  },
+  "github.source.verified": {
+    category: "system",
+    action: "verified the GitHub App source",
+    label: "GitHub App source verified",
+    tone: "info",
+  },
+  "github.source.defaulted": {
+    category: "system",
+    action: "made the default GitHub App source",
+    label: "Default GitHub App source changed",
+    tone: "info",
+  },
+  "github.source.deleted": {
+    category: "system",
+    action: "deleted the GitHub App source",
+    label: "GitHub App source deleted",
+    tone: "warning",
+    description:
+      "The local App credentials and installation bindings were removed; the GitHub App itself was not uninstalled on GitHub.",
   },
   "github.disconnect": {
     category: "system",

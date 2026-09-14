@@ -1,5 +1,12 @@
 import { api, getApiBaseUrl, getActiveOrganizationId } from "./client";
 import { endpoints } from "./endpoints";
+// Removal types + the timeout rule live with the pure helpers so the modal and this
+// client share one definition (and so the rule is testable without React).
+import {
+  serverRemovalTimeoutMs,
+  type ServerDeletionPreview,
+  type ServerRemovalResult,
+} from "../server-removal";
 
 /**
  * Client budget for an ad-hoc SSH probe.
@@ -755,9 +762,32 @@ export const systemApi = {
   updateServerEntry: (id: string, data: Record<string, unknown>) =>
     api.patch<ServerInfo>(endpoints.system.server(id), data),
 
-  /** Delete a server */
-  deleteServerEntry: (id: string) =>
-    api.delete<{ ok: boolean }>(endpoints.system.server(id)),
+  /** What "Remove server" is about to take with it — every project/app bound to the
+   *  box plus the server-scoped records that cascade. Read-only; safe on modal open. */
+  serverDeletionPreview: (id: string) =>
+    api.get<{ ok: boolean; preview: ServerDeletionPreview }>(
+      endpoints.system.serverDeletionPreview(id),
+    ),
+
+  /**
+   * Remove a server, resolving the fate of every workload bound to it.
+   *
+   * `destroyOnSource` is the operator's explicit opt-in to stop and delete the
+   * containers on the machine; without it the workloads are removed from Openship
+   * only and keep running. Flags travel as query params (same idiom as
+   * `projectsApi.delete`), and the timeout scales with the workload count because
+   * each teardown is its own SSH round-trip — a short client timeout would abort a
+   * request the server then finishes anyway.
+   */
+  deleteServerEntry: (
+    id: string,
+    opts: { destroyOnSource?: boolean; workloadCount?: number } = {},
+  ) => {
+    const qs = opts.destroyOnSource ? "?destroyOnSource=true" : "";
+    return api.delete<ServerRemovalResult>(`${endpoints.system.server(id)}${qs}`, {
+      timeout: serverRemovalTimeoutMs(opts),
+    });
+  },
 
   // ── Native-module updates (per-server) ─────────────────────────────────────
 

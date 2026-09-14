@@ -52,6 +52,18 @@ export interface LiveContainerLike {
 
 export type LiveMatchKind = "label" | "name" | "trackedId" | "compose";
 
+const OWNED_CONTAINER_TIERS = ["label", "name", "trackedId"] as const;
+
+/** Compose labels are a recovery key only for an explicitly adopted stack.
+ * Compose project names and Openship slugs are different namespaces; using a
+ * slug match for normal deployments lets an unrelated same-named stack claim
+ * the service. */
+export function liveMatchTiersForDeployment(
+  meta: Record<string, unknown> | null | undefined,
+): readonly LiveMatchKind[] | undefined {
+  return meta?.adopt === true ? undefined : OWNED_CONTAINER_TIERS;
+}
+
 export interface LiveServiceMatch {
   /** The container this service ACTUALLY runs as — what logs/terminal/start
    *  must target. Null when nothing on the host matches. */

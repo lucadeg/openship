@@ -6,6 +6,7 @@ import {
   pricingUi,
   resolvePlans,
   resolveSelfHosted,
+  resolveStandard,
   type ActiveCampaign,
   type PlanDefinition,
 } from "@repo/core";
@@ -45,6 +46,13 @@ const LOCALE = "en";
 
 export const UI = pricingUi(LOCALE);
 export const SELF_HOSTED = resolveSelfHosted(LOCALE);
+/**
+ * What every cloud tier includes, stated once beside the grid.
+ *
+ * Safe at module scope by the rule above: it is a pure function of the committed
+ * catalog, with no dependence on the current instant.
+ */
+export const STANDARD = resolveStandard(LOCALE);
 
 const PLANS = resolvePlans(LOCALE);
 

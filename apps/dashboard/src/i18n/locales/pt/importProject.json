@@ -414,5 +414,14 @@
     "rowServices": "Serviços",
     "rowProject": "Projeto",
     "rowType": "Tipo"
+  },
+  "configDiagnostics": {
+    "title": "Parte do openship.json deste repositório não foi aplicada",
+    "description": "Os campos listados abaixo foram ignorados; o resto do arquivo foi aplicado. O deploy vai continuar.",
+    "titleWholeFile": "O openship.json deste repositório foi ignorado",
+    "descriptionWholeFile": "Nada do arquivo foi aplicado. O deploy vai continuar com as configurações que o Openship detectou.",
+    "refused": "Recusado",
+    "unrecognized": "Não reconhecido",
+    "hint": "Execute `openship config validate` no repositório para verificar o arquivo antes do próximo deploy."
   }
 }

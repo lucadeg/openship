@@ -237,9 +237,10 @@ describe("sanitizeLogsForPersistence", () => {
 });
 
 /**
- * The deploy pipeline builds `https://x-access-token:<token>@github.com/o/r.git`
- * (injectGitToken, packages/adapters/src/runtime/git-clone.ts:30) and interpolates it
- * into a shell command whose git output is persisted. So the credential is one the
+ * The deploy pipeline builds `https://<token>:x-oauth-basic@github.com/o/r.git` for a
+ * user token and `https://x-access-token:<token>@…` for an App installation token
+ * (injectGitToken / gitCredentialPair, packages/adapters/src/runtime/git-clone.ts) and
+ * interpolates it into a shell command whose git output is persisted. So the credential is one the
  * pipeline manufactures itself — masking project env upstream does nothing for it,
  * and `build_session.logs` outlives the ~60-minute token in backups and exports.
  */
@@ -250,6 +251,15 @@ describe("redactCredentials", () => {
     );
     expect(out).not.toContain("ghs_AbCdEf0123456789xyz");
     expect(out).not.toContain("x-access-token");
+    expect(out).toContain("https://***@github.com/acme/app.git");
+  });
+
+  it("redacts the user-token pair — secret in the USERNAME slot", () => {
+    const out = redactCredentials(
+      "Cloning into 'app'... https://ghp_0123456789abcdefghij:x-oauth-basic@github.com/acme/app.git",
+    );
+    expect(out).not.toContain("ghp_0123456789abcdefghij");
+    expect(out).not.toContain("x-oauth-basic");
     expect(out).toContain("https://***@github.com/acme/app.git");
   });
 

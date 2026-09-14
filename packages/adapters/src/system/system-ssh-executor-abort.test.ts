@@ -12,6 +12,7 @@ import { describe, it, expect, vi } from "vitest";
 class FakeChild extends EventEmitter {
   stdout = new EventEmitter();
   stderr = new EventEmitter();
+  stdin = { write: vi.fn(), end: vi.fn() };
   kill = vi.fn((_signal?: string) => {
     // Real ssh dies and the close event carries no exit code.
     this.emit("close", null);
@@ -60,6 +61,21 @@ describe("SystemSshExecutor.streamExec abort", () => {
     // code 0, not the killed child's null→1: an abort is the caller's own
     // decision, so it must not read as a transport failure (matches SshExecutor).
     await expect(promise).resolves.toEqual({ code: 0, output: "" });
+    expect(spawned.at(-1)!.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("binds ordinary exec to the ambient deployment signal and waits for child close", async () => {
+    const executor = new SystemSshExecutor(CONFIG);
+    const controller = new AbortController();
+    const before = spawned.length;
+    const pending = executor.runWithAbortSignal(controller.signal, () => executor.exec("sleep 999"));
+    await vi.waitFor(() => {
+      if (spawned.length === before) throw new Error("not spawned yet");
+    });
+
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
     expect(spawned.at(-1)!.kill).toHaveBeenCalledWith("SIGKILL");
   });
 

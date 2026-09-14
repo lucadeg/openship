@@ -19,9 +19,9 @@ credentials are stored.
 </Callout>
 
 <Callout title="Both cloud and self-hosted" type="info">
-This module is mounted on every instance. Two routes — `GET /api/github/local-status` and
-`GET /api/github/connect/poll` — are self-hosted only (they back the local `gh` CLI login flow) and
-return 404 on Openship Cloud.
+This module is mounted on every instance. The local identity routes and every `/api/github/sources` route
+are self-hosted only and return 404 on Openship Cloud. Source management additionally requires the active
+workspace's `owner` role.
 </Callout>
 
 ## Endpoints
@@ -33,8 +33,18 @@ return 404 on Openship Cloud.
 | `GET /api/github/local-status` | `github:read` | Whether the host has `gh` CLI auth available (self-hosted only). |
 | `GET /api/github/connect/poll` | `github:read` | Poll device-flow login status (self-hosted only). |
 | `POST /api/github/connect` | `github:write` | Start or advance the connection flow. |
+| `POST /api/github/installations/claim` | `github:write` | Verify and bind a self-hosted App setup redirect to the active workspace. |
 | `GET /api/github/connect/redirect` | public | GitHub OAuth callback — browser navigates here, no session yet. |
 | `POST /api/github/disconnect` | `github:admin` | Disconnect one source or all. |
+| `GET /api/github/sources` | `github:admin` + owner | List workspace-owned Apps and callback configuration. |
+| `POST /api/github/sources/manifest` | `github:admin` + owner | Start a GitHub.com App manifest flow. |
+| `POST /api/github/sources/manifest/convert` | `github:admin` + owner | Convert the one-time manifest code and save the App. |
+| `POST /api/github/sources/manual` | `github:admin` + owner | Verify and register an existing GitHub/GHE App. |
+| `PATCH /api/github/sources/:id` | `github:admin` + owner | Verify and update App identity, endpoints, or credentials. |
+| `DELETE /api/github/sources/:id` | `github:admin` + owner | Remove local credentials and reconcile its project bindings. |
+| `POST /api/github/sources/:id/verify` | `github:admin` + owner | Recheck the stored App credentials. |
+| `POST /api/github/sources/:id/default` | `github:admin` + owner | Make this App the workspace's preferred source. |
+| `POST /api/github/sources/:id/install` | `github:admin` + owner | Create a one-time, workspace-bound App installation URL. |
 | `GET /api/github/repos` | `github:list` | List the connected account's repos (optionally `?owner=`). |
 | `POST /api/github/repos` | `github:write` | Create a repository. |
 | `GET /api/github/orgs/:org/repos` | `github:list` | List repositories in an org / account. |
@@ -53,7 +63,8 @@ return 404 on Openship Cloud.
 `GET /api/github/home` is the dashboard's single entry point: it returns `{ state, accounts, repos }` in one
 round trip, filtered to the accounts and repos your member role is allowed to see.
 `GET /api/github/status` is narrower — the Settings card's data source — returning `{ state, accounts,
-installUrl, cloudUnreachable }`.
+installUrl, cloudUnreachable, customSourcesConfigured }`. The last field tells clients that App lifecycle
+controls belong to the workspace source manager rather than the legacy Openship App connection.
 
 ```bash
 curl https://your-host/api/github/home \
@@ -103,6 +114,75 @@ remove it from github.com (Openship reacts to the uninstall webhook).
 ```bash
 openship api /github/disconnect -X POST -d '{"source":"cli"}'
 ```
+
+This endpoint does not delete a workspace-owned source. Use `DELETE /api/github/sources/:id` for that
+explicit owner-only operation.
+
+## Workspace-owned GitHub App sources
+
+These endpoints are available only on self-hosted instances. All reads are sanitized: private keys, client
+secrets, webhook secrets, and their encrypted envelope are never returned.
+
+### List sources
+
+```bash
+openship api /github/sources
+```
+
+Returns `{ data, configuration }`. `configuration` contains `publicReady`, `publicUrl`, `setupUrl`, and
+`webhookUrl`. Each source in `data` contains public App metadata, health, default status, and its claimed
+installations.
+
+### One-click manifest
+
+Start the GitHub.com flow with:
+
+```bash
+openship api /github/sources/manifest -X POST -d '{"name":"Acme GitHub"}'
+```
+
+The response contains `{ url, manifest }`. Submit `manifest` as a JSON string in a form field named
+`manifest` to `url`; the dashboard does this automatically. GitHub redirects to the configured setup page
+with `code` and `state`, which must be sent to:
+
+```text
+POST /api/github/sources/manifest/convert
+{ "code": "…", "state": "…" }
+```
+
+Conversion consumes the user/workspace-bound state exactly once, encrypts GitHub's generated credentials,
+and returns `{ data, installUrl }`.
+
+### Manual registration and GitHub Enterprise Server
+
+```text
+POST /api/github/sources/manual
+```
+
+<TypeTable
+  type={{
+    name: { type: 'string', description: 'Workspace-facing source label.', required: true },
+    appId: { type: 'integer', description: 'Numeric GitHub App ID.', required: true },
+    clientId: { type: 'string', description: 'Optional App client ID.' },
+    clientSecret: { type: 'string', description: 'Optional App client secret; stored encrypted.' },
+    privateKeyPem: { type: 'string', description: 'Complete App private key PEM; stored encrypted.', required: true },
+    webhookSecret: { type: 'string', description: 'Matching App webhook secret, at least 16 characters; stored encrypted.', required: true },
+    webBaseUrl: { type: 'string', description: 'GitHub web origin. Defaults to https://github.com.' },
+    apiBaseUrl: { type: 'string', description: 'REST API base. Defaults to https://api.github.com; GHE commonly uses https://host/api/v3.' },
+    isDefault: { type: 'boolean', description: 'Prefer this App when more than one source covers an owner.' },
+  }}
+/>
+
+The API signs an App JWT and verifies `/app` before saving the source. It returns `{ data, installUrl }`.
+
+`PATCH /api/github/sources/:id` accepts the same identity and endpoint fields, all optional. Omitted secret
+fields retain their existing encrypted values. App ID or API URL cannot change while the source has claimed
+installations. `POST .../verify` refreshes public App metadata and marks bad credentials as needing attention.
+
+Making a source default atomically rebinds existing projects for every GitHub owner installed on that source.
+Deleting a source promotes another active source when possible and rebinds affected projects; projects with no
+replacement lose their installation binding and auto-deploy is disabled. Deleting locally does not uninstall
+the GitHub App itself.
 
 ## Create a repository
 
@@ -203,6 +283,9 @@ On a self-hosted instance connected to Openship Cloud, GitHub OAuth and App-inst
 through openship.io. If the SaaS is unreachable, `connect` returns 503 rather than a dead install link. Check
 network / the cloud connection in Settings, then retry.
 </Callout>
+
+An instance configured with its [own self-hosted GitHub App](/docs/guides/self-hosted-github-app) does not
+use this cloud proxy; `GITHUB_AUTH_MODE=auto` selects the complete local App configuration first.
 
 <Callout title="404 on a repo route" type="error">
 The `:owner/:repo` isn't visible to the active GitHub source (private, not granted to your member role, or

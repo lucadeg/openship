@@ -84,12 +84,10 @@ r.get(
   ctrl.getById,
 );
 r.post(
-  // #336: real (unmasked) compose env for the keys named in the body — never the
-  // whole map. Write-gated on purpose: read-only callers only ever see the masked
-  // map from GET /:serviceId. POST, not GET, because the requested key names are
-  // a body (out of proxy access logs and browser history) and are unbounded by
-  // URL length. No mcp block: revealing secrets stays a dashboard action, off the
-  // automation surface.
+  // #336: real env for named keys only. With `environment`, reads service-scoped
+  // env_var rows; without it, reads compose-inline values for import/config forms.
+  // Write-gated on purpose. POST keeps key names out of URLs and proxy logs.
+  // No mcp block: revealing secrets stays a dashboard action, off automation.
   "/:serviceId/env-reveal",
   { tag: "project:service:write" },
   cloudProjectProxy,
@@ -141,7 +139,10 @@ r.patch(
   {
     tag: "project:service:write",
     body: UpdateServiceBody,
-    mcp: { description: "Update a service's configuration." },
+    mcp: {
+      description:
+        "Update a service's configuration. Partial: an omitted field is left alone. `environment` and `advanced` are MERGED onto the stored values rather than replacing them — omit a key to keep it, set a key to null to remove it, send null for the whole field to clear it. Env values read back masked as `••••••••`; echo the sentinel to keep one unchanged. Every other field (`ports`, `volumes`, `dependsOn`, `publicEndpoints`, …) REPLACES its stored value wholesale, so send the complete list.",
+    },
   },
   cloudProjectProxy,
   ctrl.update,
@@ -170,7 +171,14 @@ r.post(
 /* ─── Per-service container actions ─────────────────────────────────────── */
 r.post("/:serviceId/start", { tag: "project:service:write", mcp: { description: "Start this service's container." } }, cloudProjectProxy, ctrl.startContainer);
 r.post("/:serviceId/stop", { tag: "project:service:write", mcp: { description: "Stop this service's container." } }, cloudProjectProxy, ctrl.stopContainer);
-r.post("/:serviceId/restart", { tag: "project:service:write", mcp: { description: "Restart this service's container." } }, cloudProjectProxy, ctrl.restartContainer);
+/* `restart` is a BOUNCE, not a config apply — a container's environment is fixed
+ * when it is created. With pending env changes it answers 409 SERVICE_CONFIG_STALE
+ * naming the drifted keys instead of silently re-running the old config (GH-615);
+ * `?force=true` bounces anyway. Declaring a `body`/`query` schema here would be
+ * wrong twice over: `RouteSpec` has no `query` field, and a `body` schema makes
+ * secureRouter mount tbValidator("json"), which 400s the CLI's bodyless POST
+ * (its api-client always sets Content-Type: application/json). */
+r.post("/:serviceId/restart", { tag: "project:service:write", mcp: { description: "Restart (bounce) this service's container. Does NOT apply changed env/config — it answers 409 SERVICE_CONFIG_STALE when env changed since the running container was created. To APPLY config, trigger a refresh deploy: POST /api/deployments {refresh:true, serviceIds:[serviceId]}. Pass ?force=true to bounce despite pending changes." } }, cloudProjectProxy, ctrl.restartContainer);
 
 /* ─── Service environment variables ─────────────────────────────────────── */
 r.get(

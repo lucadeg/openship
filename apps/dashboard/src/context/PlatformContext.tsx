@@ -25,6 +25,8 @@ interface PlatformContextValue {
    *  state without a restart. */
   hostControlEnabled: boolean;
   authMode: "cloud" | "local" | "none";
+  /** Running server release reported by /health/env. */
+  version?: string;
   /** What the INSTANCE declares it is (from /health/env). Used by the settings
    *  toggle to show the operator what the box-wide default currently is. */
   productMode: ProductView;
@@ -50,10 +52,7 @@ const PlatformContext = createContext<PlatformContextValue | undefined>(undefine
 
 type CloudConnectionPlatformState = Pick<PlatformContextValue, "selfHosted" | "deployMode">;
 
-export function canUseCloudConnection({
-  selfHosted,
-  deployMode,
-}: CloudConnectionPlatformState) {
+export function canUseCloudConnection({ selfHosted, deployMode }: CloudConnectionPlatformState) {
   return selfHosted || deployMode === "desktop";
 }
 
@@ -72,6 +71,7 @@ interface PlatformProviderProps {
   isServerHost?: boolean;
   hostControlEnabled?: boolean;
   authMode?: "cloud" | "local" | "none";
+  version?: string;
   productMode?: ProductView;
   productView?: ProductView;
   cloudAuthUrl?: string;
@@ -95,6 +95,7 @@ export function PlatformProvider({
   isServerHost = false,
   hostControlEnabled = false,
   authMode = "local",
+  version,
   productMode = "platform",
   productView = "platform",
   cloudAuthUrl = CLOUD_DASHBOARD_URL,
@@ -134,6 +135,7 @@ export function PlatformProvider({
         isServerHost,
         hostControlEnabled,
         authMode,
+        version,
         productMode,
         productView,
         setProductView,

@@ -68,7 +68,7 @@ export async function resolveSmartRoute(
         opts.commitShaBefore,
         opts.commitSha,
       ).catch(() => null);
-      if (!compare) {
+      if (!compare || compare.truncated) {
         resolvedForceAll = true; // can't determine the diff → safe full rebuild
       } else {
         const files = new Set(compare.files);

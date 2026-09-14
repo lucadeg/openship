@@ -199,6 +199,63 @@ jobs:
           OPENSHIP_E2E_IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
         run: bun run --cwd apps/api test:e2e
 
+  # Does the dashboard image actually CONTAIN every page in src/app?
+  #
+  # `next build` compiles whatever tree it is handed, so a page removed from the build
+  # context before it runs is invisible: no error, and the emitted manifest agrees with
+  # the truncated tree. GH-622 is what that costs — `**/build` in .dockerignore deleted
+  # src/app/(dashboard)/(deployment)/build/[id], the v0.6.6 dashboard shipped 52 routes
+  # instead of 53, and every deployment-detail link 404'd while this workflow stayed
+  # green. Nothing here built or inspected the image, so nothing could have noticed.
+  #
+  # The comparison has to be between the IMAGE and a full checkout — that is the pair a
+  # truncated context cannot make agree. Positioned like update-e2e: the per-arch builds
+  # have pushed by digest under no tag, so this reads the exact bytes merge-images is
+  # about to tag, and a failure leaves them unreferenced in the registry.
+  dashboard-routes:
+    name: Audit dashboard route surface
+    needs: build-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # This runner is amd64. The artifact holds one empty file NAMED for the digest
+      # (see "Export digest" in build-images).
+      - name: Resolve the new dashboard image digest
+        uses: actions/download-artifact@v8
+        with:
+          name: digests-dashboard-amd64
+          path: /tmp/dashboard-digest
+
+      - name: Extract the route manifest from the image
+        run: |
+          set -euo pipefail
+          digest="$(ls /tmp/dashboard-digest | head -1)"
+          if [ -z "$digest" ]; then
+            echo "No digest artifact — build-images did not export one for dashboard/amd64." >&2
+            exit 1
+          fi
+          image="ghcr.io/${{ github.repository_owner }}/openship-dashboard@sha256:${digest}"
+          echo "Auditing $image"
+          docker pull -q "$image"
+          # `docker cp` off a created-but-never-started container: no entrypoint, no
+          # runtime env, and it fails loudly if the path is absent.
+          docker create --name dash-audit "$image" >/dev/null
+          docker cp dash-audit:/app/apps/dashboard/.next/app-path-routes-manifest.json /tmp/image-routes.json
+          docker rm -f dash-audit >/dev/null
+
+      - name: Every src/app page must be in the image
+        run: node apps/dashboard/scripts/check-routes.mjs /tmp/image-routes.json
+
   merge-images:
     name: Publish ${{ matrix.image }} (manifest)
     # `gate` as well as the builds: this job is where images become PULLABLE (the
@@ -210,7 +267,7 @@ jobs:
     # Gated on the manual path too. That path never moves `:latest`, but it does
     # publish tags a box can be pointed at, and the wiring stays simpler than a
     # conditional that has to be right about which publishes are "only tests".
-    needs: [gate, build-images, update-e2e]
+    needs: [gate, build-images, update-e2e, dashboard-routes]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false

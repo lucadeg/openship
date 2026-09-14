@@ -186,7 +186,13 @@ export function buildDomainFanoutRegistrations(input: {
     const proxyLocations: RouteProxyLocation[] = [];
     for (const loc of route.locations) {
       const url = input.resolveTargetUrl(loc.serviceId);
-      if (url) proxyLocations.push({ pathPrefix: loc.pathPrefix, targetUrl: url });
+      if (url) {
+        proxyLocations.push({
+          pathPrefix: loc.pathPrefix,
+          targetUrl: url,
+          ...(loc.exact ? { exact: true } : {}),
+        });
+      }
     }
     out.push({
       hostname: route.hostname,

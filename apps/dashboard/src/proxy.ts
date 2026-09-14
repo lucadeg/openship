@@ -12,6 +12,10 @@ const PUBLIC_ROUTES = [
   "/forgot-password",
   "/reset-password",
   "/verify-email",
+  // Better Auth redirects browser-flow failures here. It must remain visible
+  // without a session or the middleware turns the useful error back into a
+  // silent login redirect.
+  "/auth/error",
   "/authorize",
   "/onboarding",
   // The MCP OAuth consent page. It must reach its own render even without a
@@ -21,6 +25,7 @@ const PUBLIC_ROUTES = [
   // `returnTo`/`callback`), so intercepting it stranded the user on `/` and the
   // MCP client's flow never completed.
   "/mcp/authorize",
+  "/accept-invite",
 ];
 
 const SESSION_COOKIE_SUFFIX = ".session_token";

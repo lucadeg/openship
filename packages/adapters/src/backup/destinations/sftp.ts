@@ -59,6 +59,19 @@ const CAPS: ReadonlySet<DestinationCapability> = new Set<DestinationCapability>(
 const UPLOAD_STALL_TIMEOUT_MS = 10 * 60 * 1000;
 const UPLOAD_STALL_PROBE_MS = 30 * 1000;
 
+/**
+ * Write buffer for one artifact upload — and therefore how many SFTP write requests
+ * ride the link at once, since ssh2 pipelines everything Node hands it in a single
+ * `_writev`. See `put` for why the default 16 KB caps an upload at roughly one
+ * packet per round trip.
+ *
+ * 8 MB against a 32 KB SFTP packet is on the order of 256 requests in flight, which
+ * is the same neighbourhood as ssh2's own `fastPut` default (64) with room for the
+ * larger chunks a demuxed dump delivers. It is a per-upload memory ceiling, and
+ * uploads are one-at-a-time within a run.
+ */
+const UPLOAD_BUFFER_BYTES = 8 * 1024 * 1024;
+
 interface ConnectionConfig {
   host: string;
   port: number;
@@ -226,16 +239,38 @@ class SftpDestinationImpl implements BackupDestination {
       await this.ensureDir(sftp, posix.dirname(target));
 
       await new Promise<void>((resolve, reject) => {
-        const ws = sftp.createWriteStream(tmp);
+        // `highWaterMark` is the throughput fix, and it is not a micro-optimisation.
+        //
+        // ssh2's SFTP WriteStream issues ONE `sftp.write()` per `_write` and waits
+        // for the server's status reply before the next — so with the stream default
+        // (16 KB) the upload runs at one 16-32 KB packet per round trip. On a 20 ms
+        // link that is under 2 MB/s no matter how fast either end is, which is the
+        // ~1.7 MB/s measured in #633 and the reason a 110 GB dump could not finish.
+        //
+        // Node calls `_writev` whenever more than one chunk is queued, and ssh2's
+        // `_writev` fires every queued write CONCURRENTLY (each SFTP request carries
+        // its own id, so they pipeline). Raising the buffer therefore raises the
+        // number of requests in flight — the same trick `fastPut` uses with its
+        // concurrency:64 — without reaching past the public stream API.
+        //
+        // This buffer is ALSO the backpressure boundary the artifact stream pushes
+        // against, so it is a deliberate memory ceiling per upload, not a guess.
+        const ws = sftp.createWriteStream(tmp, { highWaterMark: UPLOAD_BUFFER_BYTES });
         let lastProgressAt = Date.now();
         let settled = false;
 
         let watchdog: ReturnType<typeof setInterval> | undefined;
 
+        const onSettled: Array<() => void> = [];
         const finish = (err?: Error) => {
           if (settled) return;
           settled = true;
           if (watchdog) clearInterval(watchdog);
+          for (const stop of onSettled) stop();
+          // One last read, so a fast upload that finished inside a single tracker
+          // interval still reports the bytes it actually stored.
+          const acked = (ws as unknown as { bytesWritten?: number }).bytesWritten ?? 0;
+          if (acked > bytesWritten) bytesWritten = acked;
           if (err) {
             ws.destroy();
             body.destroy();
@@ -263,10 +298,22 @@ class SftpDestinationImpl implements BackupDestination {
 
         ws.on("error", (err: Error) => finish(err));
         ws.on("close", () => finish());
-        body.on("data", (chunk: Buffer) => {
-          bytesWritten += chunk.byteLength;
+        // Progress is measured at the WRITE side (`ws`), not by counting bytes read
+        // out of `body`. Those are different questions: with a fast producer and a
+        // dead destination, bytes leave `body` into the write buffer and the stall
+        // watchdog sees healthy "progress" for as long as that buffer keeps
+        // accepting. `ws.bytesWritten` only advances when the server has
+        // acknowledged a write, which is the only evidence the upload is moving.
+        // It is also the number this function returns, so a reported byte count now
+        // means "stored", not "handed over".
+        const trackProgress = setInterval(() => {
+          const acked = (ws as unknown as { bytesWritten?: number }).bytesWritten ?? 0;
+          if (acked <= bytesWritten) return;
+          bytesWritten = acked;
           lastProgressAt = Date.now();
-        });
+        }, 1000);
+        (trackProgress as { unref?: () => void }).unref?.();
+        onSettled.push(() => clearInterval(trackProgress));
         body.on("error", (err) => finish(err));
         body.pipe(ws);
       });

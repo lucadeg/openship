@@ -54,7 +54,13 @@ export function resolveBuildRuntimeModes(input: {
   baseTarget: "desktop" | "selfhosted" | "cloud";
   effectiveTarget: "local" | "server" | "cloud";
   willRunServices: boolean;
+  /** A single-app OCI image is already built, but still needs a container
+   * runtime to pull and run it. Bare mode cannot consume that artifact. */
+  hasPrebuiltImage?: boolean;
 }): BuildRuntimeModes {
+  if (input.hasPrebuiltImage && input.effectiveTarget !== "cloud") {
+    return { buildRuntimeMode: "docker", serveRuntimeMode: "docker" };
+  }
   if (input.willRunServices || input.workload === "worker") {
     return { buildRuntimeMode: "docker", serveRuntimeMode: "docker" };
   }
@@ -100,4 +106,39 @@ export function resolveDeployRouting(input: {
     deployMode: "static-file-serve",
     staticServeOutputDir: dockerBuilt ? "" : input.outputDirectory,
   };
+}
+
+/**
+ * Correct the routing for a deploy that REUSES an existing static release
+ * directory instead of building one (a rollback restoring a pinned release —
+ * see `reuseRetainedArtifact`).
+ *
+ * `resolveDeployRouting` answers `staticServeOutputDir` from the runtime that is
+ * about to BUILD, which is the right answer for a build and the wrong one for a
+ * release that already exists: where that release's doc-root sits was decided
+ * when its files were extracted, and no later runtime resolution moves them.
+ *
+ * The two resolutions agree only while nothing about the box has changed, and
+ * `dockerBuilt` is not derivable from the release either — a self-hosted static
+ * builds in a Docker sandbox but persists `runtimeMode: "bare"` (its SERVE
+ * identity), so the answer genuinely cannot be recomputed; it can only be read
+ * back. Drift is ordinary: a desktop project with no `runtime_mode` resolves
+ * bare while Docker isn't running and docker once it is, which flips the answer
+ * for the same release. Both directions fail badly and neither says why — "" on
+ * a bare-built release publishes the promoted SOURCE tree (and prunes `.git` out
+ * of it) and reports SUCCESS, while `"dist"` on a sandbox-built release aborts
+ * the promote with "check the build command and the Output Directory setting"
+ * for a restore that ran no build at all.
+ *
+ * `frozen` is the release's own persisted `DeploymentMeta.staticServeOutputDir`.
+ * Checked for PRESENCE, not truthiness — `""` IS the answer for a sandbox-built
+ * release and is the one this most needs to preserve. Absent (a release older
+ * than the field) keeps the derived answer: there is nothing better to use.
+ */
+export function reusedReleaseRouting(
+  routing: DeployRouting,
+  frozen: string | undefined,
+): DeployRouting {
+  if (routing.deployMode !== "static-file-serve" || frozen === undefined) return routing;
+  return { ...routing, staticServeOutputDir: frozen };
 }

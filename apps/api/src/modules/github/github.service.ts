@@ -6,18 +6,16 @@
  */
 
 import { randomBytes } from "crypto";
-import {
-  githubFetch,
-  getGitHubAuthMode,
-} from "./github.auth";
+import { githubFetch, getGitHubAuthMode } from "./github.auth";
 import { ghFetch, ghSend } from "./github.http";
 import { mapRepositories } from "./sources/mappers";
 import { isIgnoredRepoPath } from "../../lib/project-root-detector";
+import { cacheStore, type CacheStore } from "../../lib/cache-store";
 import type { RequestContext } from "../../lib/request-context";
 import { buildBackgroundContext } from "../../lib/request-context";
 import { resolveOrgOwner } from "../../lib/org-actor";
 import { assertGitHubRepoAccess, canUseGitHubRepo } from "./github-access";
-import { AppError, safeErrorMessage } from "@repo/core";
+import { AppError, isFullCommitSha, safeErrorMessage } from "@repo/core";
 import { repos as dbRepos } from "@repo/db";
 import { encrypt, decrypt } from "../../lib/encryption";
 import type {
@@ -33,9 +31,19 @@ import type {
 } from "./github.types";
 import { env } from "../../config/env";
 import { resolveApiPublicUrl, sharedWebhookUrl, domainWebhookUrl } from "../../lib/public-url";
+import { hasActiveGitHubSource } from "./github-source.service";
 
 export const GITHUB_DEPLOY_WEBHOOK_EVENTS = ["push"] as const;
 const MAX_FALLBACK_TREE_ENTRIES = 5000;
+const MAX_COMPARE_FILES_PER_RESPONSE = 300;
+const COMPARE_CACHE_TTL_SECONDS = 6 * 60 * 60;
+const compareInFlight = new Map<string, Promise<CompareCommitsResult | null>>();
+
+export interface CompareCommitsResult {
+  files: string[];
+  /** GitHub capped the response, so absence from `files` is not proof of no change. */
+  truncated: boolean;
+}
 
 /**
  * Length in bytes of a per-project webhook signing secret. 32 raw bytes
@@ -56,7 +64,7 @@ export const WEBHOOK_SECRET_BYTES = 32;
  * Source: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps
  */
 export const PAT_SCOPE_WARN_PATTERNS: readonly RegExp[] = [
-  /^admin:/i,        // admin:org, admin:repo_hook, admin:public_key, …
+  /^admin:/i, // admin:org, admin:repo_hook, admin:public_key, …
   /^delete_repo$/i,
   /^write:packages$/i,
   /^write:org$/i,
@@ -131,9 +139,7 @@ export async function inspectPatScope(token: string): Promise<PatScopeReport> {
  */
 export function classifyPatScope(
   report: PatScopeReport,
-):
-  | { ok: false; reason: string }
-  | { ok: true; warning?: string } {
+): { ok: false; reason: string } | { ok: true; warning?: string } {
   const scopeSet = new Set(report.scopes);
 
   // Fine-grained PATs report no classic scopes — pass without warning.
@@ -148,9 +154,7 @@ export function classifyPatScope(
     };
   }
 
-  const broad = report.scopes.filter((s) =>
-    PAT_SCOPE_WARN_PATTERNS.some((re) => re.test(s)),
-  );
+  const broad = report.scopes.filter((s) => PAT_SCOPE_WARN_PATTERNS.some((re) => re.test(s)));
   if (broad.length > 0) {
     return {
       ok: true,
@@ -226,7 +230,11 @@ export async function listUserOwnedRepos(
     const data = await githubFetch<GitHubRepository[]>({
       ctx,
       url: "https://api.github.com/user/repos",
-      params: { per_page: 100, sort: "updated", affiliation: "owner,collaborator,organization_member" },
+      params: {
+        per_page: 100,
+        sort: "updated",
+        affiliation: "owner,collaborator,organization_member",
+      },
     });
     return mapRepositories(Array.isArray(data) ? data : []);
   }
@@ -308,7 +316,7 @@ export async function getRepository(
 export async function createRepository(
   ctx: RequestContext,
   name: string,
-  opts: { description?: string; private?: boolean; owner?: string; } = {},
+  opts: { description?: string; private?: boolean; owner?: string } = {},
 ): Promise<GitHubRepository> {
   // Owner-level WRITE gate (defense-in-depth for GHSA-hp2g-hw7g-f3vm). Creating
   // a repo under an org account uses the org's App installation token, so it must
@@ -355,7 +363,7 @@ export async function createRepository(
 export async function deleteRepository(
   ctx: RequestContext,
   owner: string,
-  repo: string
+  repo: string,
 ): Promise<void> {
   // Per-repo WRITE gate (defense-in-depth for GHSA-hp2g-hw7g-f3vm) — a read grant,
   // or a grant on a DIFFERENT repo under this owner, must not delete this one.
@@ -427,7 +435,7 @@ export async function revokeDeployKey(
 export async function listBranches(
   ctx: RequestContext,
   owner: string,
-  repo: string
+  repo: string,
 ): Promise<GitHubBranch[]> {
   return githubFetch<GitHubBranch[]>({
     ctx,
@@ -486,24 +494,28 @@ export async function getRecentCommits(
   repo: string,
   branch: string,
   perPage = 10,
-): Promise<Array<{
-  sha: string;
-  message: string;
-  author: string;
-  authorAvatar: string;
-  date: string;
-  url: string;
-}>> {
+): Promise<
+  Array<{
+    sha: string;
+    message: string;
+    author: string;
+    authorAvatar: string;
+    date: string;
+    url: string;
+  }>
+> {
   try {
-    const data = await githubFetch<Array<{
-      sha: string;
-      html_url: string;
-      commit: {
-        message: string;
-        author: { name: string; date: string } | null;
-      };
-      author: { login: string; avatar_url: string } | null;
-    }>>({
+    const data = await githubFetch<
+      Array<{
+        sha: string;
+        html_url: string;
+        commit: {
+          message: string;
+          author: { name: string; date: string } | null;
+        };
+        author: { login: string; avatar_url: string } | null;
+      }>
+    >({
       ctx,
       owner,
       repo,
@@ -532,33 +544,80 @@ export async function getRecentCommits(
  * may have omitted some) and they need the FULL changed-files set for
  * smart per-service routing.
  *
- * Returns `null` on any API error so callers can degrade to the truncated
- * commits[] list rather than failing the deploy.
+ * Results for full-SHA pairs are immutable, so cache and coalesce them. The
+ * update-status read path can otherwise issue the same comparison once per
+ * project and once per dashboard surface even while its upstream HEAD is cached.
+ *
+ * GitHub caps a single comparison response at 300 files. We cannot prove a
+ * negative match from a capped set, so expose `truncated` and let routing/drift
+ * callers fall back conservatively. Returns `null` on any API error.
  */
 export async function compareCommits(
   ctx: RequestContext,
   owner: string,
   repo: string,
   base: string,
-  head: string
-): Promise<{ files: string[] } | null> {
-  try {
-    const data = await githubFetch<{
-      files?: Array<{ filename: string; previous_filename?: string }>;
-    }>({
-      ctx,
-      owner,
-      repo,
-      url: `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`,
-    });
-    const out = new Set<string>();
-    for (const f of data.files ?? []) {
-      if (f.filename) out.add(f.filename);
-      if (f.previous_filename) out.add(f.previous_filename);
+  head: string,
+): Promise<CompareCommitsResult | null> {
+  const key = JSON.stringify([
+    ctx.organizationId,
+    ctx.userId,
+    ctx.sessionKind,
+    ctx.principalKind ?? null,
+    ctx.tokenScope?.tokenId ?? null,
+    owner.toLowerCase(),
+    repo.toLowerCase(),
+    base.toLowerCase(),
+    head.toLowerCase(),
+  ]);
+  const cacheable = isFullCommitSha(base) && isFullCommitSha(head);
+  let store: CacheStore<CompareCommitsResult> | null = null;
+
+  if (cacheable) {
+    store = await cacheStore<CompareCommitsResult>("github-commit-comparisons", {
+      maxSize: 5_000,
+    }).catch(() => null);
+    const cached = await store?.get(key).catch(() => null);
+    if (cached) return cached;
+  }
+
+  const shared = compareInFlight.get(key);
+  if (shared) return shared;
+
+  const request = (async (): Promise<CompareCommitsResult | null> => {
+    try {
+      const data = await githubFetch<{
+        files?: Array<{ filename: string; previous_filename?: string }>;
+      }>({
+        ctx,
+        owner,
+        repo,
+        url: `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`,
+      });
+      const returnedFiles = data.files ?? [];
+      const out = new Set<string>();
+      for (const f of returnedFiles) {
+        if (f.filename) out.add(f.filename);
+        if (f.previous_filename) out.add(f.previous_filename);
+      }
+      const result = {
+        files: Array.from(out),
+        // Exactly 300 may be complete, but treating it as unknown is safer than
+        // suppressing a real update whose matching file was omitted by GitHub.
+        truncated: returnedFiles.length >= MAX_COMPARE_FILES_PER_RESPONSE,
+      };
+      if (store) await store.set(key, result, COMPARE_CACHE_TTL_SECONDS).catch(() => {});
+      return result;
+    } catch {
+      return null;
     }
-    return { files: Array.from(out) };
-  } catch {
-    return null;
+  })();
+
+  compareInFlight.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (compareInFlight.get(key) === request) compareInFlight.delete(key);
   }
 }
 
@@ -571,7 +630,7 @@ export async function listFiles(
   ctx: RequestContext,
   owner: string,
   repo: string,
-  opts: { branch?: string; path?: string; } = {},
+  opts: { branch?: string; path?: string } = {},
 ): Promise<GitHubFileContent[]> {
   const filePath = opts.path ?? "";
   return githubFetch<GitHubFileContent[]>({
@@ -612,7 +671,9 @@ export async function listRepositoryTree(
     return tree;
   }
 
-  const fallbackTree = await listRepositoryTreeViaContents(ctx, owner, repo, opts).catch(() => tree);
+  const fallbackTree = await listRepositoryTreeViaContents(ctx, owner, repo, opts).catch(
+    () => tree,
+  );
   return fallbackTree.length > 0 ? fallbackTree : tree;
 }
 
@@ -624,7 +685,7 @@ export async function getFileContent(
   owner: string,
   repo: string,
   file: string,
-  opts: { branch?: string; json?: boolean; } = {},
+  opts: { branch?: string; json?: boolean } = {},
 ): Promise<{
   sha: string;
   size: number;
@@ -665,7 +726,7 @@ export async function getFileContent(
 export async function listWebhooks(
   ctx: RequestContext,
   owner: string,
-  repo: string
+  repo: string,
 ): Promise<GitHubWebhook[]> {
   return githubFetch<GitHubWebhook[]>({
     ctx,
@@ -744,7 +805,7 @@ export async function deleteWebhook(
   ctx: RequestContext,
   owner: string,
   repo: string,
-  hookId: number
+  hookId: number,
 ): Promise<void> {
   // Per-repo WRITE gate (defense-in-depth for GHSA-hp2g-hw7g-f3vm).
   await assertGitHubRepoAccess(ctx, { owner, repo }, "write");
@@ -787,6 +848,10 @@ export async function createCheckRun(
       // authorized to run. It is deploy-tier status reporting, not repo
       // administration, so a read grant is the right authority.
       authorizeAs: "read",
+      // ...but only the App CAN post it. Unpinned, the self-hosted chain returns
+      // the operator's gh-CLI token first and every check 403s — silently, even
+      // with a working installation one step later in the chain.
+      credential: ["app-installation"],
       params: {
         name: opts.name,
         head_sha: opts.headSha,
@@ -800,7 +865,20 @@ export async function createCheckRun(
       },
     });
     return { id: data.id, htmlUrl: data.html_url };
-  } catch {
+  } catch (err) {
+    // Best-effort, but never silent. "No checks appeared on my PR" was
+    // indistinguishable from "no checks were attempted": every caller swallows
+    // again with `.catch(() => {})`, and this function never throws, so the
+    // reason died here. The thrown error carries GitHub's own status + message.
+    //
+    // The App hint is appended because the pin above makes the no-credential
+    // case report the generic "connect your GitHub account" — misleading on a
+    // self-host that HAS a working gh CLI or PAT, since neither can ever post a
+    // check run. The App is the requirement, not a GitHub connection per se.
+    console.warn(
+      `[GitHub Checks] create failed for ${owner}/${repo} ${opts.name}@${opts.headSha.slice(0, 7)}: ${safeErrorMessage(err)} ` +
+        `(check runs require a GitHub App installation — a gh-CLI/PAT credential cannot post one)`,
+    );
     return null;
   }
 }
@@ -828,6 +906,8 @@ export async function updateCheckRun(
       method: "PATCH",
       // Same tier as createCheckRun — status reporting on a build already authorized.
       authorizeAs: "read",
+      // Same pin as createCheckRun — the Checks API is App-only.
+      credential: ["app-installation"],
       params: {
         status: opts.status,
         completed_at: new Date().toISOString(),
@@ -835,8 +915,11 @@ export async function updateCheckRun(
         ...(opts.output ? { output: opts.output } : {}),
       },
     });
-  } catch {
-    /* best-effort - don't fail the deployment if check update fails */
+  } catch (err) {
+    // Best-effort — never fails the deployment, never silent either (see create).
+    console.warn(
+      `[GitHub Checks] update failed for ${owner}/${repo} check ${checkRunId}: ${safeErrorMessage(err)}`,
+    );
   }
 }
 
@@ -856,7 +939,7 @@ export type WebhookStrategy = "app" | "domain" | "repo" | "none";
 /**
  * Determine the base webhook strategy from global config (sync, no user context).
  *
- *  - "app"  → GitHub App handles push events natively (cloud mode).
+ *  - "app"  → GitHub App handles push events natively (SaaS or local App).
  *  - "repo" → Create per-repo webhooks (self-hosted with a public URL).
  *  - "none" → Can't receive webhooks (localhost / private IP).
  */
@@ -876,14 +959,17 @@ export function getWebhookStrategy(): WebhookStrategy {
  * Resolve the effective webhook strategy for a project + user (async).
  *
  * Priority:
- *   1. "app"    - GitHub App (cloud mode)
+ *   1. "app"    - native GitHub App (SaaS or operator-owned self-hosted App)
  *   2. "domain" - project has a webhookDomain set (direct delivery)
  *   3. "repo"   - current API target is public
  *   4. "none"   - no way to receive webhooks
  */
 export async function resolveWebhookStrategy(
-  project?: { webhookDomain?: string | null },
+  project?: { webhookDomain?: string | null; organizationId?: string | null },
+  organizationId?: string,
 ): Promise<WebhookStrategy> {
+  const orgId = organizationId ?? project?.organizationId ?? undefined;
+  if (orgId && (await hasActiveGitHubSource(orgId).catch(() => false))) return "app";
   const base = getWebhookStrategy();
   if (base === "app") return "app";
 
@@ -904,10 +990,10 @@ export async function getAvailableStrategies(
   ctx: RequestContext,
   project?: { webhookDomain?: string | null },
 ): Promise<{ current: WebhookStrategy; available: WebhookStrategy[] }> {
-  const current = await resolveWebhookStrategy(project);
+  const current = await resolveWebhookStrategy(project, ctx.organizationId);
   const available: WebhookStrategy[] = [];
 
-  if (getGitHubAuthMode() === "app") {
+  if (current === "app") {
     available.push("app");
     return { current, available };
   }
@@ -952,11 +1038,7 @@ function isLocalUrl(url: string): boolean {
 
     // DNS sentinel cases. `.local` is mDNS (Bonjour) — reachable only on
     // the local link, never from the public internet.
-    if (
-      hostname === "localhost" ||
-      hostname === "0.0.0.0" ||
-      hostname.endsWith(".local")
-    ) {
+    if (hostname === "localhost" || hostname === "0.0.0.0" || hostname.endsWith(".local")) {
       return true;
     }
 
@@ -964,9 +1046,8 @@ function isLocalUrl(url: string): boolean {
     // Same hostname can also arrive un-bracketed if the caller passed a
     // bare IP. fe80::/10 → fe80..febf (first byte top 10 bits); fc00::/7
     // → fc00..fdff (first byte top 7 bits, fc or fd).
-    const v6 = hostname.startsWith("[") && hostname.endsWith("]")
-      ? hostname.slice(1, -1)
-      : hostname;
+    const v6 =
+      hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
     if (v6 === "::1") return true;
     if (/^fe[89ab][0-9a-f]?:/i.test(v6)) return true; // link-local
     if (/^f[cd][0-9a-f]{2}:/i.test(v6)) return true; // ULA
@@ -975,11 +1056,11 @@ function isLocalUrl(url: string): boolean {
     // (Not collapsed into a single regex — readability beats brevity here,
     // and each /8|/12|/16 has a different intent that benefits from being
     // named in the source.)
-    if (/^127\./.test(hostname)) return true;                       // loopback /8
-    if (/^10\./.test(hostname)) return true;                        // RFC1918 /8
-    if (/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return true;   // RFC1918 /12
-    if (/^192\.168\./.test(hostname)) return true;                  // RFC1918 /16
-    if (/^169\.254\./.test(hostname)) return true;                  // link-local /16
+    if (/^127\./.test(hostname)) return true; // loopback /8
+    if (/^10\./.test(hostname)) return true; // RFC1918 /8
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return true; // RFC1918 /12
+    if (/^192\.168\./.test(hostname)) return true; // RFC1918 /16
+    if (/^169\.254\./.test(hostname)) return true; // link-local /16
 
     return false;
   } catch {
@@ -1005,10 +1086,7 @@ export function mintWebhookSecret(): string {
  * (first-time registration) and rotateProjectWebhookSecret (operator-
  * initiated rotation).
  */
-async function persistProjectWebhookSecret(
-  projectId: string,
-  secret: string,
-): Promise<void> {
+async function persistProjectWebhookSecret(projectId: string, secret: string): Promise<void> {
   await dbRepos.project.update(projectId, {
     webhookSecret: encrypt(secret),
   });
@@ -1101,22 +1179,14 @@ export async function registerWebhook(
     : env.GITHUB_WEBHOOK_SECRET || undefined;
 
   try {
-    const result = await createWebhook(
-      ctx,
-      owner,
-      repo,
-      webhookUrl,
-      secret || undefined,
-    );
+    const result = await createWebhook(ctx, owner, repo, webhookUrl, secret || undefined);
     return { hookId: result.hookId, events: result.events };
   } catch (err) {
     /* 422 = webhook already exists - find it */
     if (err instanceof Error && err.message.includes("422")) {
       const existing = await listWebhooks(ctx, owner, repo);
       const targetUrl = normalizeWebhookUrl(webhookUrl);
-      const match = existing.find((h) =>
-        normalizeWebhookUrl(h.config?.url) === targetUrl,
-      );
+      const match = existing.find((h) => normalizeWebhookUrl(h.config?.url) === targetUrl);
       if (!match) return { hookId: null, events: [] };
 
       const config = secret

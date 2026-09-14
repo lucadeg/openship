@@ -24,6 +24,7 @@ import {
   STACKS,
   STACK_IDS,
   OUTPUT_DIRECTORIES,
+  categoryServesFiles,
   getProjectType,
   getBuildImage,
   LANGUAGE_MANIFEST_FILES,
@@ -396,9 +397,40 @@ const FRAMEWORK_RULES: FrameworkRule[] = [
 // from every present manifest and resolve a default port. Adding a language is
 // one new file under packages/core/src/languages/ + a registry entry there.
 
+/**
+ * The parsed package.json, recovered from its raw text when the caller didn't
+ * supply one.
+ *
+ * A snapshot reads the manifest TWICE — `readJson` for the parsed object and
+ * `readText` for the contents map — and every reader swallows a failure of either
+ * into `undefined`. So the parsed object can be missing while the text is right
+ * here in hand, and the two halves of detection then disagree: dependency
+ * matching still finds the framework (it reads the text), but command derivation
+ * silently degrades to the registry's bare `next build` / `next start`. That
+ * combination is openship#623 — a Next app whose `build` script we never saw.
+ *
+ * Returns undefined only when there is genuinely no readable manifest.
+ */
+export function resolvePackageJson(
+  packageJson?: Record<string, unknown>,
+  fileContents?: Record<string, string>,
+): Record<string, unknown> | undefined {
+  if (packageJson) return packageJson;
+  const text = fileContents
+    ? Object.entries(fileContents).find(([k]) => k.toLowerCase() === "package.json")?.[1]
+    : undefined;
+  if (!text) return undefined;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function detectStack(
   files: RepoFile[],
-  packageJson?: Record<string, unknown>,
+  packageJsonInput?: Record<string, unknown>,
   fileContents?: Record<string, string>,
 ): StackResult {
   const fileSet = new Set(files.map((f) => f.name.toLowerCase()));
@@ -408,6 +440,8 @@ export function detectStack(
   if (fileContents) {
     for (const [k, v] of Object.entries(fileContents)) fc[k.toLowerCase()] = v;
   }
+
+  const packageJson = resolvePackageJson(packageJsonInput, fc);
 
   // Merge deps: JS deps come from the parsed package.json, the rest come from
   // language-specific manifest parsers via the registry. The JS detector's
@@ -606,7 +640,7 @@ function isTrueServerStack(result: StackResult): boolean {
  * static output rather than a long-running server.
  */
 function classifyAsStaticOutput(result: StackResult): StackResult {
-  if (result.category === "frontend" || result.category === "static") {
+  if (categoryServesFiles(result.category)) {
     return { ...result, startCommand: "" };
   }
   return {

@@ -271,6 +271,7 @@ export function planProjectMove(input: {
       // Identity. The rows already carry their final names — there is no repo mapping
       // step and nothing to de-duplicate, because we are not adding rows to a project.
       renames: {},
+      rowNameByDiscovered: {},
       // Reuse the image that is running right now, for every moved service. Door A only
       // needs this for native `build:` rows, because its other rows carry a registry
       // image the target can pull. Ours are OUR builds: the tag exists on the source

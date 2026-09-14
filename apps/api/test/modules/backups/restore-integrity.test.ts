@@ -53,6 +53,9 @@ const h = vi.hoisted(() => ({
   reads: [] as string[],
   row: null as Record<string, unknown> | null,
   terminal: null as null | (() => void),
+  /** Source-run status. THE gate that makes capture atomic — see the tests at the end. */
+  sourceStatus: "succeeded" as string,
+  sourceDeletedAt: null as Date | null,
 }));
 
 vi.mock("@repo/db", () => ({
@@ -60,7 +63,7 @@ vi.mock("@repo/db", () => ({
     backupRun: {
       findById: async () => ({
         id: "bkr_1",
-        status: "succeeded",
+        status: h.sourceStatus,
         destinationId: "dst_1",
         organizationId: "org_1",
         projectId: "prj_1",
@@ -68,7 +71,7 @@ vi.mock("@repo/db", () => ({
         sourceKind: "service",
         policyId: h.policyId,
         manifestKey: h.manifestKey,
-        deletedAt: null,
+        deletedAt: h.sourceDeletedAt,
         artifacts: h.artifacts,
       }),
     },
@@ -100,6 +103,9 @@ vi.mock("@repo/db", () => ({
         activeDeploymentId: null,
       }),
       listEnvVars: async () => [],
+      // serviceHandleFor reads env through the SCOPED map (project-level and
+      // service-scoped, per environment) rather than every row in the project.
+      getEnvMap: async () => ({}),
     },
     service: {
       findById: async () => ({
@@ -185,6 +191,7 @@ vi.mock("../../../src/modules/backup-destinations/hydrate-server", () => ({
 }));
 vi.mock("../../../src/modules/services/service-container", () => ({
   liveContainerIdForService: async () => null,
+  liveContainerForService: async () => ({ containerId: null, running: null }),
 }));
 
 import { RestoreOrchestrator } from "../../../src/modules/backups/restore.orchestrator";
@@ -236,6 +243,8 @@ async function prepare() {
 const meta = () => (h.transitions.at(-1)!.patch?.meta ?? {}) as Record<string, unknown>;
 
 beforeEach(() => {
+  h.sourceStatus = "succeeded";
+  h.sourceDeletedAt = null;
   h.objects.clear();
   h.artifacts = [];
   h.manifestKey = null;
@@ -525,5 +534,53 @@ describe("digest normalization", () => {
 
     expect(last.status).toBe("prepared");
     expect(meta().integrity).toBe("size-only");
+  });
+});
+
+describe("a partial run is not a restore point — the atomicity gate", () => {
+  /**
+   * This is what makes CAPTURE atomic, and it is the run's STATUS, not its manifest.
+   *
+   * A run that dies mid-upload has `artifacts: [...]` already written by the in-loop
+   * progress transitions, and no manifest. If such a run were restorable it would apply a
+   * partial artifact list over live data — so the gate has to be airtight, and until now
+   * nothing asserted it. (A missing manifest is only a cross-check: it records
+   * `meta.manifest: "missing"` and verifies against the recorded list instead.)
+   *
+   * It is also why the terminal-status guard in `backup.repo.ts` is load-bearing rather
+   * than tidy: the gate is only as trustworthy as the column, and before that guard a
+   * racing writer could flip a partial `failed` run to `succeeded`.
+   */
+  for (const status of ["failed", "server_error", "cancelled", "uploading", "queued"]) {
+    it(`refuses to restore from a run in "${status}"`, async () => {
+      h.sourceStatus = status;
+
+      await expect(
+        new RestoreOrchestrator().beginPrepare({
+          runId: "bkr_1",
+          trigger: "manual",
+          confirmationToken: "tok",
+        }),
+      ).rejects.toThrow(/Can only restore from a succeeded backup run/);
+
+      // And it refused before touching anything.
+      expect(h.targetTouched).toBe(false);
+    });
+  }
+
+  it("refuses a run whose artifacts have been purged, even though it succeeded", async () => {
+    // Status alone is not enough: retention can have reclaimed the bytes out from under a
+    // succeeded row.
+    h.sourceStatus = "succeeded";
+    h.sourceDeletedAt = new Date();
+
+    await expect(
+      new RestoreOrchestrator().beginPrepare({
+        runId: "bkr_1",
+        trigger: "manual",
+        confirmationToken: "tok",
+      }),
+    ).rejects.toThrow(/purged/);
+    expect(h.targetTouched).toBe(false);
   });
 });

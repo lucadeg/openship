@@ -71,9 +71,9 @@ export interface MailWebmailState {
  *
  * Lives at `openship@<state.domain>` (the primary install). The
  * doveadm-hashed password is stored in `vmail.mailbox`; the plaintext
- * here is the canonical copy the API hands to nodemailer. Both ends are
- * written in a SINGLE call to `ensureOpenshipPlatformMailbox` so drift is
- * structurally impossible — see
+ * here is the credential cache the API hands to nodemailer. Every read is
+ * reconciled against the live mailbox + forwarding rows, and both ends are
+ * written in a SINGLE call to `ensureOpenshipPlatformMailbox` — see
  * apps/api/src/modules/mail/admin/platform-mailbox.service.ts.
  *
  * Absence of the field on an existing state file = "not yet provisioned"

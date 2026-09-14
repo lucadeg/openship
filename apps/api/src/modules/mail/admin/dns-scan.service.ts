@@ -18,7 +18,7 @@
  * resolved in parallel). The Health tab refreshes on demand.
  */
 
-import { Resolver } from "node:dns/promises";
+import { createPublicDnsResolver } from "../../../lib/public-dns";
 
 /**
  * PUBLIC resolvers, not the system stub.
@@ -31,10 +31,7 @@ import { Resolver } from "node:dns/promises";
  * correct DNS. Querying public resolvers directly is the only way to see the
  * published zone. Two, so one being unreachable isn't a scan failure.
  */
-const PUBLIC_DNS_SERVERS = ["1.1.1.1", "8.8.8.8"];
-
-const publicResolver = new Resolver();
-publicResolver.setServers(PUBLIC_DNS_SERVERS);
+const publicResolver = createPublicDnsResolver();
 
 const resolve4 = publicResolver.resolve4.bind(publicResolver);
 const resolve6 = publicResolver.resolve6.bind(publicResolver);
@@ -43,6 +40,7 @@ const resolveMx = publicResolver.resolveMx.bind(publicResolver);
 const resolveTxt = publicResolver.resolveTxt.bind(publicResolver);
 const reverse = publicResolver.reverse.bind(publicResolver);
 import { sshManager } from "../../../lib/ssh-manager";
+import { isSyntheticDnsAddress } from "../../../lib/dns-address";
 import { readState } from "../mail-state";
 import { relayedDomainsFor, safeErrorMessage, mailHostname } from "@repo/core";
 
@@ -195,14 +193,7 @@ export async function scanDns(serverId: string, domain?: string): Promise<DnsSca
  * "unverifiable" costs nothing and stops the scan lying about the zone.
  */
 export function looksSyntheticAddress(ip: string): boolean {
-  if (ip.includes(":")) {
-    const head = parseInt(ip.split(":")[0] || "0", 16);
-    return head >= 0xfc00 && head <= 0xfdff;
-  }
-  const [a = 0, b = 0] = ip.split(".").map(Number);
-  if (a === 198 && (b === 18 || b === 19)) return true;
-  if (a >= 240) return true;
-  return false;
+  return isSyntheticDnsAddress(ip);
 }
 
 // ─── Per-record checks ───────────────────────────────────────────────────────
@@ -258,6 +249,23 @@ async function checkAaaa(domain: string, exp?: ExpectedRecord): Promise<DnsCheck
   try {
     const ips = await resolve6(name);
     const match = ips.some((ip) => normaliseIpv6(ip) === normaliseIpv6(exp.value!));
+    if (!match && ips.length > 0 && ips.every(looksSyntheticAddress)) {
+      return {
+        key: "aaaa",
+        label: "AAAA record",
+        description: "IPv6 address for the mail hostname. Recommended for delivery to Gmail.",
+        queriedName: name,
+        recordType: "AAAA",
+        status: "unknown",
+        expected: exp.value,
+        actual: ips.join(", "),
+        message:
+          `DNS could not be verified from here: ${name} resolved to ${ips.join(", ")}, ` +
+          `which is a synthetic IPv6 address from a local DNS interceptor (a fake-IP VPN ` +
+          `or proxy such as Clash or sing-box), not a published record. Re-run the scan ` +
+          `with that proxy off, or check the record from another network.`,
+      };
+    }
     return {
       key: "aaaa",
       label: "AAAA record",

@@ -43,7 +43,10 @@ function fmtInt(n: number): string {
   return Math.round(n).toLocaleString();
 }
 function fmtCredits(n: number): string {
-  // values arrive in milli-credits
+  // Values arrive in milli-credits. The result is read as COMPUTE MINUTES: one
+  // compute minute is one credit (`MILLI_PER_COMPUTE_MINUTE`), which is why the
+  // divisor is unchanged even though the label now says compute — the plans
+  // publish minutes, so the meter beside them has to speak minutes too.
   return Math.floor(n / 1000).toLocaleString();
 }
 
@@ -158,7 +161,10 @@ export const BillingCapacity: React.FC<{ state: BillingState }> = ({ state }) =>
 
   const rows: RowSpec[] = [];
 
-  // Credits — fully live from the balance (the primary allowance meter).
+  // Compute minutes — fully live from the balance (the primary allowance meter).
+  // The quota behind it is the tier's whole derived grant, app runtime PLUS its
+  // build allowance (see `planMonthlyCredits`), which is why the build row below is
+  // a view of the same pool rather than a second, independent budget.
   rows.push({
     key: "credits",
     label: h.credits,

@@ -29,9 +29,6 @@
       "popular": false,
       "contactSales": null,
       "support": "community",
-      "credits": {
-        "monthlyMilli": 500000
-      },
       "limits": {
         "workloads": [
           "static"
@@ -40,7 +37,8 @@
         "runningServices": 0,
         "maxProjects": 3,
         "maxResourceTier": "low",
-        "buildMinutesPerMonth": 15,
+        "computeMinutesPerMonth": 0,
+        "buildMinutesPerMonth": 500,
         "freeSubdomains": 10,
         "customDomains": null,
         "seats": null
@@ -48,10 +46,8 @@
       "features": [
         "staticOnly",
         "buildMinutes",
-        "freeSubdomains",
-        "customDomains",
         "projects",
-        "unlimitedSeats",
+        "freeSubdomains",
         "communitySupport"
       ]
     },
@@ -69,9 +65,6 @@
       "contactSales": null,
       "support": "email",
       "inherits": "free",
-      "credits": {
-        "monthlyMilli": 2000000
-      },
       "limits": {
         "workloads": [
           "static",
@@ -80,9 +73,10 @@
         ],
         "services": true,
         "runningServices": 3,
-        "maxProjects": 5,
+        "maxProjects": 10,
         "maxResourceTier": "medium",
-        "buildMinutesPerMonth": 400,
+        "computeMinutesPerMonth": 150000,
+        "buildMinutesPerMonth": 3000,
         "freeSubdomains": 25,
         "customDomains": null,
         "seats": null
@@ -90,15 +84,11 @@
       "features": [
         "everythingIn",
         "anyWorkload",
-        "managedServices",
         "runningServices",
+        "computeMinutes",
+        "buildMinutes",
         "power",
         "projects",
-        "buildMinutes",
-        "credits",
-        "meteredCredits",
-        "freeSubdomains",
-        "previewDeploys",
         "emailSupport"
       ]
     },
@@ -116,9 +106,6 @@
       "contactSales": null,
       "support": "priority",
       "inherits": "starter",
-      "credits": {
-        "monthlyMilli": 10000000
-      },
       "limits": {
         "workloads": [
           "static",
@@ -127,9 +114,10 @@
         ],
         "services": true,
         "runningServices": 10,
-        "maxProjects": 25,
+        "maxProjects": 50,
         "maxResourceTier": "high",
-        "buildMinutesPerMonth": 2000,
+        "computeMinutesPerMonth": 600000,
+        "buildMinutesPerMonth": 12000,
         "freeSubdomains": 100,
         "customDomains": null,
         "seats": null
@@ -137,15 +125,10 @@
       "features": [
         "everythingIn",
         "runningServices",
+        "computeMinutes",
+        "buildMinutes",
         "power",
         "projects",
-        "buildMinutes",
-        "credits",
-        "meteredCredits",
-        "freeSubdomains",
-        "backups",
-        "observability",
-        "mailServer",
         "prioritySupport"
       ]
     },
@@ -163,9 +146,6 @@
       "contactSales": null,
       "support": "priority",
       "inherits": "pro",
-      "credits": {
-        "monthlyMilli": 60000000
-      },
       "limits": {
         "workloads": [
           "static",
@@ -176,7 +156,8 @@
         "runningServices": 50,
         "maxProjects": null,
         "maxResourceTier": "xlarge",
-        "buildMinutesPerMonth": 6000,
+        "computeMinutesPerMonth": 2200000,
+        "buildMinutesPerMonth": 36000,
         "freeSubdomains": null,
         "customDomains": null,
         "seats": null
@@ -184,14 +165,11 @@
       "features": [
         "everythingIn",
         "runningServices",
+        "computeMinutes",
+        "buildMinutes",
         "power",
         "projectsUnlimited",
-        "buildMinutes",
-        "credits",
-        "meteredCredits",
         "freeSubdomainsUnlimited",
-        "auditLog",
-        "sharedChannel",
         "prioritySupport"
       ]
     },
@@ -209,9 +187,6 @@
       "contactSales": "mailto:sales@openship.io",
       "support": "dedicated",
       "inherits": "team",
-      "credits": {
-        "monthlyMilli": null
-      },
       "limits": {
         "workloads": [
           "static",
@@ -222,6 +197,7 @@
         "runningServices": null,
         "maxProjects": null,
         "maxResourceTier": null,
+        "computeMinutesPerMonth": null,
         "buildMinutesPerMonth": null,
         "freeSubdomains": null,
         "customDomains": null,
@@ -260,6 +236,15 @@
       "sortOrder": 30
     }
   ],
+  "standard": {
+    "features": [
+      "gitDeploys",
+      "customDomains",
+      "deployLogs",
+      "auditLog",
+      "unlimitedSeats"
+    ]
+  },
   "selfHosted": {
     "features": [
       "selfHostedOpenSource",

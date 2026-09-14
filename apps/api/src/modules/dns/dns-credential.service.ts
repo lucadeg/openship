@@ -370,8 +370,8 @@ export async function provisionRecords(
   desired: DnsRecordInput[],
 ): Promise<DnsProvisionResult> {
   // No reason attached: "there was nothing to write" is not something to report
-  // to an operator, and a reason here would make `autoDns` appear on the response
-  // for a domain nobody is automating (external ingress returns no records).
+  // to an operator, and external ingress legitimately produces no provider
+  // inputs. The on-demand panel can keep showing the manual-record fallback.
   if (desired.length === 0) return { provisioned: false, records: [] };
 
   const lookup = await resolveDnsManager(organizationId, hostname);

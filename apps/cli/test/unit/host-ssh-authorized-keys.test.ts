@@ -21,6 +21,7 @@ import {
   chooseHostChannelUser,
   listensOnPort,
   renderHostChannelIssue,
+  sshdRefusesRootLogin,
 } from "../../src/lib/compose";
 
 /**
@@ -153,57 +154,190 @@ function hardened(pub: string): string {
 }
 
 /**
- * The host channel must log in as root — the account the platform runs every host op as
- * (/root/.openship, mail, edge) and the account the auto-created server record says. A
- * channel provisioned for the invoking sudo user instead is issue #489.
+ * Which account the container→host channel logs in as.
+ *
+ * A LIST, not a choice: `authorized_keys` is a file we write, not a verdict sshd gives, so
+ * the only thing that can establish whether an account works is dialing it. #527 is what a
+ * single choice cost — a box with `PermitRootLogin no` got the root arm, the key went into a
+ * file sshd never consults for a login it refuses outright, and there was nothing else to
+ * try. Host ops still need root, but they do NOT need a root LOGIN (#489 is the opposite
+ * mistake, and `elevation` is what keeps both from recurring).
  */
 describe("chooseHostChannelUser", () => {
-  it("uses root directly when invoked as root", () => {
+  it("tries root FIRST when invoked as root — `sudo openship up` is how you ask for one", () => {
     const out = chooseHostChannelUser({
       invokerUid: 0,
       invokerName: "root",
       invokerHome: "/root",
       hasPasswordlessSudo: false,
     });
-    expect(out).toEqual({
-      user: "root",
-      authKeysPath: "/root/.ssh/authorized_keys",
-      rootUnavailable: false,
-      elevation: "login",
+    expect(out).toEqual([
+      {
+        user: "root",
+        authKeysPath: "/root/.ssh/authorized_keys",
+        elevation: "login",
+        source: "root",
+      },
+    ]);
+  });
+
+  it("follows root with $SUDO_USER, so a host that refuses root logins still gets a channel", () => {
+    const out = chooseHostChannelUser({
+      invokerUid: 0,
+      invokerName: "root",
+      invokerHome: "/root",
+      hasPasswordlessSudo: false,
+      sudoUser: { user: "admin", home: "/home/admin" },
+    });
+    // Order is the whole fix: root stays first (an operator who ran `sudo` asked for it,
+    // and a working root install must not be migrated out from under them), and the
+    // fallback is only ever reached when root's DIAL actually fails.
+    expect(out.map((c) => c.user)).toEqual(["root", "admin"]);
+    expect(out[1]).toEqual({
+      user: "admin",
+      // From the passwd database, never $HOME — sudo has already rewritten that to root's.
+      authKeysPath: "/home/admin/.ssh/authorized_keys",
+      elevation: "sudo",
+      source: "sudo-user",
     });
   });
 
-  it("logs in as the invoker and elevates when a non-root user has passwordless sudo", () => {
+  it("ignores a SUDO_USER of root — that is not a second account", () => {
+    const out = chooseHostChannelUser({
+      invokerUid: 0,
+      invokerName: "root",
+      invokerHome: "/root",
+      hasPasswordlessSudo: false,
+      sudoUser: { user: "root", home: "/root" },
+    });
+    expect(out).toHaveLength(1);
+  });
+
+  it("offers ONLY the invoker on a non-root run, and elevates when sudo is passwordless", () => {
     const out = chooseHostChannelUser({
       invokerUid: 1000,
       invokerName: "ubuntu",
       invokerHome: "/home/ubuntu",
       hasPasswordlessSudo: true,
     });
-    // The change #527 argued for: root is reached by ELEVATING this session, not by
-    // minting a standing root SSH credential. `rootUnavailable` stays false because root
-    // is still reachable — through sudo — so the caller must not warn that mail/edge fail.
-    expect(out).toEqual({
-      user: "ubuntu",
-      authKeysPath: "/home/ubuntu/.ssh/authorized_keys",
-      rootUnavailable: false,
-      elevation: "sudo",
-    });
+    // The change #527 argued for: root is reached by ELEVATING this session, not by minting
+    // a standing root SSH credential. No root candidate follows, because authorizing root's
+    // file would mean writing an account we are not logging in as — the thing de-rooting
+    // removed.
+    expect(out).toEqual([
+      {
+        user: "ubuntu",
+        authKeysPath: "/home/ubuntu/.ssh/authorized_keys",
+        elevation: "sudo",
+        source: "invoker",
+      },
+    ]);
   });
 
-  it("falls back to the invoking user (flagged) when root is unreachable", () => {
+  it("flags the invoker as having no route to root when sudo isn't passwordless", () => {
     const out = chooseHostChannelUser({
       invokerUid: 1000,
       invokerName: "deploy",
       invokerHome: "/home/deploy",
       hasPasswordlessSudo: false,
     });
-    expect(out).toEqual({
-      user: "deploy",
-      authKeysPath: "/home/deploy/.ssh/authorized_keys",
-      rootUnavailable: true,
-      elevation: "none",
+    expect(out).toEqual([
+      {
+        user: "deploy",
+        authKeysPath: "/home/deploy/.ssh/authorized_keys",
+        elevation: "none",
+        source: "invoker",
+      },
+    ]);
+  });
+
+  it("honours a pin as the ONLY candidate — a fallback would defeat naming one", () => {
+    const out = chooseHostChannelUser({
+      invokerUid: 0,
+      invokerName: "root",
+      invokerHome: "/root",
+      hasPasswordlessSudo: false,
+      sudoUser: { user: "admin", home: "/home/admin" },
+      pinned: { user: "ops", home: "/home/ops" },
     });
+    expect(out).toEqual([
+      {
+        user: "ops",
+        authKeysPath: "/home/ops/.ssh/authorized_keys",
+        elevation: "sudo",
+        source: "pin",
+      },
+    ]);
+  });
+
+  it("uses root's fixed path when root is what was pinned", () => {
+    const out = chooseHostChannelUser({
+      invokerUid: 1000,
+      invokerName: "ubuntu",
+      invokerHome: "/home/ubuntu",
+      hasPasswordlessSudo: true,
+      pinned: { user: "root", home: "/root" },
+    });
+    expect(out[0]).toMatchObject({
+      user: "root",
+      authKeysPath: "/root/.ssh/authorized_keys",
+      elevation: "login",
+    });
+  });
+
+  it("promotes the account the previous run settled on, so a re-run doesn't churn files", () => {
+    const out = chooseHostChannelUser({
+      invokerUid: 0,
+      invokerName: "root",
+      invokerHome: "/root",
+      hasPasswordlessSudo: false,
+      sudoUser: { user: "admin", home: "/home/admin" },
+      carried: "admin",
+      });
+    // Continuity, not a pin: a box that already settled on `admin` shouldn't re-authorize
+    // (and then revoke) root's file every run. It still falls through like any candidate.
+    expect(out.map((c) => c.user)).toEqual(["admin", "root"]);
+    expect(out[0]?.source).toBe("carried");
+  });
+
+  it("does not let a carried account invent a candidate we could not authorize", () => {
+    const out = chooseHostChannelUser({
+      invokerUid: 1000,
+      invokerName: "ubuntu",
+      invokerHome: "/home/ubuntu",
+      hasPasswordlessSudo: true,
+      // A previous root install, now re-run by a non-root user: root's authorized_keys is
+      // not ours to write from here, so it must not reappear as a candidate.
+      carried: "root",
+    });
+    expect(out.map((c) => c.user)).toEqual(["ubuntu"]);
+  });
+});
+
+/**
+ * `PermitRootLogin` admits our key for THREE of its four values, and the intuitive rule —
+ * "anything but `yes` is a refusal" — is wrong twice over. Getting this backwards means
+ * telling an operator to change a setting that was never the problem, on a box (default
+ * Debian, which reports `without-password`) where root logins work fine.
+ */
+describe("sshdRefusesRootLogin", () => {
+  it("treats every publickey-permitting value as permissive", () => {
+    for (const value of ["yes", "prohibit-password", "without-password", "PROHIBIT-PASSWORD"]) {
+      expect(sshdRefusesRootLogin(value), value).toBe(false);
+    }
+  });
+
+  it("refuses on `no` and on forced-commands-only", () => {
+    // forced-commands-only accepts the key and then kills the session, because our line
+    // carries no `command=` — unusable, so it belongs on this side.
+    expect(sshdRefusesRootLogin("no")).toBe(true);
+    expect(sshdRefusesRootLogin("forced-commands-only")).toBe(true);
+  });
+
+  it("says nothing when sshd said nothing — an unread setting is not a refusal", () => {
+    expect(sshdRefusesRootLogin(undefined)).toBe(false);
+    expect(sshdRefusesRootLogin(null)).toBe(false);
+    expect(sshdRefusesRootLogin("")).toBe(false);
   });
 });
 
@@ -268,6 +402,10 @@ describe("listensOnPort", () => {
  */
 describe("renderHostChannelIssue", () => {
   const AT = { target: "host.docker.internal:22", kept: false };
+  /** The message as one line: it is wrapped to 80 columns for a terminal, so asserting on
+   *  any phrase longer than a few words otherwise depends on where the wrap happened to
+   *  fall — which changes whenever a word before it does. */
+  const unwrapped = (s: string) => s.replace(/\s+/g, " ");
 
   it("names the cause a later surface cannot recover", () => {
     const out = renderHostChannelIssue(
@@ -303,6 +441,78 @@ describe("renderHostChannelIssue", () => {
     expect(out).not.toContain("Kept the host channel");
   });
 
+  it("names every account it dialed, not just the last one", () => {
+    // #527's reporter was told only about `root`. On a sudo'd run we DID try their account
+    // too, and an operator who can't see that reasonably asks why we didn't.
+    const out = renderHostChannelIssue(
+      {
+        code: "auth-refused",
+        detail: "Permission denied (publickey).",
+        account: "admin",
+        tried: ["root", "admin"],
+      },
+      AT,
+    );
+    expect(out).toContain("`root` then `admin`");
+    expect(out).toContain("Permission denied (publickey).");
+  });
+
+  it("offers all three real remedies for a refusal, not just a re-run", () => {
+    const out = renderHostChannelIssue({ code: "auth-refused", tried: ["root"] }, AT);
+    expect(out).toContain("--host-ssh-user");
+    expect(out).toContain("PermitRootLogin prohibit-password");
+    expect(out).toContain("--no-host-control");
+    // A refusal no longer leaves a channel behind, so it must say what happened to `.env`.
+    expect(out).toContain("is therefore unset");
+  });
+
+  it("quotes sshd's PermitRootLogin only as an explanation, and only when it refuses", () => {
+    const refusing = renderHostChannelIssue(
+      { code: "auth-refused", tried: ["root"], permitRootLogin: "no" },
+      AT,
+    );
+    expect(refusing).toContain("`PermitRootLogin no`");
+    // Whitespace-normalized: the note is prose wrapped to the terminal, so any phrase long
+    // enough to matter can land across a line break.
+    expect(unwrapped(refusing)).toContain("refuses a root login outright");
+    // `without-password` PERMITS publickey — the value is still reported, but claiming it
+    // caused the refusal would send the operator to change a working setting.
+    const permissive = renderHostChannelIssue(
+      { code: "auth-refused", tried: ["root"], permitRootLogin: "without-password" },
+      AT,
+    );
+    expect(permissive).toContain("`PermitRootLogin without-password`");
+    expect(unwrapped(permissive)).not.toContain("refuses a root login outright");
+  });
+
+  it("reports a connect failure as an ADDRESS problem, never as a refused key", () => {
+    const out = renderHostChannelIssue(
+      { code: "unreachable", detail: "ssh: connect to host 127.0.0.1 port 22: Connection refused" },
+      AT,
+    );
+    expect(out).toContain("ADDRESS problem, not a key problem");
+    expect(out).toContain("ListenAddress");
+    // The one thing it must never say: every non-zero `ssh` exit used to land here as a
+    // refused key, which sent operators to an authorized_keys sshd had never read.
+    expect(out).not.toContain("REFUSED the channel's key");
+    // The channel WAS written, so no continuity claim either way.
+    expect(out).not.toContain("is therefore unset");
+    expect(out).not.toContain("Kept the host channel");
+  });
+
+  it("separates forced-commands-only, where the key was ACCEPTED", () => {
+    const out = renderHostChannelIssue(
+      { code: "forced-command", account: "root", detail: "Connection closed by 127.0.0.1" },
+      AT,
+    );
+    expect(out).toContain("ACCEPTED the channel's key");
+    expect(out).toContain("forced-commands-only");
+    expect(out).not.toContain("REFUSED the channel's key");
+    // A key that can't run a command is not a channel, so nothing was written — and unlike
+    // the two host-level faults, this one has to say so.
+    expect(out).toContain("is therefore unset");
+  });
+
   it("always carries the reassurance, the blocked list and the re-check command", () => {
     // A degraded install is not a failed one, and an operator who reads only "host control
     // failed" tears down a box whose deploys were fine.
@@ -311,6 +521,9 @@ describe("renderHostChannelIssue", () => {
       { code: "empty-key" as const },
       { code: "error" as const },
       { code: "no-sshd" as const },
+      { code: "auth-refused" as const, tried: ["root"] },
+      { code: "unreachable" as const },
+      { code: "forced-command" as const },
     ]) {
       const out = renderHostChannelIssue(issue, AT);
       expect(out, issue.code).toContain("Ordinary deploys to this box still work");

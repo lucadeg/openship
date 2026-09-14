@@ -35,9 +35,17 @@ export async function runRetentionSweep(): Promise<{
   policiesProcessed: number;
   policiesSkipped: number;
   runsDeleted: number;
+  /** Runs whose objects the destination refused to delete — still on the books. */
+  runsDeferred: number;
   errors: number;
 }> {
-  const stats = { policiesProcessed: 0, policiesSkipped: 0, runsDeleted: 0, errors: 0 };
+  const stats = {
+    policiesProcessed: 0,
+    policiesSkipped: 0,
+    runsDeleted: 0,
+    runsDeferred: 0,
+    errors: 0,
+  };
 
   // Every enabled policy that HAS retention configured, cron or not. Walking
   // cron-scheduled policies missed the two triggers that produce runs
@@ -48,6 +56,7 @@ export async function runRetentionSweep(): Promise<{
     try {
       const result = await prunePolicy(policy);
       stats.runsDeleted += result.dropped;
+      stats.runsDeferred += result.deferred;
       if (result.skipped) {
         // Every skip is logged. Silence here is what let "retention is on" and
         // "retention runs" diverge for a whole release.
@@ -66,8 +75,13 @@ export async function runRetentionSweep(): Promise<{
   return stats;
 }
 
-/** Why a policy produced no pruning, or null when it was evaluated normally. */
-type PruneOutcome = { dropped: number; skipped: string | null };
+/**
+ * `skipped` is why a policy produced no pruning, or null when it was evaluated
+ * normally. `deferred` counts runs left in place because their objects could not be
+ * deleted — reported separately from `dropped` so "retention ran" and "the bytes are
+ * gone" cannot be read as the same number.
+ */
+type PruneOutcome = { dropped: number; deferred: number; skipped: string | null };
 
 const PRUNE_PAGE_SIZE = 500;
 
@@ -84,7 +98,7 @@ export async function prunePolicy(policy: BackupPolicy): Promise<PruneOutcome> {
   // migration 0096 backfilled the rows written before it. There is no fallback
   // here on purpose — one would override the explicit choice.
   if (!retainCount && !retainDays) {
-    return { dropped: 0, skipped: "retention set to unlimited" };
+    return { dropped: 0, deferred: 0, skipped: "retention set to unlimited" };
   }
 
   const destinationId = policy.destinationId;
@@ -100,7 +114,7 @@ export async function prunePolicy(policy: BackupPolicy): Promise<PruneOutcome> {
       ? ({ mailServerId: policy.mailServerId } as const)
       : null;
   if (!scope) {
-    return { dropped: 0, skipped: "policy has neither a project nor a mail server" };
+    return { dropped: 0, deferred: 0, skipped: "policy has neither a project nor a mail server" };
   }
   const organizationId = await policyOrganizationId(policy);
   if (!organizationId) {
@@ -109,6 +123,7 @@ export async function prunePolicy(policy: BackupPolicy): Promise<PruneOutcome> {
     // are now unprunable and someone has to go delete them by hand.
     return {
       dropped: 0,
+      deferred: 0,
       skipped: policy.projectId ? "project soft-deleted" : "mail server row is gone",
     };
   }
@@ -174,18 +189,19 @@ export async function prunePolicy(policy: BackupPolicy): Promise<PruneOutcome> {
     }
   }
 
-  if (toDelete.length === 0) return { dropped: 0, skipped: null };
+  if (toDelete.length === 0) return { dropped: 0, deferred: 0, skipped: null };
 
   const destinationRow = await repos.backupDestination.findById(destinationId);
   if (!destinationRow) {
     // The artifacts outlive the destination row, so they are now unreachable
     // AND unprunable. Worth saying out loud rather than returning zero.
-    return { dropped: 0, skipped: `destination ${destinationId} is gone` };
+    return { dropped: 0, deferred: 0, skipped: `destination ${destinationId} is gone` };
   }
   const adapterRow = await toAdapterRow(destinationRow);
   const destination = resolveDestination(adapterRow);
 
   let dropped = 0;
+  let deferred = 0;
   for (const run of toDelete) {
     try {
       const artifactKeys = Array.isArray(run.artifacts)
@@ -200,7 +216,27 @@ export async function prunePolicy(policy: BackupPolicy): Promise<PruneOutcome> {
       if (run.manifestKey) artifactKeys.push(run.manifestKey);
 
       if (artifactKeys.length > 0) {
-        await destination.deleteMany(artifactKeys);
+        // `deleteMany` RESOLVES on a partial failure — it reports per-key outcomes
+        // instead of throwing, and all three destinations count "already gone" as
+        // deleted, so a non-empty `failed` means those objects are still there.
+        //
+        // Soft-deleting the row anyway was a one-way leak: the row is the only record
+        // of which keys belong to this run, and every later sweep skips deleted rows,
+        // so nothing would ever retry them. The operator sees the run disappear and
+        // the quota not move, with no way to connect the two.
+        //
+        // Leaving the row alive costs one retained restore point until the next sweep;
+        // dropping it costs the bytes forever.
+        const { failed } = await destination.deleteMany(artifactKeys);
+        if (failed.length > 0) {
+          deferred += 1;
+          console.warn(
+            `[retention-prune] run ${run.id} kept: ${failed.length}/${artifactKeys.length} ` +
+              `object(s) could not be deleted, will retry next sweep — ` +
+              failed.map((f) => `${f.key}: ${f.error}`).join("; "),
+          );
+          continue;
+        }
       }
       await repos.backupRun.softDelete(run.id);
       dropped += 1;
@@ -210,6 +246,6 @@ export async function prunePolicy(policy: BackupPolicy): Promise<PruneOutcome> {
       );
     }
   }
-  return { dropped, skipped: null };
+  return { dropped, deferred, skipped: null };
 }
 

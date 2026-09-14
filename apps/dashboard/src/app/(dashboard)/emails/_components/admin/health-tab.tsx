@@ -61,6 +61,8 @@ import {
   type MailDeferralKind,
   type MailDeliveryHealth,
   type MailDeliveryStatus,
+  type MailPortReachability,
+  type MailPortReachabilityCheck,
 } from "@/lib/api";
 import { useToast } from "@/context/ToastContext";
 import { SectionCard } from "./_shared/section-card";
@@ -82,6 +84,8 @@ export function HealthTab({ serverId }: { serverId: string }) {
   // Same response as the daemons, so the same poll and the same error banner —
   // the send path is a second reading off one connection, not a second request.
   const [delivery, setDelivery] = useState<MailDeliveryHealth | null>(null);
+  const [reachability, setReachability] = useState<MailPortReachability | null>(null);
+  const [reachabilityRefreshing, setReachabilityRefreshing] = useState(false);
   const [componentsErr, setComponentsErr] = useState<string | null>(null);
   const [componentsLastUpdated, setComponentsLastUpdated] = useState<number | null>(null);
 
@@ -89,11 +93,12 @@ export function HealthTab({ serverId }: { serverId: string }) {
   const [dnsErr, setDnsErr] = useState<string | null>(null);
   const [dnsRefreshing, setDnsRefreshing] = useState(false);
 
-  const tickComponents = useCallback(async () => {
+  const tickComponents = useCallback(async (refreshReachability = false) => {
     try {
-      const r = await mailApi.getHealth(serverId);
+      const r = await mailApi.getHealth(serverId, refreshReachability);
       setComponents(r.components);
       setDelivery(r.delivery);
+      setReachability(r.reachability);
       setComponentsErr(null);
       setComponentsLastUpdated(Date.now());
     } catch (err) {
@@ -141,11 +146,22 @@ export function HealthTab({ serverId }: { serverId: string }) {
     }
   };
 
+  const onReachabilityRefresh = async () => {
+    if (reachabilityRefreshing) return;
+    setReachabilityRefreshing(true);
+    try {
+      await tickComponents(true);
+    } finally {
+      setReachabilityRefreshing(false);
+    }
+  };
+
   const summary = summarizeHealth(
     components,
     dns?.checks ?? null,
     delivery,
     t.emailsAdmin.health,
+    reachability,
   );
 
   return (
@@ -215,6 +231,13 @@ export function HealthTab({ serverId }: { serverId: string }) {
         ) : null}
       </SectionCard>
 
+      <ReachabilitySection
+        reachability={reachability}
+        error={componentsErr}
+        refreshing={reachabilityRefreshing}
+        onRefresh={onReachabilityRefresh}
+      />
+
       {/* ── Outbound delivery ─────────────────────────────────────────────
           Hidden only until the first reading lands, and only if that first
           reading failed — the error is already shown above, and an empty card
@@ -274,6 +297,140 @@ export function HealthTab({ serverId }: { serverId: string }) {
       </SectionCard>
     </div>
   );
+}
+
+export function ReachabilitySection({
+  reachability,
+  error,
+  refreshing,
+  onRefresh,
+}: {
+  reachability: MailPortReachability | null;
+  error: string | null;
+  refreshing: boolean;
+  onRefresh: () => void;
+}) {
+  const { t } = useI18n();
+  const h = t.emailsAdmin.health;
+  const providerBlocked =
+    reachability?.status === "fail" &&
+    reachability.ports.some((port) => port.status === "blocked");
+  return (
+    <SectionCard
+      title={h.reachability.title}
+      description={
+        reachability?.address
+          ? interpolate(h.reachability.descFor, {
+              hostname: reachability.hostname,
+              address: reachability.address,
+            })
+          : h.reachability.desc
+      }
+      density="split"
+      icon={Globe}
+      action={
+        <div className="flex items-center gap-3">
+          {reachability && (
+            <span className="text-[11px] text-muted-foreground tabular-nums">
+              {interpolate(h.updated, { time: timeAgo(reachability.checkedAt, h.time) })}
+            </span>
+          )}
+          <button
+            onClick={onRefresh}
+            disabled={refreshing}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-muted text-foreground hover:bg-muted/80 border border-border transition-colors disabled:opacity-50"
+          >
+            <RefreshCcw className={`size-3 ${refreshing ? "animate-spin" : ""}`} />
+            {h.rescan}
+          </button>
+        </div>
+      }
+    >
+      {!reachability && !error ? (
+        <ReachabilitySkeleton />
+      ) : reachability ? (
+        <>
+          {providerBlocked && (
+            <div className="px-5 py-3 text-sm text-danger border-b border-danger-border bg-danger-bg">
+              {h.reachability.remediation}
+            </div>
+          )}
+          {reachability.status === "unknown" && reachability.detail && (
+            <div className="px-5 py-3 text-sm text-warning border-b border-warning-border bg-warning-bg">
+              {reachability.detail}
+            </div>
+          )}
+          <div className="divide-y divide-border/40">
+            {reachability.ports.map((port) => (
+              <ReachabilityRow
+                key={port.key}
+                port={port}
+                unverified={reachability.status === "unknown" && port.status === "blocked"}
+              />
+            ))}
+          </div>
+        </>
+      ) : null}
+    </SectionCard>
+  );
+}
+
+function ReachabilityRow({
+  port,
+  unverified,
+}: {
+  port: MailPortReachabilityCheck;
+  unverified: boolean;
+}) {
+  const { t } = useI18n();
+  const copy = t.emailsAdmin.health.reachability;
+  // Keep the raw failed probe in the API response, but do not present an
+  // ambiguous SMTP timeout as a confirmed inbound firewall failure.
+  const displayStatus = unverified ? "unknown" : port.status;
+  const status = reachabilityPresentation(displayStatus);
+  const detail =
+    displayStatus === "reachable"
+      ? copy.reachableHint
+      : displayStatus === "blocked"
+        ? port.failure === "timeout"
+          ? copy.blockedTimeoutHint
+          : copy.blockedHint
+        : displayStatus === "not_listening"
+          ? copy.notListeningHint
+          : displayStatus === "not_exposed"
+            ? copy.notExposedHint
+            : port.detail || copy.unknownHint;
+
+  return (
+    <div className="flex items-center gap-4 px-5 py-4">
+      <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${status.iconBg}`}>
+        <status.Icon className={`size-5 ${status.iconColor}`} strokeWidth={2} />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 flex-wrap">
+          <p className="text-sm font-medium text-foreground">{copy.ports[port.key]}</p>
+          <span className="font-mono text-[11px] text-muted-foreground">TCP {port.port}</span>
+        </div>
+        <p className="text-xs text-muted-foreground mt-0.5">{detail}</p>
+      </div>
+      <StatusPill tone={status.tone}>{copy.status[displayStatus]}</StatusPill>
+    </div>
+  );
+}
+
+function reachabilityPresentation(status: MailPortReachabilityCheck["status"]): {
+  Icon: typeof CheckCircle2;
+  iconBg: string;
+  iconColor: string;
+  tone: PillTone;
+} {
+  if (status === "reachable") {
+    return { Icon: CheckCircle2, iconBg: "bg-success-bg", iconColor: "text-success", tone: "success" };
+  }
+  if (status === "unknown") {
+    return { Icon: CircleDashed, iconBg: "bg-muted", iconColor: "text-muted-foreground", tone: "neutral" };
+  }
+  return { Icon: Unplug, iconBg: "bg-danger-bg", iconColor: "text-danger", tone: "danger" };
 }
 
 // ─── Rows ────────────────────────────────────────────────────────────────────
@@ -784,6 +941,23 @@ function DeliverySkeleton() {
             <Skeleton className="h-3 w-52 max-w-full" />
             <Skeleton className="h-2.5 w-72 max-w-full" />
           </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ReachabilitySkeleton() {
+  return (
+    <div className="divide-y divide-border/40">
+      {Array.from({ length: 4 }).map((_, i) => (
+        <div key={i} className="flex items-center gap-4 px-5 py-4">
+          <Skeleton className="w-10 h-10 rounded-xl shrink-0" />
+          <div className="flex-1 space-y-2">
+            <Skeleton className="h-3 w-48 max-w-full" />
+            <Skeleton className="h-2.5 w-72 max-w-full" />
+          </div>
+          <Skeleton className="h-5 w-20 rounded-full shrink-0" />
         </div>
       ))}
     </div>

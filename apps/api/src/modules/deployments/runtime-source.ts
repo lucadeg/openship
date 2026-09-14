@@ -1,6 +1,12 @@
 import { isIgnoredRepoPath, type RepoTreeEntry } from "../../lib/project-root-detector";
 import type { ProjectReader } from "./project-reader";
-import { resolveFromReader, type ProjectInfo } from "./prepare.service";
+import {
+  resolveFromReader,
+  resolveSourceEnvFromReader,
+  type ProjectInfo,
+  type ProjectSourceEnv,
+  type ResolveOptions,
+} from "./prepare.service";
 
 /**
  * Framework detection for a folder that was UPLOADED into an Oblien cloud
@@ -93,10 +99,20 @@ export function createRuntimeReader(rt: RuntimeFilesClient): ProjectReader {
   };
 }
 
+/** Lightweight counterpart to resolveFromRuntime for an explicit single-app
+ * deploy: read environment defaults without interpreting a sibling Compose file. */
+export function resolveSourceEnvFromRuntime(
+  rt: RuntimeFilesClient,
+  rootDirectory = "",
+): Promise<ProjectSourceEnv> {
+  return resolveSourceEnvFromReader(createRuntimeReader(rt), rootDirectory);
+}
+
 /** Detect stack/build config for source uploaded into a cloud workspace. */
 export async function resolveFromRuntime(
   rt: RuntimeFilesClient,
   name: string,
+  opts: ResolveOptions = {},
 ): Promise<ProjectInfo> {
   const reader = createRuntimeReader(rt);
   const rootPackageJson = await reader.readJson("package.json");
@@ -112,5 +128,6 @@ export async function resolveFromRuntime(
       default_branch: "main",
     },
     "main",
+    opts,
   );
 }

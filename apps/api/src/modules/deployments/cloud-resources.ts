@@ -11,13 +11,17 @@
  * no workspace to size, and non-cloud targets keep the project's own resource
  * config.
  *
- * NOTE (current runtime coverage — plumbed, not yet fully enforced):
- *   - compose cloud: cpu/memory ARE applied (createImageServiceWorkspace);
- *     disk is currently hardcoded to the default (cloud/runtime/cloud/compose.ts).
- *   - single-app cloud: the deploy reuses the build workspace and the prod
- *     cpu/memory resize is intentionally disabled (cloud.ts `deploy()` TODO,
- *     "testing without resource shrink"), so the tier does NOT yet resize a
- *     single-app workspace. Re-enable that resize to make this fully effective.
+ * Runtime coverage:
+ *   - compose cloud: cpu/memory are applied by `createImageServiceWorkspace`;
+ *     disk stays at the default.
+ *   - single-app cloud: the deploy reuses the build workspace and then RESIZES it
+ *     to the prod tier — `ws.resources.update({ …, apply: true })` in
+ *     `runtime/cloud.ts`'s `deploy()`, in a 3-attempt retry that THROWS rather
+ *     than promote a build-sized workspace. So the tier is enforced, not advisory.
+ *
+ * (This block previously said the single-app resize was "intentionally disabled …
+ * testing without resource shrink". That stopped being true when the resize
+ * landed, and a stale note here reads as a known gap someone should go fix.)
  */
 
 import type { ResourceConfig } from "@repo/adapters";

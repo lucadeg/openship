@@ -29,6 +29,8 @@ import {
   managedImagesAreFromSource,
   swapManagedImage,
 } from "../managed-image";
+import { dirOf, elevatedExecutor } from "../elevated-executor";
+import { resolveEnvironment } from "../environment";
 import { waitForPortListening } from "../port-listen";
 import { rootOrDegrade } from "../privilege";
 import {
@@ -87,7 +89,7 @@ export interface ContainerMailOptions {
   /** The primary mail domain (FIRST_DOMAIN), injected into the engine on first boot. */
   domain: string;
   /**
-   * Per-install secrets (iRedMail DB passwords, etc.). Written to a root-only
+   * Per-install secrets (iRedMail DB passwords, etc.). Written to a 0600
    * env-file and passed via `--env-file`, never on the command line — so they
    * never appear in `ps`/shell history (the same no-shell-exposure rule the SASL
    * password write follows).
@@ -180,7 +182,12 @@ function mountArg(m: MailMount): string {
  */
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-/** Write a root-only env-file the launcher passes via `--env-file`. */
+/**
+ * Write the env-file the launcher passes via `--env-file`, mode 0600.
+ *
+ * Owned by whichever account this `executor` is — root when it is the elevated view, which
+ * is why every caller follows the write with {@link handOverEnvFile}.
+ */
 async function writeEnvFile(
   executor: CommandExecutor,
   path: string,
@@ -202,12 +209,107 @@ async function writeEnvFile(
       // whole rest of the line verbatim as the value.
       .map(([k, v]) => `${k}=${v}`)
       .join("\n") + "\n";
-  await executor.writeFile(path, body);
-  await executor.exec(`chmod 600 ${sq(path)}`).catch(() => {});
+  // Born private, not tightened after publication. The privileged executor's
+  // private staging path carries this mode through its root-owned rename.
+  await executor.writeFile(path, body, { mode: 0o600 });
 }
 
 const ENGINE_ENV_FILE = `${MAIL_HOST_STATE_DIR}/engine.env`;
 const DB_ENV_FILE = `${MAIL_HOST_STATE_DIR}/db.env`;
+
+/**
+ * Hand a secret env-file to the account that runs `docker`, and make sure it can reach it.
+ *
+ * GH-630: `docker run --env-file <path>` opens that file CLIENT-SIDE, in the CLI's own
+ * process, before it ever reaches the daemon socket — so it has to be readable by whoever
+ * invokes docker, and being in the `docker` group grants the socket, not the file. The
+ * elevated write publishes these root:root (`writeFile` chowns 0:0 so the `mv` cannot leave
+ * the file writable by the login user) and `writeEnvFile` creates it as 0600, which on a non-root
+ * login is exactly unreadable. Setting up mail died with `docker: --env-file: open
+ * /var/lib/openship/mail/db.env: permission denied`, surfaced as the unrelated-sounding
+ * "the mail database container failed to become ready".
+ *
+ * Moving the FILE rather than elevating the LAUNCH is the load-bearing choice. The docker
+ * CLI's identity also decides which DAEMON it reaches and which registry credentials it
+ * presents: `DOCKER_HOST` for a rootless daemon lives in the login user's shell profile,
+ * which `sudo -n sh -c` never reads (the #482 trap), and root has its own
+ * ~/.docker/config.json. A `docker run` elevated to root while every inspect and pull stays
+ * on the login user can therefore address a different daemon entirely — creating a SECOND
+ * host-network engine to fight the live one for :25, and passing verification anyway because
+ * the /proc port probe is daemon-blind. So every docker command on the mail path runs as one
+ * identity and only the file moves. (`installContainerEdge` does elevate its own docker, so
+ * this is not a repo-wide invariant: that path passes no `--env-file` and its bind mounts are
+ * resolved daemon-side by root, so it never needed the login user's view of the filesystem.)
+ *
+ * Three operations, and the two beyond the chown each close a way it silently fails anyway:
+ *
+ *  1. `chown` — the handover itself.
+ *  2. `chmod 400`, not 600. The kernel enforces the mode against the owner too, so
+ *     read-only keeps docker's client-side read working while an UNELEVATED `writeFile`
+ *     still fails loudly — and that refusal is load-bearing. `retainedDbPassword`'s
+ *     `test -s .../pgdata/PG_VERSION` probe reads "denied" as "no cluster" (pgdata is 0700
+ *     uid-999), so if elevation later degrades, a re-run mints a fresh superuser password
+ *     and would overwrite the only copy of the one the cluster was initialised with — GH-564
+ *     with its recovery value destroyed. Before this handover existed that write was refused
+ *     because the file was root's; 0400 keeps it refused now that it is the login user's.
+ *  3. `chmod a+x` on the two directories above it. Ownership is not reach: docker opens the
+ *     file as `loginUser`, so every component of the path must be traversable by it. The tree
+ *     is created by a bare `mkdir -p` (step 2) that takes the sudo session's umask — 0755 on
+ *     a default host, but 0750 wherever login.defs sets UMASK 027 (the CIS default), and
+ *     there the chown succeeds while the open fails with the identical error and nothing
+ *     warns. `a+x` grants search without listing, and only on the arm that needs it, so a
+ *     root-only box stays exactly as tight as it is today. Deliberately NOT `ensureOwnedDir`,
+ *     whose `chown -R` would hand the container's vmail and pgdata trees to the login user.
+ *
+ * Confidentiality is unchanged, and provably so from two directions: the account gaining
+ * ownership already held the plaintext, because `elevatedExecutor.writeFile` stages the
+ * content unelevated as that same login before publishing it; and it provably has arbitrary
+ * root, because the chown only lands if `sudo -n sh -c` does. It is the account Openship
+ * drives THIS SERVER as — a remote box's SSH login, not necessarily the one Openship itself
+ * runs under.
+ *
+ * `canSudo` is the exact condition, and it is a property of the writer rather than a guess: a
+ * root login already owns the file, and a login with no route to root wrote it itself
+ * (`rootOrDegrade` degrades to the caller's own executor) — and on the swap arm, where this
+ * run wrote nothing, has no route to root to repair it with either. A probe that cannot
+ * answer lands there too, which is why it degrades instead of throwing: `ensureContainerMail`
+ * documents that a best-effort image swap never throws, and this is the one await in it that
+ * would otherwise break that contract.
+ */
+async function handOverEnvFile(
+  executor: CommandExecutor,
+  path: string,
+  onLog: SystemLogCallback,
+): Promise<void> {
+  const profile = await resolveEnvironment(executor).catch(() => null);
+  if (!profile || profile.isRoot || !profile.canSudo) return;
+
+  // `$SUDO_USER` only as a last resort, so an owner we could not name fails loudly rather
+  // than expanding to nothing — `ensureOwnedDir` keeps the same fallback for the same reason.
+  // A uid with no passwd entry answers `opsh_uid`/`opsh_sudo` but leaves `opsh_user` empty,
+  // and that is precisely a host whose file IS root-owned and does need the handover.
+  const owner = profile.loginUser ? sq(profile.loginUser) : '"$SUDO_USER"';
+  const stateDir = dirOf(path);
+
+  // One `&&` chain: reach without ownership is as useless as ownership without reach, so a
+  // failure at any step has to reach the operator rather than leave a half-done handover
+  // reported as success.
+  await elevatedExecutor(executor)
+    .exec(
+      `chown ${owner} ${sq(path)} && chmod 400 ${sq(path)} && ` +
+        `chmod a+x ${sq(stateDir)} ${sq(dirOf(stateDir))}`,
+    )
+    .catch((err: unknown) => {
+      onLog(
+        log(
+          `Could not give ${profile.loginUser || "the login user"} access to ${path}: ` +
+            `${safeErrorMessage(err)}. docker opens --env-file as that account, so the mail ` +
+            "containers will fail to start.",
+          "warn",
+        ),
+      );
+    });
+}
 
 /** One key back out of an env-file we wrote. Same trivial `K=V` shape as `writeEnvFile`. */
 async function readEnvFileValue(
@@ -415,6 +517,14 @@ export async function ensureContainerMail(
   if (current) {
     if (current === image) return { container, dbContainer, image, updated: false };
 
+    // The `engine.env` this swap launches against was written by a PREVIOUS install, so on
+    // a box provisioned before GH-630 it is still root-owned and no amount of relaunching
+    // fixes it. Repair it here, or a non-root box can never update its engine: `startEngine`
+    // dies on the client-side `--env-file` open, `swapManagedImage` rolls back through the
+    // same callback and dies identically, and a perfectly healthy engine gets reported as
+    // `mailDown` with nothing in the log pointing at permissions.
+    await handOverEnvFile(executor, ENGINE_ENV_FILE, onLog);
+
     const start = makeMailStart(executor, container, opts);
     const swap = await swapManagedImage(executor, {
       kind: "mail",
@@ -510,6 +620,7 @@ export async function ensureContainerMail(
     POSTGRES_DB: MAIL_DB_NAME,
     POSTGRES_PASSWORD: dbRootPassword,
   });
+  await handOverEnvFile(executor, DB_ENV_FILE, onLog);
   await writeEnvFile(hostState, ENGINE_ENV_FILE, {
     FIRST_DOMAIN: opts.domain,
     OPENSHIP_MAIL_DB_HOST: MAIL_DB_HOST_BIND,
@@ -522,6 +633,7 @@ export async function ensureContainerMail(
     // one this deploy generated.
     ...(retainedRoot ? { PGSQL_ROOT_PASSWD: retainedRoot } : {}),
   });
+  await handOverEnvFile(executor, ENGINE_ENV_FILE, onLog);
 
   try {
     // 4. DB sidecar first — the engine's entrypoint blocks on it.

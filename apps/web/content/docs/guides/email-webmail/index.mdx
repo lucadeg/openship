@@ -269,10 +269,22 @@ plan it's hidden on purpose.
 </Callout>
 
 <Callout title="The “Check Port 25” step warns that port 25 is blocked" type="warn">
-This step is a check, not a wall — the install keeps going even when it warns. But outbound mail won't actually
-send until port 25 is open. Many hosting providers block it by default (some need a support request to open it).
-Ask your provider to open it, then use **Sending → Send test email** to confirm mail flows once setup has
-finished.
+This step is a check, not a wall — the install keeps going even when it warns. Direct-to-MX sending needs
+outbound port 25. Many hosting providers block it by default, including AWS. You can
+finish setup and route sending through an SMTP provider from the **Sending** tab (Amazon SES, and similar),
+then use **Sending → Send test email** to confirm mail flows.
+</Callout>
+
+<Callout title="“Verify Public Mail Ports” warns about TCP 25 but 465/587/993 are open" type="warn">
+On a single-server install the probe runs from the same machine it is testing. An outbound port-25 restriction
+can make `mail.example.com:25` time out even when the daemon listens on a non-loopback interface. If all three
+client ports complete a TCP handshake and only TCP 25 times out, setup continues with a warning. Connection
+refusals, routing errors, missing or loopback-only listeners, and client-port failures still stop setup.
+
+Health keeps inbound SMTP **unverified**. Check TCP 25 from an independent host or send a test message from
+another mail provider: open client ports do not prove that other mail servers can reach your inbound SMTP.
+If receiving fails, check inbound TCP 25 in the host and provider firewalls. A relay configured in **Sending**
+handles outgoing mail only.
 </Callout>
 
 <Callout title="Mail sends but lands in spam" type="warn">

@@ -33,6 +33,7 @@ import { projectsApi } from "@/lib/api";
 import { getApiErrorMessage } from "@/lib/api/client";
 import { invalidateProjectCaches } from "@/hooks/useProjectEndpoints";
 import { migrationNeedsOperator } from "@/utils/project-status";
+import { formatBytes } from "@/lib/formatBytes";
 import type { RouteStrategy } from "@/lib/api/settings";
 import type { OpenshipReadiness } from "@repo/core";
 import { workloadOf } from "@/context/deployment/types";
@@ -40,9 +41,10 @@ import ReadinessSection from "@/components/project-settings/ReadinessSection";
 import { ProjectMigrationCard } from "@/components/migration/ProjectMigrationCard";
 import { ProjectMigrationHistory } from "@/components/migration/ProjectMigrationHistory";
 import { ServerMigrationWizard } from "@/components/migration/ServerMigrationWizard";
+import { useAuth } from "@/context/AuthContext";
 
 interface Props {
-  onDeleteProject: (deleteApp?: boolean, wipeVolumes?: boolean, recordOnly?: boolean) => void;
+  onDeleteProject: (wipeVolumes?: boolean, recordOnly?: boolean) => void;
 }
 
 const ICON_TONES = {
@@ -51,9 +53,8 @@ const ICON_TONES = {
   red: "bg-danger-bg text-danger",
 } as const;
 
-// Cache and Transfer & Clone are mock UI — not wired to real actions yet.
-// Flip to true to reveal them once the backend is ready.
-const SHOW_MOCK_ADVANCED = false;
+// Transfer & Clone remains mock UI. Build-cache management below is real.
+const SHOW_MOCK_TRANSFER = false;
 
 function SectionCard({
   title,
@@ -131,6 +132,7 @@ function SectionCard({
 
 export const AdvancedSettings = ({ onDeleteProject }: Props) => {
   const { showToast } = useToast();
+  const { user } = useAuth();
   const { t } = useI18n();
   const { projectData } = useProjectSettings();
   // `enabled` is the server's answer (derived from disabled_at in enrichProject).
@@ -188,7 +190,6 @@ export const AdvancedSettings = ({ onDeleteProject }: Props) => {
 
   const [loading, setLoading] = useState({
     disableProject: false,
-    clearInstallCache: false,
     clearBuildCache: false,
   });
 
@@ -196,7 +197,7 @@ export const AdvancedSettings = ({ onDeleteProject }: Props) => {
    * Run one of this panel's async actions: hold the button, always release it,
    * and report a failure with the API's own reason.
    *
-   * All three actions used to hand-roll this and all three got it wrong the same
+   * These actions used to hand-roll this and got it wrong the same
    * way — they read `response.success` on a client that THROWS for any non-2xx
    * (see `api.post`). So the failure branch was unreachable, the throw escaped
    * the handler, and `setLoading(false)` never ran: the button sat spinning
@@ -235,19 +236,28 @@ export const AdvancedSettings = ({ onDeleteProject }: Props) => {
     invalidateProjectCaches(String(projectData.id));
   };
 
-  const handleClearInstallCache = () =>
-    runAction(
-      "clearInstallCache",
-      () => projectsApi.clearCache(projectData.id),
-      t.projectSettings.advanced.toast.clearInstallFailed,
-    );
-
-  const handleClearBuildCache = () =>
-    runAction(
+  const handleClearBuildCache = async () => {
+    if (!window.confirm(t.projectSettings.advanced.cache.clearBuildConfirm)) return;
+    let reclaimed = 0;
+    const ok = await runAction(
       "clearBuildCache",
-      () => projectsApi.clearBuild(projectData.id),
+      async () => {
+        const result = await projectsApi.clearBuild(projectData.id);
+        reclaimed = result.bytesReclaimed;
+      },
       t.projectSettings.advanced.toast.clearBuildFailed,
     );
+    if (!ok) return;
+    showToast(
+      reclaimed > 0
+        ? interpolate(t.projectSettings.advanced.cache.clearBuildSuccess, {
+            size: formatBytes(reclaimed),
+          })
+        : t.projectSettings.advanced.cache.clearBuildEmpty,
+      "success",
+      t.projectSettings.advanced.cache.clearBuild,
+    );
+  };
 
   const menu = t.projectSettings.advanced.projectMenu;
 
@@ -584,34 +594,21 @@ export const AdvancedSettings = ({ onDeleteProject }: Props) => {
           />
         </SectionCard>
 
-        {/* Cache Management (mock — hidden until wired) */}
-        {SHOW_MOCK_ADVANCED && (
+        {/* BuildKit cache is daemon-wide, so this is hidden for cloud projects
+            and its copy/confirmation explicitly name the host-wide scope. */}
+        {user?.role === "admin" && projectData?.deployTarget !== "cloud" && (
         <SectionCard
           title={t.projectSettings.advanced.cache.title}
           description={t.projectSettings.advanced.cache.description}
           icon={Package}
           iconTone="amber"
         >
-          <div className="grid gap-3 sm:grid-cols-2">
+          <div>
             <button
-              onClick={handleClearInstallCache}
-              disabled={loading.clearInstallCache}
-              className="flex items-center gap-3 rounded-xl border border-border/50 bg-muted/20 px-4 py-3 text-start transition-colors hover:bg-muted/40 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
-                <Package className="size-4 text-primary" />
-              </div>
-              <div className="min-w-0">
-                <p className="text-[13px] font-medium text-foreground">{t.projectSettings.advanced.cache.clearInstall}</p>
-                <p className="text-[12px] text-muted-foreground">{t.projectSettings.advanced.cache.clearInstallDesc}</p>
-              </div>
-              {loading.clearInstallCache && <Loader2 className="ms-auto size-4 animate-spin text-muted-foreground" />}
-            </button>
-
-            <button
-              onClick={handleClearBuildCache}
+              type="button"
+              onClick={() => void handleClearBuildCache()}
               disabled={loading.clearBuildCache}
-              className="flex items-center gap-3 rounded-xl border border-border/50 bg-muted/20 px-4 py-3 text-start transition-colors hover:bg-muted/40 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex w-full items-center gap-3 rounded-xl border border-border/50 bg-muted/20 px-4 py-3 text-start transition-colors hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
                 <Hammer className="size-4 text-primary" />
@@ -627,7 +624,7 @@ export const AdvancedSettings = ({ onDeleteProject }: Props) => {
         )}
 
         {/* Transfer & Clone (mock — hidden until wired) */}
-        {SHOW_MOCK_ADVANCED && (
+        {SHOW_MOCK_TRANSFER && (
         <SectionCard
           title={t.projectSettings.advanced.transfer.title}
           description={t.projectSettings.advanced.transfer.description}
@@ -1005,4 +1002,3 @@ function TransferOptions({
     </div>
   );
 }
-

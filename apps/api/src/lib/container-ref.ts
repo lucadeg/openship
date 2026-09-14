@@ -28,3 +28,24 @@ export function usableRef(ref: string | null | undefined): string | null {
 export function isRealContainerRef(ref: string | null | undefined): ref is string {
   return usableRef(ref) !== null;
 }
+
+/**
+ * Is this ref a filesystem DIRECTORY a runtime produced, rather than a Docker
+ * image or container?
+ *
+ * A static deploy stores a HOST PATH in the very columns that otherwise hold
+ * image tags and container ids: `service_deployment.image_ref` for a compose
+ * static sub-app, `deployment.image_ref` / `deployment.container_id` for a
+ * single-app static. Nothing in the column's type says which it is, so every
+ * consumer that picks a runtime VERB from one of those columns has to ask this
+ * question — and the ones that didn't picked `removeImage` for a directory, which
+ * is issue #640.
+ *
+ * The test is a LEADING slash, not `includes("/")`: an image tag legitimately
+ * contains slashes (`openship/my-app:bld_1`, `ghcr.io/org/img`) but can never
+ * start with one, and every artifact path this codebase writes is absolute.
+ */
+export function isArtifactRef(ref: string | null | undefined): boolean {
+  const usable = usableRef(ref);
+  return usable !== null && usable.startsWith("/");
+}

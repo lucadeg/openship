@@ -1,8 +1,9 @@
 /**
  * The event accelerator's contract is about RATE, not about classification.
  *
- * It never decides anything — `onEvent` doesn't even read the event — so there is
- * nothing here about whether a container is broken. What can go wrong is arithmetic
+ * It never decides anything — `onEvent` only applies the authoritative sweep's
+ * ownership index and a lifecycle-action allowlist — so there is nothing here
+ * about whether a container is broken. What can go wrong is arithmetic
  * on timers: a burst of events becoming a burst of sweeps, a flapping container
  * hammering a daemon, a fault that reaches only one observation and then waits 60s
  * for its second, a stream that drops and never comes back, or a subscription that
@@ -38,10 +39,12 @@ const h = vi.hoisted(() => ({
   release: vi.fn(),
   target: "selfhosted" as string,
   disabled: false,
+  tracked: true,
 }));
 
 vi.mock("./health-watch", () => ({
   runHealthWatch: h.run,
+  isTrackedHealthContainer: () => h.tracked,
   // Mirrors health-watch.ts's own helpers (asserted against the real pair by the
   // round-trip test there). Kept inline so this suite doesn't import the sweep.
   watchGroupKey: (serverId: string | null, organizationId: string) =>
@@ -170,6 +173,7 @@ beforeEach(async () => {
   boxes.clear();
   h.target = "selfhosted";
   h.disabled = false;
+  h.tracked = true;
   h.run.mockReset();
   h.run.mockResolvedValue(ZERO);
   h.retain.mockClear();

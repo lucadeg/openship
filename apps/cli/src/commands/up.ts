@@ -100,6 +100,9 @@ interface UpOpts {
    *  host.docker.internal:22) — rootless Docker, or a non-standard sshd. */
   hostSshHost?: string;
   hostSshPort?: string;
+  /** Pin the host account the channel logs in as, instead of letting provisioning settle
+   *  on one by dialing (#527: a box with `PermitRootLogin no` had no way to say so). */
+  hostSshUser?: string;
   /** Headless install: after the service is up, create the admin + register the
    *  domain from flags instead of prompting. Requires --admin-email + password. */
   nonInteractive?: boolean;
@@ -243,6 +246,10 @@ export const upCommand = new Command("up")
   .option(
     "--host-ssh-port <port>",
     "Compose mode: port the host's sshd listens on for host operations (default 22). Preserved across re-runs.",
+  )
+  .option(
+    "--host-ssh-user <name>",
+    "Compose mode: the host account the api container logs in as for host operations. Normally left unset — provisioning authorizes a key and DIALS to find an account this host's sshd actually accepts (root when invoked as root, otherwise the invoking user, falling back to $SUDO_USER when a root login is refused). Set this when neither is the account you want, or when sshd's rules mean neither works: the named account is used as-is and never falls back, so it must be able to log in over SSH and should have passwordless sudo (host operations elevate per command). Preserved across re-runs.",
   )
   .option(
     "--open-host-firewall",
@@ -467,6 +474,7 @@ async function runCompose(opts: UpOpts & { yes?: boolean }): Promise<{ apiPort: 
     // so the containers would keep an environment the file no longer shows.
     hostSshHost: opts.hostSshHost,
     hostSshPort: opts.hostSshPort,
+    hostSshUser: opts.hostSshUser,
     resetSecrets: opts.resetSecrets,
     mail: opts.mail,
   });
@@ -529,6 +537,7 @@ async function runCompose(opts: UpOpts & { yes?: boolean }): Promise<{ apiPort: 
     // configured with rather than resetting it to host.docker.internal:22.
     hostSshHost: opts.hostSshHost,
     hostSshPort: opts.hostSshPort,
+    hostSshUser: opts.hostSshUser,
     resetSecrets: opts.resetSecrets,
     // Absent on a re-run keeps the install's mode (resolveEnvConfig), so this
     // never flips a mail box back to the platform shell.

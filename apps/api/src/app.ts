@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { env, trustedOrigins } from "./config/env";
 import { handleApiError } from "./middleware/error-handler";
-import { rateLimiterFor } from "./middleware/rate-limiter";
+import { authRouteLimiter } from "./middleware/rate-limiter";
 import { clientIpMiddleware } from "./middleware/client-ip";
 import { betterAuthShield } from "./middleware/better-auth-shield";
 import { forceMcpConsent } from "./middleware/mcp-consent";
@@ -14,6 +14,7 @@ import { validatePlanPriceIds } from "@repo/core";
 import { resolvePlatformConfig } from "./lib/controller-helpers";
 import { runWithRequestStore } from "./lib/request-store";
 import { runWithCallSource } from "./lib/call-source";
+import { sanitizeRequestLogLine } from "./lib/request-log-redaction";
 
 import { authRoutes } from "./modules/auth/auth.routes";
 import { auth } from "./lib/auth";
@@ -58,6 +59,7 @@ import { reconcileAllSchedules } from "./modules/backups/triggers/cron";
 import { reconcileJobs } from "./modules/jobs/job.service";
 import { scheduleBillingAnniversary } from "./modules/billing/billing-anniversary.cron";
 import { ensureOblienWebhook } from "./lib/openship-cloud";
+import { ensureOblienDefaultQuota } from "./modules/billing/billing-oblien-quota";
 import { backfillWebhookSecrets } from "./modules/github/github.service";
 import { backupOrchestrator } from "./modules/backups/backup.orchestrator";
 import { getJobRunner } from "./lib/job-runner";
@@ -97,10 +99,10 @@ function requestScopedMetadata(
       // Non-JSON (an upstream error page): pass the plugin's own body through.
       return new Response(body, { status: res.status, headers });
     }
-    return new Response(
-      JSON.stringify(rewriteMetadataOrigin(metadata, publicOriginFor(req))),
-      { status: res.status, headers },
-    );
+    return new Response(JSON.stringify(rewriteMetadataOrigin(metadata, publicOriginFor(req))), {
+      status: res.status,
+      headers,
+    });
   };
 }
 
@@ -115,7 +117,13 @@ app.use(
     credentials: true,
   }),
 );
-app.use("*", logger());
+// Hono's default logger includes the raw query string and path. Invitation ids
+// are bearer credentials embedded in a path, while OAuth/signed credentials
+// commonly live in queries, so sanitize both before anything reaches stdout.
+app.use(
+  "*",
+  logger((line) => console.log(sanitizeRequestLogLine(line))),
+);
 // Seed a per-request memo store FIRST so every downstream handler shares it.
 // Collapses idempotent-per-request reads (cloud session validation, GitHub
 // auth-mode, installations) to one call each — a single /github/status was
@@ -147,11 +155,10 @@ app.onError(handleApiError);
 // policy. A global limiter ran upstream of auth, so it could never see `ctx`
 // (always default-anon) and double-charged routes with their own policy.
 //
-// Better Auth is a RAW catch-all (not secureRouter), so it carries its own:
-// POST → `auth-tight` (credential-stuffing), GET (get-session, OAuth
-// callbacks) → `default-anon` (hot). See lib/rate-limit/policies.ts.
-app.on("POST", "/api/auth/*", rateLimiterFor("auth-tight"));
-app.on("GET", "/api/auth/*", rateLimiterFor("default-anon"));
+// Better Auth is a RAW catch-all (not secureRouter), so it carries one central
+// limiter: POSTs and invitation bearer-token previews use `auth-tight`; ordinary
+// session/OAuth GETs use `default-anon`. A route must not add a second limiter.
+app.use("/api/auth/*", authRouteLimiter);
 
 // Shield Better Auth's organization-plugin reads (list-members,
 // list-invitations, get-active-member-role) — they leak admin-tier
@@ -250,7 +257,14 @@ const authCallbackHtml = `<!DOCTYPE html><html><head><title>Success</title></hea
 
 app.get("/auth/callback/install", (c) => {
   if (githubAuth.getGitHubAuthMode() === "app") {
-    return c.redirect(githubAuth.getInstallUrl());
+    // The setup URL's installation_id is attacker-controlled. A local App
+    // install is usable only when it carries the one-shot user/workspace state
+    // minted before OAuth. Never retain the old stateless fallback here.
+    const state = c.req.query("state")?.trim();
+    if (!state) {
+      return c.text("Missing GitHub installation state. Start again from Settings.", 400);
+    }
+    return c.redirect(`${githubAuth.getInstallUrl()}?state=${encodeURIComponent(state)}`);
   }
   return c.html(authCallbackHtml);
 });
@@ -275,9 +289,8 @@ setupWebSocket(app);
 // exec via the Docker runtime adapter. The controller picks via
 // resolveDeploymentRuntime() from the service's active deployment.
 {
-  const { serviceTerminalRoutes } = await import(
-    "./modules/service-terminal/service-terminal.routes"
-  );
+  const { serviceTerminalRoutes } =
+    await import("./modules/service-terminal/service-terminal.routes");
   app.route("/api/services/terminal", serviceTerminalRoutes);
 }
 
@@ -339,38 +352,43 @@ if (env.CLOUD_MODE) {
 // desktop installs. The runner is module-singleton; first access
 // here triggers Redis detection.
 {
-  const sweepStale = repos.backupRun.sweepStaleRuns(
-    "API restart while backup in flight",
-  );
-  const sweepStaleRestores = repos.backupRestore.sweepStaleRestores(
-    "API restart while restore in flight",
-  );
-  // A deploy is an in-process task driven by an in-memory build session, so a
-  // restart orphans any deployment still building/deploying/queued — the UI
-  // would otherwise hang on "Building" forever. Flip those to cancelled at boot
-  // (reconciling is left for the reconcile scheduler). Fire-and-forget.
-  void repos.deployment
-    .sweepStaleInFlight("Interrupted by a server restart — redeploy to try again.")
-    .then((n) => {
-      if (n > 0) console.log(`[boot] cancelled ${n} stale in-flight deployment(s)`);
-    })
-    .catch((err) => console.warn("[boot] sweepStaleInFlight failed:", err));
-  // A project's deletionInProgress flag can only survive from a teardown that
-  // died mid-flight (no teardown outlives a restart), so clear stuck locks at
-  // boot — otherwise the project refuses all deletes forever ("Another delete
-  // is already running"). Fire-and-forget; logs the count if any were stuck.
-  void repos.project.clearStaleDeletions().then((n) => {
-    if (n > 0) console.log(`[boot] cleared ${n} stale project deletion lock(s)`);
-  }).catch((err) => console.warn("[boot] clearStaleDeletions failed:", err));
+  // These rows represent process-owned work. A self-hosted instance has one API
+  // process, so its boot proves the previous owner died. CLOUD_MODE has several
+  // replicas sharing the same DB: one replica starting proves nothing about a
+  // worker or teardown on another, and sweeping it would manufacture false
+  // quiescence while that other process can still mutate runtime resources.
+  if (!env.CLOUD_MODE) {
+    // A self-hosted process restart proves every in-process worker from the old
+    // process is gone. Complete reconciliation BEFORE starting the runner: a
+    // fire-and-forget sweep can otherwise terminalize a backup/deploy/restore
+    // that the new process has already claimed.
+    const [runs, restores, deployments] = await Promise.all([
+      repos.backupRun.sweepStaleRuns("API restart while backup in flight"),
+      repos.backupRestore.sweepStaleRestores("API restart while restore in flight"),
+      repos.deployment.sweepStaleInFlight(
+        "Interrupted by a server restart — redeploy to try again.",
+      ),
+    ]);
+    if (runs > 0 || restores > 0) {
+      console.log(`[boot] swept ${runs} stale backup runs + ${restores} stale restores`);
+    }
+    if (deployments > 0) {
+      console.log(`[boot] cancelled ${deployments} stale in-flight deployment(s)`);
+    }
+
+    // Stale project deletion flags are reclaimed under the project advisory
+    // lock by the next teardown attempt. A blanket boot sweep can overlap work
+    // started by this process and clear a fresh fence, so it is deliberately
+    // not used here.
+  }
   // A Docker migration is an in-memory FSM that quiesces (stops) the source
   // containers before the target deploy — a restart mid-migration would strand
   // a stopped production stack forever. Restart the originals + roll back any
   // interrupted run. Self-hosted only (migrations don't run on the SaaS); the
   // dynamic import keeps the SSH/runtime chain out of the cloud boot path.
   if (!env.CLOUD_MODE) {
-    void import("./modules/migration/migration.orchestrator")
-      .then(({ migrationOrchestrator }) => migrationOrchestrator.recoverInterruptedMigrations())
-      .catch((err) => console.warn("[boot] migration recovery failed:", err));
+    const { migrationOrchestrator } = await import("./modules/migration/migration.orchestrator");
+    await migrationOrchestrator.recoverInterruptedMigrations();
   }
 
   const runner = await getJobRunner();
@@ -383,9 +401,7 @@ if (env.CLOUD_MODE) {
   // prunes, deployment reconcile) into the `job` table and register every
   // enabled row on the runner. Operator cron/enabled overrides survive restarts.
   void reconcileJobs()
-    .then((stats) =>
-      console.log(`[boot] jobs: ${stats.registered}/${stats.total} scheduled`),
-    )
+    .then((stats) => console.log(`[boot] jobs: ${stats.registered}/${stats.total} scheduled`))
     .catch((err) => console.warn("[boot] reconcileJobs failed:", err));
 
   // Self-hosted (single box): any job_run still "running" at boot was orphaned
@@ -412,6 +428,14 @@ if (env.CLOUD_MODE) {
   // never calls our receiver.
   void ensureOblienWebhook().catch((err) =>
     console.warn("[boot] ensureOblienWebhook failed:", err),
+  );
+
+  // Account-wide default credit ceiling, auto-applied by Oblien to any namespace
+  // created without an explicit setQuota. Backstop only — the spend path asserts
+  // the real ceiling — but it makes the free tier, not "unlimited", the failure
+  // mode of a forgotten quota push. Self-gating on CLOUD_MODE.
+  void ensureOblienDefaultQuota().catch((err) =>
+    console.warn("[boot] ensureOblienDefaultQuota failed:", err),
   );
 
   // Drain orgs that have no Oblien namespace recorded. Every org predates
@@ -477,14 +501,6 @@ if (env.CLOUD_MODE) {
       `[boot] backup schedules: ${stats.registered} registered, ${stats.skipped} skipped`,
     ),
   );
-
-  void Promise.all([sweepStale, sweepStaleRestores]).then(([runs, restores]) => {
-    if (runs > 0 || restores > 0) {
-      console.log(
-        `[boot] swept ${runs} stale backup runs + ${restores} stale restores`,
-      );
-    }
-  });
 }
 
 // ─── Notification delivery runner ───────────────────────────────────

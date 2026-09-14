@@ -15,16 +15,34 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { drive } from "./helpers/docker-helper-harness";
 
-/** The SFTP write stream, scriptable as "accepts bytes" or "wedged". */
+/**
+ * The SFTP write stream, scriptable as "accepts bytes" or "wedged".
+ *
+ * `bytesWritten` is named after ssh2's own WriteStream field, which it sets in the
+ * constructor and advances only in the `sftp.write` CALLBACK — i.e. once the server
+ * has acknowledged the write. `put` reads that field rather than counting bytes off
+ * the source stream, because a full write buffer accepts bytes from a fast producer
+ * long after the destination has stopped storing them, and the stall watchdog would
+ * read that as progress.
+ */
 class FakeWriteStream extends EventEmitter {
-  written = 0;
+  bytesWritten = 0;
   destroyedWith = false;
   /** When false, write() applies backpressure and 'drain' never comes. */
   accepting = true;
 
+  /**
+   * Accepts the chunk now, counts it LATER — ssh2 advances `bytesWritten` only in the
+   * `sftp.write` callback, once the server has acknowledged. The delay is the whole
+   * point of the fake: a version that counted synchronously could not tell "handed to
+   * the write buffer" from "stored on the far end", which is exactly the conflation
+   * `put`'s stall watchdog used to make.
+   */
   write(chunk: Buffer): boolean {
     if (!this.accepting) return false;
-    this.written += chunk.byteLength;
+    queueMicrotask(() => {
+      this.bytesWritten += chunk.byteLength;
+    });
     return true;
   }
   end() {
@@ -118,7 +136,7 @@ describe("SFTP upload silence is bounded, slowness is not", () => {
     body.end();
 
     await expect(drive(put, 60_000)).resolves.toMatchObject({ bytesWritten: 1024 });
-    expect(ws.written).toBe(1024);
+    expect(ws.bytesWritten).toBe(1024);
     expect(ws.destroyedWith).toBe(false);
   });
 });

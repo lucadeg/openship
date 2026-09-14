@@ -48,6 +48,26 @@ export class SshDisconnectedError extends Error {
   }
 }
 
+/**
+ * `ssh2.Client.exec()` reached the server, but the server rejected the exec
+ * request before returning a command stream. The distinction is important:
+ * arbitrary remote stderr is also surfaced as an Error, and must never become
+ * a reason to replay a command merely because it contains similar words.
+ */
+export class SshExecRequestError extends Error {
+  constructor(cause: Error) {
+    super(cause.message, { cause });
+    this.name = "SshExecRequestError";
+  }
+}
+
+export function isSshExecRequestError(err: unknown): boolean {
+  return (
+    err instanceof SshExecRequestError ||
+    (err instanceof Error && err.name === "SshExecRequestError")
+  );
+}
+
 export function isSshDisconnectedError(err: unknown): err is SshDisconnectedError {
   // instanceof for same-realm throws; name check survives a structured-clone /
   // re-thrown copy that lost its prototype across a boundary.
@@ -107,7 +127,15 @@ export function isRetryableRemoteConnectionError(err: unknown): boolean {
 }
 
 export function isRemoteConnectionError(err: unknown): boolean {
-  return isSshAuthError(err) || isRetryableRemoteConnectionError(err);
+  // An exec-request rejection is remote/protocol failure, so human-facing
+  // probes must abort instead of claiming a binary is absent. It deliberately
+  // is NOT globally retryable: SshExecutor already retries that command once,
+  // while a manager-level retry would replay the caller's entire callback.
+  return (
+    isSshAuthError(err) ||
+    isRetryableRemoteConnectionError(err) ||
+    isSshExecRequestError(err)
+  );
 }
 
 const MAX_COMMAND_CHARS = 120;

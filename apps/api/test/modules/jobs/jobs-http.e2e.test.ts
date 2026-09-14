@@ -6,16 +6,20 @@
  * config + run output are not readable across orgs (only server-admins of the
  * job's target servers; builtins stay member-visible).
  */
-import { describe, it, expect, beforeAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import { initPlatform, resetPlatform } from "@repo/adapters";
 import { makeApp, seedOwner, seedServer, resetJobs, installFakeRunner, req, db, schema, repos } from "./_harness";
 
 const app = makeApp();
+const runner = installFakeRunner();
 
-beforeAll(() => {
-  installFakeRunner();
+beforeAll(async () => {
+  await initPlatform({ target: "selfhosted", runtime: "docker" });
 });
+afterAll(() => resetPlatform());
 beforeEach(async () => {
   await resetJobs();
+  runner.recurring.clear();
 });
 
 describe("jobs HTTP — auth + CRUD", () => {
@@ -249,21 +253,151 @@ describe("jobs HTTP — fix #2: cross-org write isolation", () => {
     expect(await repos.job.findByKey(key)).toBeNull();
   });
 
-  it("system jobs stay tunable by any member, and still refuse deletion", async () => {
-    // Builtins store no actionConfig → no target servers → nothing to gate on.
-    // They are instance operations, so this must not become owner-of-org-A-only.
-    const a = await seedOwner();
-    const b = await seedOwner();
-    await seedSystemJob("test:builtin-write");
+  it("only an instance admin can mutate or run an instance-wide system job", async () => {
+    // Every ordinary user owns a personal org, so an org-owner check is not an
+    // instance boundary. Reproduce the advisory's encoded dispatcher route.
+    const orgOwner = await seedOwner();
+    const victim = await seedOwner();
+    const instanceAdmin = await seedOwner({ instanceAdmin: true });
+    const victimServer = await seedServer(victim.orgId);
+    const victimJob = "custom:victim-once";
+    const now = new Date();
+    await db.insert(schema.job).values({
+      id: "job_victim_once",
+      key: victimJob,
+      kind: "custom",
+      label: "Victim once",
+      scheduleType: "once",
+      runAt: new Date(Date.now() - 60_000),
+      enabled: true,
+      actionType: "command",
+      actionConfig: { serverIds: [victimServer], command: "true" },
+      createdBy: victim.userId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await seedSystemJob("jobs:oneshot");
+
+    const deniedRun = await req(app, "POST", "/jobs%3Aoneshot/run", {
+      auth: orgOwner.auth,
+    });
+    expect(deniedRun.status).toBe(403);
+    expect(deniedRun.body.code).toBe("FORBIDDEN");
+    expect(deniedRun.body.error).toBe("Requires an instance administrator");
+    expect(await repos.jobRun.listRecent({ jobId: "jobs:oneshot" })).toEqual([]);
+    expect(await repos.jobRun.listRecent({ jobId: victimJob })).toEqual([]);
+    expect(await repos.job.findByKey(victimJob)).toMatchObject({
+      enabled: true,
+      runAt: expect.any(Date),
+    });
+
+    const deniedPatch = await req(app, "PATCH", "/jobs%3Aoneshot", {
+      auth: orgOwner.auth,
+      body: { enabled: false },
+    });
+    expect(deniedPatch.status).toBe(403);
+    expect((await repos.job.findByKey("jobs:oneshot"))?.enabled).toBe(true);
+
+    // Keep the positive instance-admin case independent of the denied victim.
+    await repos.job.remove(victimJob);
+
+    const allowedRun = await req(app, "POST", "/jobs%3Aoneshot/run", {
+      auth: instanceAdmin.auth,
+    });
+    expect(allowedRun.status).toBe(200);
+    expect(allowedRun.body.data).toMatchObject({
+      key: "jobs:oneshot",
+      summary: { fired: 0 },
+    });
 
     expect(
-      (await req(app, "PATCH", "/test:builtin-write", { auth: b.auth, body: { enabled: false } })).status,
+      (
+        await req(app, "PATCH", "/jobs%3Aoneshot", {
+          auth: instanceAdmin.auth,
+          body: { enabled: false },
+        })
+      ).status,
     ).toBe(200);
-    expect((await repos.job.findByKey("test:builtin-write"))?.enabled).toBe(false);
+    expect((await repos.job.findByKey("jobs:oneshot"))?.enabled).toBe(false);
+  });
 
-    const del = await req(app, "DELETE", "/test:builtin-write", { auth: a.auth });
-    expect(del.status).toBeGreaterThanOrEqual(400);
-    expect(await repos.job.findByKey("test:builtin-write")).not.toBeNull();
+  it("self-heals a missing registered system job and keeps one row + schedule", async () => {
+    const instanceAdmin = await seedOwner({ instanceAdmin: true });
+    const path = "/services%3Ahealth-watch";
+
+    // Exercise the same boot/request race that produced `Job not found`: both
+    // requests see no row and converge through the registry-backed upsert.
+    const results = await Promise.all([
+      req(app, "PATCH", path, { auth: instanceAdmin.auth, body: { enabled: true } }),
+      req(app, "PATCH", path, { auth: instanceAdmin.auth, body: { enabled: true } }),
+    ]);
+    expect(results.map((result) => result.status)).toEqual([200, 200]);
+
+    const matchingRows = (await repos.job.listAll()).filter(
+      (row) => row.key === "services:health-watch",
+    );
+    expect(matchingRows).toHaveLength(1);
+    expect(matchingRows[0]).toMatchObject({
+      kind: "system",
+      actionType: "builtin",
+      label: "Container health watch",
+      cronExpression: "* * * * *",
+      enabled: true,
+    });
+    expect([...runner.recurring.keys()].filter((key) => key === "services:health-watch")).toHaveLength(1);
+
+    // A later click is idempotent too: no second definition and no second timer.
+    expect((await req(app, "PATCH", path, {
+      auth: instanceAdmin.auth,
+      body: { enabled: true },
+    })).status).toBe(200);
+    expect((await repos.job.listAll()).filter((row) => row.key === "services:health-watch")).toHaveLength(1);
+    expect([...runner.recurring.keys()].filter((key) => key === "services:health-watch")).toHaveLength(1);
+
+    // The registration is the registry's real health-watch callback, wrapped by
+    // the normal job-run recorder—not a second Health-tab implementation.
+    await runner.tick("services:health-watch");
+    expect(await repos.jobRun.listRecent({ jobId: "services:health-watch", limit: 5 })).toMatchObject([
+      { status: "success", trigger: "schedule", kind: "system" },
+    ]);
+  });
+
+  it("authorizes a missing registered system job before creating it", async () => {
+    const orgOwner = await seedOwner();
+    const denied = await req(app, "PATCH", "/services%3Ahealth-watch", {
+      auth: orgOwner.auth,
+      body: { enabled: true },
+    });
+
+    expect(denied.status).toBe(403);
+    expect(denied.body.error).toBe("Requires an instance administrator");
+    expect(await repos.job.findByKey("services:health-watch")).toBeNull();
+    expect(runner.recurring.has("services:health-watch")).toBe(false);
+  });
+
+  it("keeps operator settings when concurrent system-job ensures converge", async () => {
+    const definition = {
+      key: "services:health-watch",
+      label: "Container health watch",
+      defaultCron: "* * * * *",
+    };
+    await repos.job.upsertSystem(definition);
+    await repos.job.update(definition.key, {
+      enabled: false,
+      cronExpression: "*/7 * * * *",
+    });
+
+    await Promise.all([
+      repos.job.upsertSystem(definition),
+      repos.job.upsertSystem(definition),
+      repos.job.upsertSystem(definition),
+    ]);
+
+    expect((await repos.job.listAll()).filter((row) => row.key === definition.key)).toHaveLength(1);
+    expect(await repos.job.findByKey(definition.key)).toMatchObject({
+      enabled: false,
+      cronExpression: "*/7 * * * *",
+    });
   });
 
   it("an unknown key is 404 on both write verbs", async () => {

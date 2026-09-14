@@ -29,6 +29,7 @@ import {
   type OpenshipService,
   type ParseResult,
 } from "./schema";
+import { isValidEnvKey } from "../utils";
 
 const TOP_LEVEL_KEYS = new Set([
   "$schema",
@@ -139,6 +140,38 @@ function parseEnv(ctx: Ctx, v: unknown, path: string): OpenshipEnv | undefined {
   return out;
 }
 
+/**
+ * Parse the native service build-argument map into the same normalized shape
+ * used by Compose imports. `null` deliberately means "inherit this key from
+ * the project build environment"; explicit values are strings and win later in
+ * the shared Docker build-argument resolver.
+ */
+function parseBuildArgs(
+  ctx: Ctx,
+  v: unknown,
+  path: string,
+): Record<string, string | null> | undefined {
+  if (v === undefined) return undefined;
+  if (!ctx.isObj(v)) {
+    ctx.err(path, "must be an object of string or null build arguments");
+    return undefined;
+  }
+
+  const out: Record<string, string | null> = {};
+  for (const [key, value] of Object.entries(v)) {
+    if (!isValidEnvKey(key)) {
+      ctx.err(`${path}.${key}`, "has an invalid build argument name");
+      continue;
+    }
+    if (value === null || typeof value === "string") {
+      out[key] = value;
+    } else {
+      ctx.err(`${path}.${key}`, "must be a string or null");
+    }
+  }
+  return out;
+}
+
 function parseDomains(ctx: Ctx, v: unknown, path: string): OpenshipDomain[] | undefined {
   if (v === undefined) return undefined;
   if (!Array.isArray(v)) {
@@ -186,7 +219,9 @@ function parseRoutes(ctx: Ctx, v: unknown, path: string): RoutingConfig | undefi
     return source && destination ? { source, destination } : null;
   };
   if (Array.isArray(v.rewrites)) {
-    routes.rewrites = v.rewrites.map((r, i) => rule(r, `${path}.rewrites[${i}]`)).filter(Boolean) as RoutingConfig["rewrites"];
+    routes.rewrites = v.rewrites
+      .map((r, i) => rule(r, `${path}.rewrites[${i}]`))
+      .filter(Boolean) as RoutingConfig["rewrites"];
   } else if (v.rewrites !== undefined) ctx.err(`${path}.rewrites`, "must be an array");
   if (Array.isArray(v.redirects)) {
     routes.redirects = v.redirects
@@ -215,7 +250,10 @@ function parseRoutes(ctx: Ctx, v: unknown, path: string): RoutingConfig | undefi
           ? (h.headers
               .map((kv, j) => {
                 const key = ctx.str((kv as Record<string, unknown>)?.key, `${p}.headers[${j}].key`);
-                const value = ctx.str((kv as Record<string, unknown>)?.value, `${p}.headers[${j}].value`);
+                const value = ctx.str(
+                  (kv as Record<string, unknown>)?.value,
+                  `${p}.headers[${j}].value`,
+                );
                 return key && value !== undefined ? { key, value } : null;
               })
               .filter(Boolean) as { key: string; value: string }[])
@@ -323,6 +361,7 @@ function parseServices(ctx: Ctx, v: unknown, path: string): OpenshipService[] | 
       image: ctx.str(item.image, `${p}.image`),
       build: ctx.str(item.build, `${p}.build`),
       dockerfile: ctx.str(item.dockerfile, `${p}.dockerfile`),
+      buildArgs: parseBuildArgs(ctx, item.buildArgs, `${p}.buildArgs`),
       ports: ctx.strArray(item.ports, `${p}.ports`),
       volumes: ctx.strArray(item.volumes, `${p}.volumes`),
       dependsOn: ctx.strArray(item.dependsOn, `${p}.dependsOn`),

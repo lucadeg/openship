@@ -57,12 +57,12 @@
  * on a legacy host-native box both are the same file and the commands run bare.
  *
  * SECURITY (see security-invariants): the SASL credentials are operator-
- * supplied and attacker-influenceable. They are written via `exec.writeFile`
- * (SFTP — NO shell), never interpolated into a shell string. Only fixed
- * commands + the regex-validated host run through the shell. We also reject
- * newline / `:` injection into the sasl_passwd line so the map can't be
- * corrupted. amavis keeps signing DKIM before Postfix hands off, so DMARC
- * still passes on DKIM alignment through the relay.
+ * supplied and attacker-influenceable. They are written to a private, mode-0600
+ * sibling via the host-file executor and atomically renamed — never interpolated
+ * into a shell string. Only fixed commands + the regex-validated host run through
+ * the shell. We also reject newline / `:` injection into the sasl_passwd line so
+ * the map can't be corrupted. amavis keeps signing DKIM before Postfix hands off,
+ * so DMARC still passes on DKIM alignment through the relay.
  */
 
 import type { CommandExecutor } from "@repo/adapters";
@@ -85,6 +85,8 @@ import {
   mailEngineCommand,
   mailConfigFile,
   requireMailEngine,
+  resolveMailMutationAccess,
+  writeMailConfigFile,
   type MailEngineFlavor,
 } from "../mail-engine";
 import {
@@ -111,8 +113,8 @@ const TLS_POLICY_PARAM = "smtp_tls_policy_maps";
 /**
  * The flavor-specific halves of every command below, resolved once per operation.
  *
- * `saslMap.write` is where `exec.writeFile` (SFTP, no shell — the SASL-password
- * security invariant) lands the map; `saslMap.engine` is the path Postfix itself
+ * `saslMap.write` is where the host-file executor atomically lands the map;
+ * `saslMap.engine` is the path Postfix itself
  * reads, which is what `postmap`/`postconf` must reference. On the container flavor
  * those are the two ends of a bind mount; on a legacy box they're one file.
  * `tlsPolicy` is the same pair for the per-nexthop TLS policy map.
@@ -125,13 +127,23 @@ async function relayTransport(exec: CommandExecutor): Promise<{
   flavor: MailEngineFlavor;
   saslMap: { write: string; engine: string };
   tlsPolicy: { write: string; engine: string };
+  hostFiles: CommandExecutor;
+  engineExec: CommandExecutor;
   engine: (cmd: string) => string;
 }> {
   const { flavor } = await requireMailEngine(exec);
+  const saslMap = mailConfigFile(flavor, "saslPasswd");
+  const tlsPolicy = mailConfigFile(flavor, "relayTlsPolicy");
+  const { hostFiles, engineExec } = await resolveMailMutationAccess(exec, flavor, [
+    { path: saslMap.write },
+    { path: tlsPolicy.write },
+  ]);
   return {
     flavor,
-    saslMap: mailConfigFile(flavor, "saslPasswd"),
-    tlsPolicy: mailConfigFile(flavor, "relayTlsPolicy"),
+    saslMap,
+    tlsPolicy,
+    hostFiles,
+    engineExec,
     engine: (cmd: string) => mailEngineCommand(flavor, cmd),
   };
 }
@@ -444,15 +456,18 @@ async function readParam(
  * and clobbering it would silently downgrade those destinations.
  */
 async function pinRelayTlsPolicy(
-  exec: CommandExecutor,
+  hostFiles: CommandExecutor,
+  engineExec: CommandExecutor,
   engine: (cmd: string) => string,
   tlsPolicy: { write: string; engine: string },
   nexthop: string,
 ): Promise<string> {
-  await exec.writeFile(tlsPolicy.write, `${nexthop} encrypt\n`);
-  await exec.exec(engine(`postmap ${tlsPolicy.engine}`));
+  await writeMailConfigFile(hostFiles, tlsPolicy.write, `${nexthop} encrypt\n`, {
+    mode: 0o644,
+  });
+  await engineExec.exec(engine(`postmap ${tlsPolicy.engine}`));
   const ours = `hash:${tlsPolicy.engine}`;
-  const parts = (await readParam(exec, engine, TLS_POLICY_PARAM)).split(/[\s,]+/).filter(Boolean);
+  const parts = (await readParam(engineExec, engine, TLS_POLICY_PARAM)).split(/[\s,]+/).filter(Boolean);
   if (!parts.includes(ours)) parts.push(ours);
   return parts.join(" ");
 }
@@ -463,20 +478,24 @@ async function pinRelayTlsPolicy(
  * which is not the same as unset) and remove the map file.
  */
 async function dropRelayTlsPolicy(
-  exec: CommandExecutor,
+  hostFiles: CommandExecutor,
+  engineExec: CommandExecutor,
   engine: (cmd: string) => string,
   tlsPolicy: { write: string; engine: string },
 ): Promise<void> {
   const ours = `hash:${tlsPolicy.engine}`;
-  const rest = (await readParam(exec, engine, TLS_POLICY_PARAM))
+  const rest = (await readParam(engineExec, engine, TLS_POLICY_PARAM))
     .split(/[\s,]+/)
     .filter((p) => p && p !== ours);
   if (rest.length) {
-    await exec.exec(engine(`postconf -e ${sq(`${TLS_POLICY_PARAM}=${rest.join(" ")}`)}`));
+    await engineExec.exec(engine(`postconf -e ${sq(`${TLS_POLICY_PARAM}=${rest.join(" ")}`)}`));
   } else {
-    await exec.exec(engine(`postconf -X ${TLS_POLICY_PARAM}`) + " 2>/dev/null || true");
+    await engineExec.exec(engine(`postconf -X ${TLS_POLICY_PARAM}`) + " 2>/dev/null || true");
   }
-  await exec.exec(`rm -f ${tlsPolicy.write} ${tlsPolicy.write}.db`).catch(() => {});
+  // Keep one SSH channel at a time. A channel failure resets the pooled
+  // connection, which would tear down a concurrent sibling operation too.
+  await hostFiles.rm(tlsPolicy.write).catch(() => undefined);
+  await hostFiles.rm(`${tlsPolicy.write}.db`).catch(() => undefined);
 }
 
 /**
@@ -489,7 +508,7 @@ export async function configureOutboundRelay(
   input: ConfigureRelayInput,
 ): Promise<MailServerState> {
   validate(input);
-  const { saslMap, tlsPolicy, engine } = await relayTransport(exec);
+  const { saslMap, tlsPolicy, hostFiles, engineExec, engine } = await relayTransport(exec);
   const host = resolveHost(input);
   const scope: "all" | "selected" = input.scope === "selected" ? "selected" : "all";
   const nexthop = `[${host}]:${input.port}`;
@@ -502,17 +521,22 @@ export async function configureOutboundRelay(
       ? `[${priorRelay.host}]:${priorRelay.port}`
       : undefined;
 
-  // 1) Write the SASL map via SFTP (creds never touch a shell string). On the
-  //    container flavor that's the host end of the bind mount; Postfix sees it at
-  //    saslMap.engine.
-  await exec.writeFile(saslMap.write, `${nexthop} ${input.username}:${input.password}\n`);
+  // 1) Write the SASL map through a private 0600 sibling and atomically rename it
+  //    (creds never touch a shell string). On the container flavor that's the host
+  //    end of the bind mount; Postfix sees it at saslMap.engine.
+  await writeMailConfigFile(
+    hostFiles,
+    saslMap.write,
+    `${nexthop} ${input.username}:${input.password}\n`,
+    { mode: 0o600 },
+  );
 
-  // 2) Lock down + hash the map. chmod the path we wrote; `postmap` must build the
-  //    .db with the Postfix that will READ it (its Berkeley-DB version), so it runs
-  //    wherever the engine is.
-  await exec.exec(`chmod 600 ${saslMap.write}`);
-  await exec.exec(engine(`postmap ${saslMap.engine}`));
-  await exec.exec(`chmod 600 ${saslMap.write}.db`).catch(() => {});
+  // 2) Hash the already-0600 source map. `postmap` must build the .db with the
+  //    Postfix that will READ it (its Berkeley-DB version), so it runs wherever
+  //    the engine is. The same engine identity owns the generated DB and can
+  //    tighten it even when host access comes from an ACL rather than sudo.
+  await engineExec.exec(engine(`postmap ${saslMap.engine}`));
+  await engineExec.exec(engine(`chmod 600 ${sq(`${saslMap.engine}.db`)}`));
 
   // 3) SASL directives always; the GLOBAL relayhost only in "all" scope. In
   //    "selected" scope we clear the global relayhost so unmatched senders keep
@@ -536,7 +560,7 @@ export async function configureOutboundRelay(
   //     idempotent, so re-saving a relay is a no-op. Unconditional rather than
   //     inside the "all" branch: "selected" leaves the global at `may` today,
   //     but an operator may have hardened it by hand.
-  await exec
+  await engineExec
     .exec(engine(`postconf -P ${sq("smtp-amavis/unix/smtp_tls_security_level=none")}`))
     .catch(() => {});
 
@@ -546,9 +570,9 @@ export async function configureOutboundRelay(
     // that happens to use the same smtp client.
     sasl.push("smtp_tls_security_level=encrypt");
     if (input.port === IMPLICIT_TLS_PORT) sasl.push("smtp_tls_wrappermode=yes");
-    await exec.exec(engine(`postconf -e ${[`relayhost=${nexthop}`, ...sasl].map(sq).join(" ")}`));
+    await engineExec.exec(engine(`postconf -e ${[`relayhost=${nexthop}`, ...sasl].map(sq).join(" ")}`));
     // A per-nexthop policy would be redundant, and stale if we came from "selected".
-    await dropRelayTlsPolicy(exec, engine, tlsPolicy);
+    await dropRelayTlsPolicy(hostFiles, engineExec, engine, tlsPolicy);
     // No per-sender rows for a relay we now route globally — including rows for a
     // host we just replaced, which would otherwise override the global relayhost
     // for those senders and point at credentials we no longer hold. Rows for any
@@ -559,17 +583,17 @@ export async function configureOutboundRelay(
         (priorNexthop ? ` OR relayhost = ${q(priorNexthop)}` : ""),
     ).catch(() => {});
   } else {
-    await exec.exec(engine("postconf -X relayhost") + " 2>/dev/null || true");
+    await engineExec.exec(engine("postconf -X relayhost") + " 2>/dev/null || true");
     // Opportunistic globally (the engine default) so non-relayed domains still
     // reach MXes without STARTTLS; `encrypt` applies to the relay hop only.
     sasl.push("smtp_tls_security_level=may");
-    const policyMaps = await pinRelayTlsPolicy(exec, engine, tlsPolicy, nexthop);
-    await exec.exec(
+    const policyMaps = await pinRelayTlsPolicy(hostFiles, engineExec, engine, tlsPolicy, nexthop);
+    await engineExec.exec(
       engine(`postconf -e ${[...sasl, `${TLS_POLICY_PARAM}=${policyMaps}`].map(sq).join(" ")}`),
     );
     // Implicit TLS is global-only and `validate` rejects :465 here, but a box that
     // previously relayed everything through :465 still has the flag set.
-    await exec.exec(engine("postconf -X smtp_tls_wrappermode") + " 2>/dev/null || true");
+    await engineExec.exec(engine("postconf -X smtp_tls_wrappermode") + " 2>/dev/null || true");
 
     // Sender rows: `@domain` for whole domains, bare address for single senders.
     // Postfix's map query is most-specific-first, so both may coexist.
@@ -592,7 +616,7 @@ export async function configureOutboundRelay(
   }
 
   // 4) Reload Postfix (inside the engine).
-  await exec.exec(engine("postfix reload"));
+  await engineExec.exec(engine("postfix reload"));
 
   // 5) Persist the relay block (encrypted password) + fan DNS across every
   //    relayed domain (primary + additional).
@@ -630,19 +654,20 @@ export async function configureOutboundRelay(
 
 /** Disable the outbound relay — revert Postfix to direct-to-MX + clear state. */
 export async function disableOutboundRelay(exec: CommandExecutor): Promise<MailServerState | null> {
-  const { saslMap, tlsPolicy, engine } = await relayTransport(exec);
+  const { saslMap, tlsPolicy, hostFiles, engineExec, engine } = await relayTransport(exec);
 
   // Remove the relay-specific directives (leave smtp_tls_security_level — it's
   // good hygiene for direct delivery too and reverting it could weaken TLS).
-  await exec.exec(
+  await engineExec.exec(
     engine(
       "postconf -X relayhost smtp_sasl_auth_enable smtp_sasl_password_maps smtp_sasl_security_options smtp_tls_wrappermode",
     ) + " 2>/dev/null || true",
   );
-  await exec.exec(`rm -f ${saslMap.write} ${saslMap.write}.db`);
+  await hostFiles.rm(saslMap.write);
+  await hostFiles.rm(`${saslMap.write}.db`);
   // The per-nexthop `encrypt` policy only made sense while the relay existed; a
   // leftover entry would pin TLS for a destination we no longer send to.
-  await dropRelayTlsPolicy(exec, engine, tlsPolicy);
+  await dropRelayTlsPolicy(hostFiles, engineExec, engine, tlsPolicy);
 
   // Delete the per-sender rows we own for this relay host (no `active` column —
   // presence = active, so disable must DELETE rather than deactivate).
@@ -654,7 +679,7 @@ export async function disableOutboundRelay(exec: CommandExecutor): Promise<MailS
     await execute(exec, `DELETE FROM sender_relayhost WHERE relayhost = ${q(nexthop)}`).catch(() => {});
   }
 
-  await exec.exec(engine("postfix reload"));
+  await engineExec.exec(engine("postfix reload"));
 
   const state = await readState(exec);
   if (!state) return null;

@@ -18,12 +18,10 @@ import * as githubAuth from "./github.auth";
 import * as githubService from "./github.service";
 import { createGitHubSource } from "./sources";
 import { filterAllowedRepos, filterAllowedAccounts, filterTreeEntries } from "./github-access";
-import {
-  resolveProjectInfo,
-  projectInfoToScanResponse,
-} from "../deployments/prepare.service";
+import { resolveProjectInfo, projectInfoToScanResponse } from "../deployments/prepare.service";
 import { paginateRepoList, type RepoListParams } from "./repo-list";
 import { getRequestContext } from "../../lib/request-context";
+import { hasConfiguredGitHubSource } from "./github-source.service";
 
 /** Map a MappedRepository to the owner/repo key the access filter needs.
  *  `full_name` is canonically "owner/repo"; fall back to the discrete
@@ -75,9 +73,10 @@ export async function getStatus(c: Context) {
   // The Settings card owns the "Install App" affordance, so the install URL is
   // resolved HERE (cloud round-trip in cloud-app mode), alongside the real App
   // status + installs. Members still only see App accounts they're granted.
-  const [{ state, accounts }, install] = await Promise.all([
+  const [{ state, accounts }, install, customSourcesConfigured] = await Promise.all([
     source.getConnectionStatus(),
     source.resolveInstallUrl(),
+    hasConfiguredGitHubSource(ctx.organizationId).catch(() => false),
   ]);
   const allowedAccounts = await filterAllowedAccounts(ctx, accounts, (a) => a.login);
   // Connect methods, derived server-side from the SAME chain table that resolves
@@ -94,6 +93,10 @@ export async function getStatus(c: Context) {
     accounts: allowedAccounts,
     installUrl: install.url,
     cloudUnreachable: install.cloudUnreachable ?? false,
+    // Management metadata, deliberately separate from the canonical auth
+    // state. It remains true for an invalid source so the dashboard never
+    // offers the unrelated legacy App connect/disconnect flow in its place.
+    customSourcesConfigured,
     capabilities,
   });
 }
@@ -190,7 +193,7 @@ export async function connect(c: Context) {
   // Per-user resolution — picks "cloud-app" when self-hosted + cloud-
   // connected, otherwise falls back to the static mode. Every branch
   // below sees the actual mode this user should use.
-  const mode = await githubAuth.resolveGitHubAuthMode(ctx);
+  let mode = await githubAuth.resolveGitHubAuthMode(ctx);
 
   // Optional `source` discriminator from the dashboard's dual-source
   // (Openship App vs gh CLI) settings panel. When the user explicitly
@@ -198,10 +201,11 @@ export async function connect(c: Context) {
   // install flow regardless of whether gh CLI is already authenticated;
   // otherwise the two buttons would be indistinguishable to the server
   // and both would short-circuit on the cli token.
-  const body = await c.req.json().catch(() => ({} as Record<string, unknown>));
-  const source = body && typeof body === "object" && "source" in body
-    ? (body.source as "oauth" | "cli" | undefined)
-    : undefined;
+  const body = await c.req.json().catch(() => ({}) as Record<string, unknown>);
+  const source =
+    body && typeof body === "object" && "source" in body
+      ? (body.source as "oauth" | "cli" | undefined)
+      : undefined;
 
   // ── Explicit CLI un-suppress (applies in any mode) ───────────────
   // User clicked "Use gh CLI" — they want the prior Disconnect
@@ -210,21 +214,14 @@ export async function connect(c: Context) {
   // cloud-app mode it would never fire (we'd return the App install
   // URL and the flag would stay set forever).
   //
-  // In cloud-app mode there's no further connection step needed once
-  // the flag is cleared — the next /github/home refresh sees the CLI
-  // available and the dashboard CLI card flips from "Disabled" to
-  // "Logged in as @user". Return `connected: true` so the frontend
-  // doesn't try to open an auth window.
-  //
-  // In cli mode we still need to check status (gh might not actually
-  // be authed), so we just clear the flag and fall through to the
-  // existing cli-mode logic below.
+  // Explicitly selecting CLI must stay a CLI flow even when a custom source
+  // makes the workspace's composite mode report "app". Otherwise this button
+  // unexpectedly opens the App installation flow. SaaS never exposes the local
+  // method, so its canonical App mode remains immutable.
   if (source === "cli") {
     const { setGithubCliDisabled } = await import("../settings/settings.service");
     await setGithubCliDisabled(userId, false);
-    if (mode === "cloud-app") {
-      return c.json({ connected: true });
-    }
+    if (!env.CLOUD_MODE) mode = "cli";
   }
 
   // ── Cloud-app (self-hosted + cloud-connected) ────────────────────
@@ -238,8 +235,9 @@ export async function connect(c: Context) {
   //      handoff URL. Popup opens it; SaaS bridges to GitHub OAuth;
   //      Better Auth creates the account row on the SaaS DB.
   //   2. Once status.connected is true on SaaS → return the SaaS-bound
-  //      install URL (also from cloud-client). User installs; webhook
-  //      attributes correctly because the OAuth row now exists.
+  //      install URL (also from cloud-client). The public Setup callback
+  //      validates its durable user/workspace nonce, the user's GitHub token,
+  //      and the Openship App JWT before atomically claiming the installation.
   //
   // The frontend keeps clicking Connect; the server's response (`step`)
   // tells it which UI to show ("connecting GitHub" vs "installing App").
@@ -298,7 +296,13 @@ export async function connect(c: Context) {
     const { setGithubCliDisabled } = await import("../settings/settings.service");
     await setGithubCliDisabled(userId, false);
   }
-  const status = await githubAuth.getUserStatus(userId);
+  const status =
+    source === "cli" && !env.CLOUD_MODE
+      ? await import("./github.local-auth").then(async ({ getLocalGhStatus }) => {
+          const local = await getLocalGhStatus();
+          return { connected: local.available };
+        })
+      : await githubAuth.getUserStatus(userId);
 
   // ── Explicit App-source request (overrides mode-based routing) ────
   // In cli mode the dashboard shows TWO connect buttons (App + CLI).
@@ -308,11 +312,18 @@ export async function connect(c: Context) {
   if (source === "oauth") {
     if (!status.connected) {
       // OAuth not present yet — the redirect endpoint will do
-      // linkSocialAccount then callbackURL=/auth/callback/install
-      // which redirects to the App install URL.
+      // linkSocialAccount then callbackURL=/auth/callback/install. Mint the
+      // workspace-bound install state BEFORE OAuth and carry it through that
+      // callback, so a topology that lands on the API callback route never
+      // degrades to a stateless GitHub installation URL.
+      const install = mode === "app" ? await githubAuth.resolveInstallUrl(ctx) : { state: "" };
+      const redirectUrl = install.state
+        ? `/api/github/connect/redirect?install_state=${encodeURIComponent(install.state)}`
+        : undefined;
       return c.json({
         connected: false,
         flow: "redirect" as const,
+        ...(redirectUrl ? { url: redirectUrl } : {}),
       });
     }
     const installations = await githubAuth.getUserInstallations(ctx, status);
@@ -413,7 +424,44 @@ export async function connect(c: Context) {
   }
 
   // ── App / OAuth: need GitHub OAuth → tell frontend to open the redirect popup ──
-  return c.json({ connected: false, flow: "redirect" as const });
+  // Local App mode must preserve an authenticated workspace binding across the
+  // OAuth round-trip. OAuth-only mode has no installation callback and needs no
+  // install state.
+  const install = mode === "app" ? await githubAuth.resolveInstallUrl(ctx) : { state: "" };
+  const redirectUrl = install.state
+    ? `/api/github/connect/redirect?install_state=${encodeURIComponent(install.state)}`
+    : undefined;
+  return c.json({
+    connected: false,
+    flow: "redirect" as const,
+    ...(redirectUrl ? { url: redirectUrl } : {}),
+  });
+}
+
+/** POST /github/installations/claim — finalize a self-hosted App setup redirect. */
+export async function claimInstallation(c: Context) {
+  const ctx = getRequestContext(c);
+  const body = await c.req
+    .json<{
+      state?: string;
+      installationId?: string | number;
+      setupAction?: string;
+    }>()
+    .catch(() => ({}));
+  const { claimLocalGitHubInstallation } = await import("./github.installation-claim");
+  const result = await claimLocalGitHubInstallation(ctx, body);
+  switch (result.kind) {
+    case "ok":
+      return c.json({ ok: true, installation: result.installation });
+    case "pending-approval":
+      return c.json({ ok: true, pendingApproval: true });
+    case "invalid":
+      return c.json({ error: "invalid_installation_claim", message: result.message }, 400);
+    case "forbidden":
+      return c.json({ error: "installation_claim_forbidden", message: result.message }, 403);
+    case "failed":
+      return c.json({ error: "installation_claim_failed", message: result.message }, 502);
+  }
 }
 
 /** GET /github/connect/redirect - Direct browser navigation endpoint.
@@ -448,9 +496,17 @@ export async function connectRedirect(c: Context) {
   // connected) install the GitHub App, so both want the install
   // callback URL. CLI / OAuth-only paths just close the popup.
   const path =
-    mode === "app" || mode === "cloud-app"
-      ? "/auth/callback/install"
-      : "/auth/callback/close";
+    mode === "app" || mode === "cloud-app" ? "/auth/callback/install" : "/auth/callback/close";
+
+  // In a self-hosted local-App flow, POST /github/connect minted this nonce for
+  // the authenticated user + active workspace before OAuth began. Better Auth
+  // preserves callbackURL in its signed OAuth state, so threading it here makes
+  // both possible landing paths (dashboard page or direct API fallback) retain
+  // the same installation binding. An injected value is harmless: the final
+  // claim accepts only a live DB nonce belonging to the authenticated caller.
+  const installState = c.req.query("install_state")?.trim();
+  const callbackPath =
+    installState && mode === "app" ? `${path}?state=${encodeURIComponent(installState)}` : path;
 
   // Better Auth stores callbackURL/errorCallbackURL verbatim and redirects to
   // them as-is after the OAuth callback (which runs on the API origin). In
@@ -458,7 +514,7 @@ export async function connectRedirect(c: Context) {
   // the API host and dead-end, so absolutize against the dashboard origin.
   // Self-hosted keeps the relative path (resolves against its single origin).
   const dashOrigin = env.CLOUD_MODE ? runtimeTarget.dashboard : "";
-  const callbackURL = `${dashOrigin}${path}`;
+  const callbackURL = `${dashOrigin}${callbackPath}`;
   // Route link FAILURES to the app's close page (which surfaces the error via
   // localStorage → opener toast) instead of Better Auth's raw error page on
   // the API origin, where the popup would otherwise dead-end.
@@ -488,7 +544,7 @@ export async function connectRedirect(c: Context) {
       }
 
       try {
-        const body = await result.json() as { url?: string };
+        const body = (await result.json()) as { url?: string };
         redirectUrl = redirectUrl ?? body?.url ?? null;
       } catch {
         // Ignore non-JSON bodies and fall back to headers-only handling.
@@ -577,7 +633,10 @@ export async function setInstanceToken(c: Context) {
     report = await githubService.inspectPatScope(token);
   } catch (err) {
     return c.json(
-      { error: err instanceof Error ? err.message : "Could not validate token", code: "INVALID_TOKEN" },
+      {
+        error: err instanceof Error ? err.message : "Could not validate token",
+        code: "INVALID_TOKEN",
+      },
       400,
     );
   }
@@ -723,7 +782,7 @@ export async function createRepo(c: Context) {
     description: body.description,
     private: body.private,
     owner: body.owner,
-      });
+  });
 
   if (ctx.organizationId) {
     audit.recordAsync(auditContextFrom(c, ctx.organizationId, ctx.userId), {
@@ -801,7 +860,12 @@ export async function getCloneToken(c: Context) {
     );
   }
 
-  const cloneUrl = `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;
+  const { resolveGitHubWebBaseUrl } = await import("./github-source.service");
+  const webBaseUrl =
+    (await resolveGitHubWebBaseUrl(ctx.organizationId, owner).catch(() => null)) ??
+    "https://github.com";
+  const cloneOrigin = webBaseUrl.replace(/^https:\/\//, "").replace(/\/+$/, "");
+  const cloneUrl = `https://x-access-token:${token}@${cloneOrigin}/${owner}/${repo}.git`;
   return c.json({ token, cloneUrl, command: `git clone ${cloneUrl}` });
 }
 
@@ -859,7 +923,7 @@ export async function listFiles(c: Context) {
   const data = await githubService.listFiles(ctx, owner, repo, {
     branch: branch ?? undefined,
     path: path || undefined,
-      });
+  });
 
   // Filter to what this caller's source scope permits. The route declares
   // `source: "content-tree"`, so the permission middleware already resolved the
@@ -955,7 +1019,7 @@ export async function getFile(c: Context) {
   const data = await githubService.getFileContent(ctx, owner, repo, file, {
     branch: branch ?? undefined,
     json: file.endsWith(".json"),
-      });
+  });
   return c.json({ data });
 }
 

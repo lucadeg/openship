@@ -66,6 +66,11 @@ export interface EnvDiffInput {
    * Per-service overrides as they resolve today: inline compose `environment:`
    * merged under the service's own env rows (rows win, matching the deploy
    * merge). Empty for a single-app project.
+   *
+   * Must be built with `mergeServiceDeployEnv`'s deferral applied — an inline
+   * empty that yields to a project value (`inlineEmptyDefers`) is NOT an override
+   * and must not appear here, or this diff reports a revert the rollback will
+   * never perform.
    */
   liveServices?: Array<{ name: string; overrides: Record<string, string> }>;
   strategy: EnvRestoreStrategy;

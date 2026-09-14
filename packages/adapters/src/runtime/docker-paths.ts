@@ -136,6 +136,55 @@ export function resolveDockerfileCandidates(
   );
 }
 
+/**
+ * The declared docker build CONTEXT for a config, relative to the source root
+ * ("" = the source root itself). ONE reader for `buildContextDirectory` so the
+ * local, SSH, clone-on-server and cloud paths cannot disagree about where a
+ * build's context begins.
+ */
+export function dockerBuildContextDirectory(config: {
+  buildContextDirectory?: string | null;
+}): string {
+  return normalizeDockerRelativePath(config.buildContextDirectory);
+}
+
+/**
+ * Dockerfile candidates INSIDE a narrowed build context, in priority order and
+ * relative to that context — what `-f` (and dockerode's `dockerfile`) wants.
+ *
+ * Compose resolves `dockerfile` against the context, so `build: svc` +
+ * `dockerfile: Dockerfile` is the `Dockerfile` sitting in `svc`. Two deliberate
+ * differences from {@link resolveDockerfileCandidates}:
+ *
+ *   - No source-root `Dockerfile` fallback. It lies outside the context, so
+ *     falling back to it would build a DIFFERENT image under this service's tag —
+ *     which is exactly what a whole-repo context let happen.
+ *   - A `dockerfilePath` that already carries the context prefix (`svc/Dockerfile`
+ *     next to `build: svc`) is accepted as a second candidate. That spelling is
+ *     what people wrote while the context WAS the repo root, and it only ever
+ *     wins when the compose-correct path is absent.
+ */
+export function resolveContextDockerfileCandidates(
+  contextDirectory?: string | null,
+  explicitDockerfilePath?: string | null,
+): string[] {
+  const context = normalizeDockerRelativePath(contextDirectory);
+  const explicit = normalizeDockerRelativePath(explicitDockerfilePath);
+  const candidates: string[] = [];
+
+  if (explicit) {
+    candidates.push(explicit);
+    if (context && explicit.startsWith(`${context}/`)) {
+      candidates.push(explicit.slice(context.length + 1));
+    }
+  }
+  candidates.push("Dockerfile");
+
+  return candidates.filter(
+    (candidate, index, values) => Boolean(candidate) && values.indexOf(candidate) === index,
+  );
+}
+
 const ROOT_MANIFESTS = [
   "package.json",
   "pyproject.toml",

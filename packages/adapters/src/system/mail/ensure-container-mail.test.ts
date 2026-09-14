@@ -7,6 +7,7 @@ import {
   setDefaultMailImage,
 } from "./ensure-container-mail";
 import { setManagedImagesFromSource } from "../managed-image";
+import { MAIL_HOST_STATE_DIR } from "../../infra/mail-container";
 
 afterEach(() => {
   setDefaultMailImage(undefined);
@@ -379,5 +380,292 @@ describe("mail database credential over a retained pgdata (GH-564)", () => {
     // And it must not have written a credential the cluster does not hold.
     const wroteDbEnv = writeFile.mock.calls.some(([p]) => String(p).endsWith("db.env"));
     expect(wroteDbEnv).toBe(false);
+  });
+});
+
+/**
+ * GH-630 — the account that runs `docker` must be able to read the env-files.
+ *
+ * Every other stub in this file is a SINGLE object, so `rootOrDegrade` degrades to it and
+ * the elevated-write / unelevated-launch split is structurally invisible: the bug could not
+ * fail a test even while it made mail setup impossible on a whole class of hosts. These
+ * model the reporter's box instead — Openship running as a non-root user that is in the
+ * docker group AND has passwordless sudo, the one arm where `rootOrDegrade` returns a real
+ * `elevatedExecutor` wrapper and the writer's identity diverges from the launcher's.
+ *
+ * `nonRootSudoBox` enforces the single kernel rule that produced the failure: a file
+ * published by a `sudo` command is root-owned 0600, and an unelevated
+ * `docker run --env-file <it>` cannot open it, because docker resolves `--env-file`
+ * client-side in the CLI's own process before it ever reaches the daemon socket. Being in
+ * the docker group grants the socket, not the file.
+ */
+const SUDO = "sudo -n sh -c ";
+const LOGIN_USER = "ubuntu";
+const DB_ENV = `${MAIL_HOST_STATE_DIR}/db.env`;
+const ENGINE_ENV = `${MAIL_HOST_STATE_DIR}/engine.env`;
+
+// `opsh_uid` != 0 with `opsh_sudo=y` is what makes `privilegedExecutor` hand back
+// `elevatedExecutor(executor)` rather than the caller's own object — i.e. the only profile
+// on which these tests have anything to catch.
+const PROBE_NON_ROOT_SUDO = [
+  "opsh_begin=1",
+  "opsh_os=Linux",
+  "opsh_arch=x86_64",
+  "opsh_uid=1000",
+  `opsh_user=${LOGIN_USER}`,
+  `opsh_home=/home/${LOGIN_USER}`,
+  "opsh_osr:ID=ubuntu",
+  'opsh_osr:VERSION_ID="24.04"',
+  "opsh_pm=apt",
+  "opsh_sm=systemd",
+  "opsh_sudo=y",
+  "opsh_fw=unknown",
+  "opsh_libc=glibc",
+  "opsh_selinux=absent",
+  "opsh_container=n",
+  "opsh_end=1",
+].join("\n");
+
+function nonRootSudoBox(
+  opts: {
+    runningImage?: string;
+    imagePresent?: boolean;
+    rootOwned?: string[];
+    /** `"root"` models the arm where nothing needs to move — docker already runs as root. */
+    login?: "root";
+  } = {},
+) {
+  const loginIsRoot = opts.login === "root";
+  const probe = loginIsRoot
+    ? PROBE_NON_ROOT_SUDO.replace("opsh_uid=1000", "opsh_uid=0")
+        .replace(`opsh_user=${LOGIN_USER}`, "opsh_user=root")
+        .replace("opsh_sudo=y", "opsh_sudo=n")
+    : PROBE_NON_ROOT_SUDO;
+  const staged = new Map<string, string>();
+  const published = new Map<string, string>();
+  const rootOwned = new Set<string>(opts.rootOwned ?? []);
+  const owners = new Map<string, string>();
+  const readOnly = new Set<string>();
+  /**
+   * Directories the login user may SEARCH. Seeded empty on purpose: this box is the
+   * umask-027 one, where `mkdir -p` leaves the tree 0750 root:root, so a chown that isn't
+   * accompanied by a traversal grant still cannot be opened.
+   */
+  const traversable = new Set<string>();
+  /** Every launch that tried to read a root-owned env-file it had no permission for. */
+  const denied: string[] = [];
+
+  const elevated = (cmd: string) => cmd.startsWith(SUDO);
+  // Unwrap one layer of `elevateCommand` so the stub matches on the real command.
+  const unwrap = (cmd: string) =>
+    elevated(cmd)
+      ? cmd.slice(SUDO.length).replace(/^'/, "").replace(/'$/, "").replace(/'\\''/g, "'")
+      : cmd;
+
+  const streamExec = vi.fn(async (cmd: string) => {
+    const command = unwrap(cmd);
+    if (command.includes("--env-file")) {
+      const target = [DB_ENV, ENGINE_ENV].find((path) => command.includes(path));
+      // Two independent ways the client-side open fails as the login user: the file is
+      // root's, or a directory on the way to it is not searchable.
+      const unreachable =
+        target &&
+        !loginIsRoot &&
+        (rootOwned.has(target) ||
+          ![`${MAIL_HOST_STATE_DIR}`, "/var/lib/openship"].every((d) => traversable.has(d)));
+      if (target && unreachable && !elevated(cmd)) {
+        denied.push(target);
+        return { code: 125, output: `docker: --env-file: open ${target}: permission denied\n` };
+      }
+    }
+    return { code: 0, output: "" };
+  });
+
+  const exec = vi.fn(async (cmd: string) => {
+    const command = unwrap(cmd);
+    if (command.includes("opsh_begin")) return probe;
+    if (command.includes(STATE_PROBE)) {
+      return opts.runningImage ? stateLine(opts.runningImage) : "";
+    }
+    if (command.includes("docker version")) return "27.0.0\n";
+    if (command.includes("docker image inspect")) return opts.imagePresent ? "sha256:abc\n" : "";
+    if (command.includes("/proc/net/tcp")) return PROC_LISTENING;
+    // `elevatedExecutor.writeFile` publishes by staging unelevated, then `chown 0:0` + `mv`
+    // as root — which is where a file becomes root-owned and unreadable to the launcher.
+    const mv = /mv -f '([^']+)' '([^']+)'/.exec(command);
+    if (mv && command.includes("chown 0:0")) {
+      published.set(mv[2], staged.get(mv[1]) ?? "");
+      rootOwned.add(mv[2]);
+    }
+    // ...and the fix's handover gives it back, read-only, with the path made traversable.
+    const chown = /chown '([^']+)' '([^']+)'/.exec(command);
+    if (chown && elevated(cmd)) {
+      owners.set(chown[2], chown[1]);
+      rootOwned.delete(chown[2]);
+      for (const m of command.matchAll(/chmod 400 '([^']+)'/g)) readOnly.add(m[1]);
+      // `chmod a+x <dir> <dir>` — one call, both path components.
+      const dirs = /chmod a\+x '([^']+)' '([^']+)'/.exec(command);
+      if (dirs) {
+        traversable.add(dirs[1]);
+        traversable.add(dirs[2]);
+      }
+    }
+    return "";
+  });
+
+  const writeFile = vi.fn(async (path: string, content: string) => {
+    staged.set(path, content);
+  });
+
+  return {
+    executor: { exec, streamExec, writeFile } as never,
+    exec,
+    streamExec,
+    published,
+    rootOwned,
+    owners,
+    readOnly,
+    traversable,
+    denied,
+    elevated,
+    /** Every docker command the run issued, launches and probes alike. */
+    dockerCommands: () =>
+      [...streamExec.mock.calls, ...exec.mock.calls]
+        .map(([cmd]) => String(cmd))
+        .filter((c) => unwrap(c).includes("docker ")),
+  };
+}
+
+describe("mail bring-up on a non-root sudo box (GH-630)", () => {
+  it("hands the env-files to the account that runs docker, and keeps docker on it", async () => {
+    setDefaultMailImage("ghcr.io/x/openship-mail:pinned");
+    const box = nonRootSudoBox({ imagePresent: false });
+
+    await ensureContainerMail(box.executor, {
+      domain: "example.com",
+      secrets: { PGSQL_ROOT_PASSWD: "pw" },
+      onLog: () => {},
+    });
+
+    // The bug: `docker: --env-file: open /var/lib/openship/mail/db.env: permission denied`,
+    // reported as "the mail database container failed to become ready".
+    expect(box.denied).toEqual([]);
+
+    // Not vacuous — the elevated write really did publish both files root-owned first, and
+    // the handover is what made them readable again.
+    expect(box.published.has(DB_ENV)).toBe(true);
+    expect(box.published.has(ENGINE_ENV)).toBe(true);
+    expect(box.rootOwned.has(DB_ENV)).toBe(false);
+    expect(box.rootOwned.has(ENGINE_ENV)).toBe(false);
+
+    // The other half of the fix, and the one a future change is most likely to undo:
+    // EVERY docker command runs as the one login identity. Elevating the launch instead
+    // would also change which daemon it reaches (`sudo` drops DOCKER_HOST) and which
+    // registry credentials it presents, so a rootless box could be told to launch a second
+    // host-network engine and report success.
+    const docker = box.dockerCommands();
+    expect(docker.length).toBeGreaterThan(0);
+    expect(docker.filter((c) => box.elevated(c))).toEqual([]);
+  });
+
+  /**
+   * The half a create-path-only fix would miss. A swap writes no env-file, so it launches
+   * against the root-owned `engine.env` a PREVIOUS install left behind — and because
+   * `swapManagedImage` re-invokes the same callback to roll back, both attempts fail and a
+   * healthy engine is reported `mailDown` with nothing naming permissions.
+   */
+  it("repairs a pre-existing root-owned engine.env before an image swap", async () => {
+    setDefaultMailImage("ghcr.io/x/openship-mail:pinned");
+    const box = nonRootSudoBox({
+      runningImage: "ghcr.io/x/openship-mail:old",
+      imagePresent: true,
+      rootOwned: [ENGINE_ENV],
+    });
+
+    const res = await ensureContainerMail(box.executor, {
+      domain: "example.com",
+      secrets: {},
+      onLog: () => {},
+    });
+
+    expect(box.denied).toEqual([]);
+    expect(res.updated).toBe(true);
+    expect(res.mailDown).toBeFalsy();
+    expect(box.rootOwned.has(ENGINE_ENV)).toBe(false);
+    expect(box.dockerCommands().filter((c) => box.elevated(c))).toEqual([]);
+
+    // Repair only — a swap must never rewrite the secret env-files, which are provisioned
+    // once by the mail wizard and are not re-derivable.
+    expect(box.published.has(ENGINE_ENV)).toBe(false);
+  });
+
+  /**
+   * Ownership is not reach. The tree is created by a bare `mkdir -p` that inherits the sudo
+   * session's umask, so on a host whose login.defs sets UMASK 027 it lands 0750 root:root and
+   * the login user cannot SEARCH it — the chown succeeds, the open still fails with the exact
+   * same message, and nothing warns. `traversable` starts empty here precisely to model that
+   * box, so a handover that only chowns leaves `denied` non-empty.
+   */
+  it("makes the path traversable, not just the file owned", async () => {
+    setDefaultMailImage("ghcr.io/x/openship-mail:pinned");
+    const box = nonRootSudoBox({ imagePresent: true });
+
+    await ensureContainerMail(box.executor, {
+      domain: "example.com",
+      secrets: {},
+      onLog: () => {},
+    });
+
+    expect(box.denied).toEqual([]);
+    // Search on both components, granted without read so the directory stays unlistable.
+    expect(box.traversable.has(MAIL_HOST_STATE_DIR)).toBe(true);
+    expect(box.traversable.has("/var/lib/openship")).toBe(true);
+    const grants = box.exec.mock.calls.map(([c]) => String(c)).filter((c) => c.includes("chmod a+x"));
+    expect(grants.length).toBeGreaterThan(0);
+    expect(grants.every((c) => !/chmod a\+rx|chmod 0?755/.test(c))).toBe(true);
+  });
+
+  /**
+   * The safety net the handover would otherwise remove. Before it, an unelevated rewrite of
+   * db.env was refused because the file was root's — and that refusal is what stopped a
+   * degraded re-run from overwriting the retained Postgres superuser password with a freshly
+   * minted one (GH-564, whose recovery value is that file). Handing the file over at 0600
+   * would make that write silently succeed; 0400 keeps the kernel refusing it, because the
+   * mode binds the owner too.
+   */
+  it("leaves the handed-over env-files read-only so an unelevated rewrite still fails", async () => {
+    setDefaultMailImage("ghcr.io/x/openship-mail:pinned");
+    const box = nonRootSudoBox({ imagePresent: true });
+
+    await ensureContainerMail(box.executor, {
+      domain: "example.com",
+      secrets: {},
+      onLog: () => {},
+    });
+
+    expect(box.readOnly.has(DB_ENV)).toBe(true);
+    expect(box.readOnly.has(ENGINE_ENV)).toBe(true);
+    expect(box.owners.get(DB_ENV)).toBe(LOGIN_USER);
+    expect(box.owners.get(ENGINE_ENV)).toBe(LOGIN_USER);
+  });
+
+  // A root login is the arm where nothing needs to move: `rootOrDegrade` returns the
+  // caller's own executor, so the file is already owned by whoever runs docker and the tree
+  // is already traversable by it. Loosening either there would be a pure downgrade.
+  it("touches neither ownership nor directory modes when the login is already root", async () => {
+    setDefaultMailImage("ghcr.io/x/openship-mail:pinned");
+    const box = nonRootSudoBox({ imagePresent: true, login: "root" });
+
+    await ensureContainerMail(box.executor, {
+      domain: "example.com",
+      secrets: {},
+      onLog: () => {},
+    });
+
+    expect(box.denied).toEqual([]);
+    const touched = box.exec.mock.calls
+      .map(([c]) => String(c))
+      .filter((c) => /chown|chmod a\+x|chmod 400/.test(c));
+    expect(touched).toEqual([]);
   });
 });

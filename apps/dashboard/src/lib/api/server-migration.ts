@@ -19,6 +19,7 @@ export interface DiscoveredService {
   image?: string;
   build?: string;
   dockerfile?: string;
+  buildArgs?: Record<string, string | null>;
   ports: string[];
   env: Record<string, string>;
   /** Env that provably came from the IMAGE, not the operator (recovered from
@@ -37,12 +38,13 @@ export interface DiscoveredService {
   /** Host edge ports (80/443) it publishes — reserved for Openship's edge. */
   edgePorts?: number[];
   /** Routes the server's existing (foreign) reverse proxy already serves for this
-   *  container, matched by published host port. ONE ENTRY PER (port,path): a
+   *  container, matched by published host port. ONE ENTRY PER (port,path,match mode): a
    *  path-fan-out domain (`/ → :1010`, `/v3 → :1020`) or a multi-port container
    *  collects several. Absent = none detected. */
   existingRoute?: Array<{
     port: number;
     path: string;
+    exact?: boolean;
     domains: string[];
     ssl: { enabled: boolean; certPath?: string; keyPath?: string };
     source?: string;
@@ -57,6 +59,7 @@ export interface ComposeRepoService {
   name: string;
   build?: string;
   dockerfile?: string;
+  buildArgs?: Record<string, string | null>;
   image?: string;
   ports: string[];
   environment: Record<string, string>;
@@ -526,6 +529,7 @@ export const dockerMigrationApi = {
         domain?: string;
         customDomain?: string;
         targetPath?: string;
+        exact?: boolean;
       }
     >;
     /** serviceName → target-volume conflict resolution (override/clone/keep). */

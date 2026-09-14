@@ -211,12 +211,18 @@ export async function updateCredential(
     throw new ValidationError(`${provider.selector.label} is required.`);
   }
 
-  // "Leave blank to keep": an omitted secret means the stored one stands, so it counts as
-  // present for validation and is carried into the new envelope unchanged.
+  // "Leave blank to keep" applies only while the credential stays bound to the same
+  // destination. In that case the stored secret counts as present during validation.
   const held = readSecrets(row);
   const submitted = input.values ?? {};
+  // A stored secret is bound to the destination it was entered for. Reusing it after an
+  // admin changes the selector would turn this write-only store into a secret-export
+  // primitive: point the credential at a server they control, leave the masked field
+  // blank, and let verification send the old secret there. A new destination therefore
+  // requires new secret material; optional held secrets are dropped rather than carried.
+  const mayReuseHeldSecrets = selector === row.selector;
   const errors = validateCredentialValues(provider, submitted, {
-    existingSecretKeys: Object.keys(held),
+    existingSecretKeys: mayReuseHeldSecrets ? Object.keys(held) : [],
   });
   if (errors.length) throw new ValidationError(errors.join("; "));
 
@@ -226,7 +232,7 @@ export async function updateCredential(
 
   const split = splitCredentialValues(provider, submitted);
   const publicFields = { ...row.publicFields, ...split.publicFields };
-  const secrets = { ...held, ...split.secrets };
+  const secrets = mayReuseHeldSecrets ? { ...held, ...split.secrets } : split.secrets;
 
   // Re-verified on every update: a changed username, registry host or secret can each
   // invalidate the pair, and the point of verifying at all is that a stored credential

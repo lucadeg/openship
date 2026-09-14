@@ -4,6 +4,70 @@
     "save": "Speichern",
     "cancel": "Abbrechen"
   },
+  "releaseImageSource": {
+    "validationInvalid": "Die Release-Image-Quelle ist ungültig.",
+    "toast": {
+      "saved": "Die Container-Release-Quelle wurde gespeichert.",
+      "saveFailed": "Die Container-Release-Quelle konnte nicht gespeichert werden."
+    },
+    "status": {
+      "notDeployed": "Noch nicht bereitgestellt",
+      "checking": "Wird geprüft…",
+      "unavailable": "Nicht verfügbar"
+    },
+    "switchToImage": {
+      "title": "Zu einer vorgefertigten Image-Quelle wechseln",
+      "description": "Beim Speichern wird die aktuelle Git- oder lokale Quelle in allen Umgebungen ersetzt. Bestehende Bereitstellungen und der Rollback-Verlauf bleiben verfügbar.",
+      "keep": "Aktuelle Quelle behalten"
+    },
+    "switchToGit": {
+      "title": "Zu einer Git-Quelle wechseln",
+      "description": "Bis zum Verknüpfen eines Repositorys ändert sich nichts. Die Verknüpfung ersetzt die verfolgte Image-Quelle in allen Umgebungen.",
+      "back": "Zurück zur Image-Quelle"
+    },
+    "entry": {
+      "shortButton": "Vorgefertigtes Image verwenden",
+      "button": "Vorgefertigtes Container-Image verfolgen",
+      "description": "Ein versioniertes Registry-Image direkt bereitstellen, ohne ein Repository zu klonen oder zu bauen."
+    },
+    "summary": {
+      "title": "Verfolgtes Container-Image",
+      "badge": "Vorgefertigt",
+      "description": "Stellt ein veröffentlichtes Image direkt bereit. Es wird kein Repository geklont und kein Build-Befehl ausgeführt.",
+      "linkGit": "Git-Repository verknüpfen",
+      "image": "Image",
+      "versionSource": "Versionsquelle",
+      "githubReleases": "GitHub-Veröffentlichungen",
+      "pinnedVersion": "Angeheftete Version",
+      "currentVersion": "Aktuelle Version",
+      "targetVersion": "Zielversion",
+      "latestVersion": "Neueste Version",
+      "updateAvailable": "Update verfügbar"
+    },
+    "editor": {
+      "trackingTitle": "Release-Verfolgung",
+      "configureTitle": "Vorgefertigtes Image konfigurieren",
+      "templateHint": "Mit {tag} bleibt das genaue Tag des Herausgebers erhalten; {version} verwendet die normalisierte Version.",
+      "provider": "Versionsanbieter",
+      "githubTitle": "GitHub-Veröffentlichungen",
+      "githubDescription": "Dem neuesten veröffentlichten Release-Tag folgen.",
+      "urlTitle": "Versions-URL oder feste Version",
+      "urlDescription": "Eine Versionsschnittstelle lesen oder eine feste Version bereitstellen.",
+      "imageTemplate": "Image-Vorlage",
+      "imagePlaceholder": "ghcr.io/acme/api:{tag}",
+      "githubRepository": "GitHub-Repository",
+      "repoPlaceholder": "owner/repository",
+      "versionUrl": "Versions-URL",
+      "versionUrlPlaceholder": "https://example.com/latest-version",
+      "versionUrlHint": "HTTPS-Endpunkt, der Text oder JSON mit version/tag_name zurückgibt.",
+      "pinnedVersion": "Angeheftete Version",
+      "pinnedPlaceholder": "Optional, z. B. v2.4.1",
+      "pinnedHint": "Überschreibt die ermittelte neueste Version; leer lassen, um Updates zu verfolgen.",
+      "appliesAll": "Änderungen gelten für alle Umgebungen dieses Projekts.",
+      "saving": "Wird gespeichert…",
+      "save": "Quelle speichern"
+    }
+  },
   "appSettings": {
     "modeApp": "App-Einstellungen",
     "modeDeployment": "Deployment",
@@ -108,12 +172,15 @@
       "runningStatus": "Läuft — {status}"
     },
     "cache": {
-      "title": "Cache",
-      "description": "Zwischengespeicherte Build-Artefakte und Abhängigkeitsinstallationen leeren",
+      "title": "Docker-Build-Cache",
+      "description": "Ungenutzter Build-Cache wird automatisch auf 5 GB pro Server begrenzt",
       "clearInstall": "Installations-Cache leeren",
       "clearInstallDesc": "Zwischengespeicherte node_modules entfernen",
       "clearBuild": "Build-Cache leeren",
-      "clearBuildDesc": "Zwischengespeicherte Build-Ausgabe entfernen"
+      "clearBuildDesc": "Ungenutzten Cache auf dem Docker-Server dieses Projekts entfernen",
+      "clearBuildConfirm": "Gesamten ungenutzten Docker-Build-Cache auf diesem Server leeren? Andere Projekte müssen beim nächsten Deployment möglicherweise Abhängigkeiten neu bauen.",
+      "clearBuildSuccess": "{size} Build-Cache freigegeben",
+      "clearBuildEmpty": "Kein ungenutzter Build-Cache vorhanden"
     },
     "transfer": {
       "title": "Übertragen & Klonen",
@@ -344,28 +411,7 @@
     "unlink": "Verbindung entfernen"
   },
   "gitInfo": {
-    "repository": "Repository",
-    "autoDeploy": "Auto-Deploy",
-    "deploysOnPush": "Deployt bei jedem Push",
-    "manualOnly": "Nur manuelle Deployments",
-    "branchToDeploy": "Zu deployender Branch",
-    "chooseBranch": "Wählen Sie, aus welchem Branch Ihres Repositorys deployt werden soll",
-    "save": "Speichern",
-    "cancel": "Abbrechen",
-    "viewOnGithub": "Auf GitHub ansehen",
-    "recentCommits": "Letzte Commits",
-    "totalCommits": "{count} insgesamt",
-    "noCommits": "Noch keine Commits",
-    "toast": {
-      "fetchBranchesFailed": "Abrufen der Branches fehlgeschlagen",
-      "errorTitle": "Fehler",
-      "branchUpdated": "Branch erfolgreich aktualisiert",
-      "updatedTitle": "Aktualisiert",
-      "branchUpdateFailed": "Aktualisieren des Branches fehlgeschlagen",
-      "autoDeployEnabled": "Auto-Deploy aktiviert",
-      "autoDeployDisabled": "Auto-Deploy deaktiviert",
-      "autoDeployFailed": "Aktualisieren von Auto-Deploy fehlgeschlagen"
-    }
+    "autoDeploy": "Auto-Deploy"
   },
   "git": {
     "connectFirst": {
@@ -515,6 +561,9 @@
     "title": "Maschinenleistung",
     "description": "CPU- und Speichergrenzen für die Container dieses Projekts.",
     "loading": "Zielmaschine wird gelesen …",
+    "unavailable": "Maschinenleistung nicht verfügbar",
+    "loadFailed": "Maschinenleistung konnte nicht geladen werden",
+    "retry": "Erneut versuchen",
     "machineCapacity": "Maschine: {cpu} vCPU · {memory}",
     "exceedsMachine": "Übersteigt diese Maschine",
     "appliesOnNextDeploy": "Grenzen werden beim Neuerstellen des Containers angewendet – für eine Änderung neu deployen.",
@@ -597,10 +646,6 @@
     "cannotUndo": "Diese Aktion kann nicht rückgängig gemacht werden.",
     "aboutToPrefix": "Sie sind dabei, ",
     "aboutToSuffix": " zu löschen.",
-    "deleteAllAria": "Alle Umgebungen löschen",
-    "deleteAll": "Alle Umgebungen löschen",
-    "deleteAllOn": "Entfernt die Projekt-App und jede darunterliegende Branch-Umgebung.",
-    "deleteAllOff": "Entfernt nur diese Umgebung. Andere Branches bleiben erhalten.",
     "scanning": "Angehängte Dienste und Volumes werden gescannt…",
     "wipeAria": "Auch Dienstdaten löschen",
     "wipeLabelOne": "Auch Dienstdaten löschen ({count} Volume)",
@@ -615,9 +660,7 @@
     "typePrefix": "Geben Sie ",
     "typeSuffix": " zur Bestätigung ein.",
     "cancel": "Abbrechen",
-    "confirmDeleteWipe": "Löschen + Daten entfernen",
     "confirmDeleteEnvWipe": "Umgebung löschen + Daten entfernen",
-    "confirmDelete": "Projekt löschen",
     "confirmDeleteEnv": "Umgebung löschen",
     "linkedTitleOne": "{count} Projekt ist mit dieser App verbunden",
     "linkedTitleOther": "{count} Projekte sind mit dieser App verbunden",
@@ -694,6 +737,9 @@
       "defaultAppName": "my-app",
       "mapsToPort": "Verweist auf Port",
       "includeWww": "www einbeziehen",
+      "dnsChallenge": "DNS-01-Challenge verwenden",
+      "dnsChallengeDesc": "Zertifikat über den verbundenen DNS-Anbieter ausstellen und erneuern. Verwenden, wenn Port 80 nicht erreichbar ist.",
+      "dnsChallengeWildcardDesc": "Wildcard-Zertifikate erfordern DNS-01 und einen verbundenen DNS-Anbieter.",
       "includeWwwDesc": "Auch Einträge für www.{domain} erzeugen",
       "includeWwwFallback": "ihredomain.de",
       "adding": "Wird hinzugefügt...",
@@ -809,6 +855,11 @@
     "records": {
       "failed": "Die DNS-Einträge für diese Domain konnten nicht geladen werden.",
       "retry": "Erneut versuchen"
+    },
+    "outputHint": {
+      "body": "Keine Build-Ausgabe unter {path} gefunden — prüfen Sie Ihr Ausgabeverzeichnis und deployen Sie erneut.",
+      "noIndex": "Unter {path} liegt eine Ausgabe, aber keine Index-Datei — Anfragen liefern 404. Prüfen Sie Ihr Ausgabeverzeichnis.",
+      "notServed": "Der Edge-Proxy antwortete mit HTTP {status} für {path} — dieser Pfad wird nicht ausgeliefert. Prüfen Sie Ihr Ausgabeverzeichnis und die Route."
     }
   }
 }

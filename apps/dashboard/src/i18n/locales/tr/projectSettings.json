@@ -4,6 +4,70 @@
     "save": "Kaydet",
     "cancel": "İptal"
   },
+  "releaseImageSource": {
+    "validationInvalid": "Sürüm imajı kaynağı geçersiz.",
+    "toast": {
+      "saved": "Konteyner sürüm kaynağı kaydedildi.",
+      "saveFailed": "Konteyner sürüm kaynağı kaydedilemedi."
+    },
+    "status": {
+      "notDeployed": "Henüz dağıtılmadı",
+      "checking": "Kontrol ediliyor…",
+      "unavailable": "Kullanılamıyor"
+    },
+    "switchToImage": {
+      "title": "Hazır imaj kaynağına geç",
+      "description": "Kaydetmek, tüm ortamlardaki mevcut Git veya yerel kaynağı değiştirir. Mevcut dağıtımlar ve geri alma geçmişi kullanılabilir kalır.",
+      "keep": "Mevcut kaynağı koru"
+    },
+    "switchToGit": {
+      "title": "Git kaynağına geç",
+      "description": "Bir depo bağlayana kadar hiçbir şey değişmez. Depoyu bağlamak, tüm ortamlardaki takip edilen imaj kaynağını değiştirir.",
+      "back": "İmaj kaynağına dön"
+    },
+    "entry": {
+      "shortButton": "Hazır imaj kullan",
+      "button": "Hazır konteyner imajını takip et",
+      "description": "Bir depoyu klonlamadan veya derlemeden sürümlü bir kayıt imajını doğrudan dağıtın."
+    },
+    "summary": {
+      "title": "Takip edilen konteyner imajı",
+      "badge": "Hazır",
+      "description": "Yayımlanmış bir imajı doğrudan dağıtır. Depo klonlanmaz ve derleme komutu çalıştırılmaz.",
+      "linkGit": "Git deposunu bağla",
+      "image": "İmaj",
+      "versionSource": "Sürüm kaynağı",
+      "githubReleases": "GitHub sürümleri",
+      "pinnedVersion": "Sabitlenmiş sürüm",
+      "currentVersion": "Geçerli sürüm",
+      "targetVersion": "Hedef sürüm",
+      "latestVersion": "En son sürüm",
+      "updateAvailable": "Güncelleme mevcut"
+    },
+    "editor": {
+      "trackingTitle": "Sürüm takibi",
+      "configureTitle": "Hazır imajı yapılandır",
+      "templateHint": "Yayıncının tam etiketini korumak için {tag}, normalleştirilmiş sürüm için {version} kullanın.",
+      "provider": "Sürüm sağlayıcısı",
+      "githubTitle": "GitHub sürümleri",
+      "githubDescription": "En son yayımlanmış sürüm etiketini takip edin.",
+      "urlTitle": "Sürüm URL'si veya sabitleme",
+      "urlDescription": "Bir sürüm uç noktasını okuyun veya sabit bir sürüm dağıtın.",
+      "imageTemplate": "İmaj şablonu",
+      "imagePlaceholder": "ghcr.io/acme/api:{tag}",
+      "githubRepository": "GitHub deposu",
+      "repoPlaceholder": "owner/repository",
+      "versionUrl": "Sürüm URL'si",
+      "versionUrlPlaceholder": "https://example.com/latest-version",
+      "versionUrlHint": "version/tag_name içeren metin veya JSON döndüren HTTPS uç noktası.",
+      "pinnedVersion": "Sabitlenmiş sürüm",
+      "pinnedPlaceholder": "İsteğe bağlı, ör. v2.4.1",
+      "pinnedHint": "Bulunan en son sürümü geçersiz kılar; güncellemeleri izlemek için boş bırakın.",
+      "appliesAll": "Değişiklikler bu projenin tüm ortamlarına uygulanır.",
+      "saving": "Kaydediliyor…",
+      "save": "Kaynağı kaydet"
+    }
+  },
   "appSource": {
     "title": "Kaynak",
     "description": "Bu uygulama bir sürümden (release) dağıtılır — push yapılacak bir repo yoktur; güncellemeler yeni sürümler olarak gelir.",
@@ -214,12 +278,15 @@
       "runningStatus": "Sürüyor — {status}"
     },
     "cache": {
-      "title": "Önbellek",
-      "description": "Önbelleğe alınmış derleme çıktılarını ve bağımlılık kurulumlarını temizleyin",
+      "title": "Docker Derleme Önbelleği",
+      "description": "Kullanılmayan derleme önbelleği sunucu başına otomatik olarak 5 GB ile sınırlandırılır",
       "clearInstall": "Kurulum Önbelleğini Temizle",
       "clearInstallDesc": "Önbelleğe alınmış node_modules klasörünü kaldır",
       "clearBuild": "Derleme Önbelleğini Temizle",
-      "clearBuildDesc": "Önbelleğe alınmış derleme çıktısını kaldır"
+      "clearBuildDesc": "Bu projenin Docker sunucusundaki kullanılmayan önbelleği kaldır",
+      "clearBuildConfirm": "Bu sunucudaki tüm kullanılmayan Docker derleme önbelleği temizlensin mi? Diğer projeler bir sonraki dağıtımda bağımlılıkları yeniden derleyebilir.",
+      "clearBuildSuccess": "{size} derleme önbelleği geri kazanıldı",
+      "clearBuildEmpty": "Temizlenecek kullanılmayan derleme önbelleği yok"
     },
     "transfer": {
       "title": "Taşıma ve Klonlama",
@@ -478,28 +545,7 @@
     "unlink": "Bağlantıyı kaldır"
   },
   "gitInfo": {
-    "repository": "Depo",
-    "autoDeploy": "Otomatik dağıtım",
-    "deploysOnPush": "Her push işleminde dağıtılır",
-    "manualOnly": "Yalnızca manuel dağıtımlar",
-    "branchToDeploy": "Dağıtılacak dal",
-    "chooseBranch": "Deponuzdan hangi dalın dağıtılacağını seçin",
-    "save": "Kaydet",
-    "cancel": "İptal",
-    "viewOnGithub": "GitHub'da Görüntüle",
-    "recentCommits": "Son commitler",
-    "totalCommits": "toplam {count}",
-    "noCommits": "Henüz commit yok",
-    "toast": {
-      "fetchBranchesFailed": "Dallar çekilemedi",
-      "errorTitle": "Hata",
-      "branchUpdated": "Dal başarıyla güncellendi",
-      "updatedTitle": "Güncellendi",
-      "branchUpdateFailed": "Dal güncellenemedi",
-      "autoDeployEnabled": "Otomatik dağıtım etkinleştirildi",
-      "autoDeployDisabled": "Otomatik dağıtım devre dışı bırakıldı",
-      "autoDeployFailed": "Otomatik dağıtım güncellenemedi"
-    }
+    "autoDeploy": "Otomatik dağıtım"
   },
   "git": {
     "connectFirst": {
@@ -649,6 +695,9 @@
     "title": "Makine gücü",
     "description": "Bu projenin konteynerleri için CPU ve bellek sınırları.",
     "loading": "Hedef makine okunuyor…",
+    "unavailable": "Makine gücü kullanılamıyor",
+    "loadFailed": "Makine gücü yüklenemedi",
+    "retry": "Yeniden dene",
     "machineCapacity": "Makine: {cpu} vCPU · {memory}",
     "exceedsMachine": "Bu makineyi aşıyor",
     "appliesOnNextDeploy": "Sınırlar konteyner yeniden oluşturulduğunda uygulanır — değişikliğin etkili olması için yeniden dağıtın.",
@@ -731,10 +780,6 @@
     "cannotUndo": "Bu işlem geri alınamaz.",
     "aboutToPrefix": "Şunu silmek üzeresiniz: ",
     "aboutToSuffix": ".",
-    "deleteAllAria": "Tüm ortamları sil",
-    "deleteAll": "Tüm ortamları sil",
-    "deleteAllOn": "Proje uygulamasını ve altındaki her dal ortamını kaldırır.",
-    "deleteAllOff": "Yalnızca bu ortamı kaldırır. Diğer dallar kalır.",
     "scanning": "Bağlı servisler ve disk birimleri taranıyor…",
     "wipeAria": "Ayrıca servis verilerini de sil",
     "wipeLabelOne": "Ayrıca servis verilerini de sil ({count} disk birimi)",
@@ -749,9 +794,7 @@
     "typePrefix": "Onaylamak için ",
     "typeSuffix": " yazın.",
     "cancel": "İptal",
-    "confirmDeleteWipe": "Sil + verileri temizle",
     "confirmDeleteEnvWipe": "Ortamı sil + verileri temizle",
-    "confirmDelete": "Projeyi sil",
     "confirmDeleteEnv": "Ortamı sil",
     "linkedTitleOne": "{count} proje bu uygulamaya bağlı",
     "linkedTitleOther": "{count} proje bu uygulamaya bağlı",
@@ -837,6 +880,9 @@
       "includeWwwFallback": "alanadiniz.com",
       "externalIngress": "Harici trafik girişi ve TLS",
       "externalIngressDesc": "TLS upstream katmanında sonlandırılır (Cloudflare Tunnel veya yük dengeleyici). Yalnızca TXT kaydıyla doğrulayın — alan adının bu sunucuya yönlenmesi gerekmez ve Openship sertifika düzenlemez.",
+      "dnsChallenge": "DNS-01 doğrulamasını kullan",
+      "dnsChallengeDesc": "Sertifikayı bağlı DNS sağlayıcınız üzerinden düzenleyin ve yenileyin. Port 80'e erişilemiyorsa bunu kullanın.",
+      "dnsChallengeWildcardDesc": "Wildcard sertifikalar DNS-01 ve bağlı bir DNS sağlayıcısı gerektirir.",
       "noWww": "Alan adını \"www.\" olmadan girin — eklemek için aşağıdan \"www dahil et\" seçeneğini açın.",
       "adding": "Ekleniyor...",
       "submit": "Alan adı ekle"
@@ -868,7 +914,9 @@
       "bodyService": "\"{service}\" servisi: port {port} üzerinde hiçbir şey yanıt vermedi — orayı dinleyene kadar istekler 502 hatası verebilir."
     },
     "outputHint": {
-      "body": "{path} yolunda derleme çıktısı bulunamadı — Çıktı Dizininizi kontrol edip yeniden dağıtın."
+      "body": "{path} yolunda derleme çıktısı bulunamadı — Çıktı Dizininizi kontrol edip yeniden dağıtın.",
+      "noIndex": "{path} yolunda çıktı var ancak index dosyası yok — istekler 404 dönecek. Çıktı Dizininizi kontrol edin.",
+      "notServed": "Uç sunucu {path} için HTTP {status} yanıtı verdi — bu yol hizmet vermiyor. Çıktı Dizininizi ve yönlendirmeyi kontrol edin."
     },
     "overview": {
       "primary": "Birincil",

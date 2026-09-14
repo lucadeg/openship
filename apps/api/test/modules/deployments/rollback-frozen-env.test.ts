@@ -13,13 +13,19 @@
 
 import { describe, expect, it } from "vitest";
 
+import { resolveEnvPublicUrls } from "../../../src/modules/deployments/compose/deploy.service";
 import {
-  mergeServiceDeployEnv,
-  resolveEnvPublicUrls,
-} from "../../../src/modules/deployments/compose/deploy.service";
+  inlineEmptyDefers,
+  mergeServiceDeployEnv as mergeLayers,
+} from "../../../src/modules/deployments/compose/service-env-layers";
 import { diffFrozenEnv, ENV_DIFF_CAP } from "../../../src/modules/deployments/rollback";
 
-const layers = (over: Partial<Parameters<typeof mergeServiceDeployEnv>[0]> = {}) => ({
+/** Unwraps `{ env, deferredEmpty }` so these cases keep asserting on the env map. */
+const mergeServiceDeployEnv = (
+  ...args: Parameters<typeof mergeLayers>
+): Record<string, string> => mergeLayers(...args).env;
+
+const layers = (over: Partial<Parameters<typeof mergeLayers>[0]> = {}) => ({
   project: {},
   frozen: {},
   inline: {},
@@ -43,19 +49,19 @@ describe("mergeServiceDeployEnv", () => {
     expect(merged.API_KEY).toBe("release");
   });
 
-  it("keeps service env winning on a normal deploy", () => {
-    // Unchanged behaviour for every non-rollback deploy: the compose UI can still
-    // override a global per service.
+  it("keeps a manual service env_var over compose on a normal project redeploy", () => {
     const merged = mergeServiceDeployEnv(
       layers({
-        project: { API_KEY: "project-live" },
-        frozen: { API_KEY: "this-deploys-snapshot" },
-        inline: { API_KEY: "compose-inline" },
-        service: { API_KEY: "service-live" },
+        project: { PROJECT_ONLY: "project-live" },
+        frozen: { PROJECT_ONLY: "captured" },
+        inline: { COMPOSE_ONLY: "compose", MANUAL_KEY: "compose-old" },
+        service: { MANUAL_KEY: "manually-added" },
       }),
       false,
     );
-    expect(merged.API_KEY).toBe("service-live");
+    expect(merged).toEqual({
+      PROJECT_ONLY: "captured", COMPOSE_ONLY: "compose", MANUAL_KEY: "manually-added",
+    });
   });
 
   it("does not delete keys the snapshot never captured", () => {
@@ -117,6 +123,43 @@ describe("frozen env and {{publicUrl}} tokens", () => {
     const { env, unresolved } = resolveEnvPublicUrls(merged, () => undefined);
     expect("API_ORIGIN" in env).toBe(false);
     expect(unresolved).toEqual([{ key: "API_ORIGIN", tokens: ["{{publicUrl:removed}}"] }]);
+  });
+});
+
+describe("frozen env and Compose templates", () => {
+  it("resolves an old release's expression against that release's frozen env", () => {
+    const merged = mergeLayers(
+      layers({
+        project: { POSTGRES_PASSWORD: "today" },
+        frozen: { POSTGRES_PASSWORD: "release-secret" },
+        inline: {
+          DATABASE_URL: "postgresql://user:${POSTGRES_PASSWORD:?set it}@db/app",
+        },
+        templateKeys: ["DATABASE_URL"],
+      }),
+      true,
+    );
+
+    expect(merged.env.DATABASE_URL).toBe(
+      "postgresql://user:release-secret@db/app",
+    );
+    expect(merged.missingRequired).toEqual([]);
+  });
+
+  it("does not re-evaluate a target value frozen directly in the release", () => {
+    const merged = mergeLayers(
+      layers({
+        frozen: { DATABASE_URL: "postgresql://frozen-value" },
+        inline: {
+          DATABASE_URL: "postgresql://user:${POSTGRES_PASSWORD:?set it}@db/app",
+        },
+        templateKeys: ["DATABASE_URL"],
+      }),
+      true,
+    );
+
+    expect(merged.env.DATABASE_URL).toBe("postgresql://frozen-value");
+    expect(merged.missingRequired).toEqual([]);
   });
 });
 
@@ -194,6 +237,32 @@ describe("diffFrozenEnv", () => {
     });
     expect(diff.changes).toHaveLength(1);
     expect(diff.changes[0]).toMatchObject({ key: "LOG_LEVEL", direction: "frozen-wins" });
+  });
+
+  it("does not report a revert for a compose passthrough key the rollback won't touch", () => {
+    // #614: the service row holds `CONFIG_PARAM: ""` from `${CONFIG_PARAM:-}`,
+    // but the deploy merge defers it to the project value — so this key resolves
+    // to the SAME value the release froze and nothing changes. Building
+    // `overrides` as a raw spread of the row listed it as a per-service override,
+    // which reported a `frozen-wins` revert plus a scopeAmbiguous warning for a
+    // key the rollback leaves alone. `describeRestorePlan` applies the same
+    // `inlineEmptyDefers` the deploy does; this pins the resulting contract.
+    const liveProject = { CONFIG_PARAM: "operator-value" };
+    const row = { CONFIG_PARAM: "" };
+
+    const overrides = Object.fromEntries(
+      Object.entries(row).filter(([key, value]) => !inlineEmptyDefers(value, liveProject[key])),
+    );
+    expect(overrides).toEqual({});
+
+    const diff = diffFrozenEnv({
+      frozen: { CONFIG_PARAM: "operator-value" },
+      liveProject,
+      liveServices: [{ name: "api", overrides }],
+      strategy: "overlay",
+    });
+    expect(diff.changes).toEqual([]);
+    expect(diff.totalChanges).toBe(0);
   });
 
   it("omits a key every service already resolves to the frozen value", () => {

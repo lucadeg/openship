@@ -14,6 +14,7 @@ interface DashboardProvidersProps {
   isServerHost?: boolean;
   hostControlEnabled?: boolean;
   authMode: "cloud" | "local" | "none";
+  version?: string;
   /** What the instance declares it is. */
   productMode?: ProductView;
   /** What THIS user sees — instance mode plus their cookie override. Resolved in
@@ -36,6 +37,7 @@ export function DashboardProviders({
   isServerHost,
   hostControlEnabled,
   authMode,
+  version,
   productMode,
   productView,
   cloudAuthUrl,
@@ -51,6 +53,7 @@ export function DashboardProviders({
         isServerHost={isServerHost}
         hostControlEnabled={hostControlEnabled}
         authMode={authMode}
+        version={version}
         productMode={productMode}
         productView={productView}
         cloudAuthUrl={cloudAuthUrl}
@@ -65,11 +68,7 @@ export function DashboardProviders({
                 (backfill from pre-table installs) — not something a platform-mode
                 dashboard should pay for. Consumers get an unloaded shape when
                 it's absent, so nothing breaks. */}
-            {productView === "mail" ? (
-              <MailScopeProvider>{children}</MailScopeProvider>
-            ) : (
-              children
-            )}
+            {productView === "mail" ? <MailScopeProvider>{children}</MailScopeProvider> : children}
           </CloudProvider>
         </GitHubProvider>
       </PlatformProvider>

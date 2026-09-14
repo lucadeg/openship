@@ -28,10 +28,7 @@ import { MailServerSwitcher } from "@/components/mail-server-switcher";
 import { useMailScope } from "@/context/MailScopeContext";
 import { setActiveOrganizationId } from "@/lib/api/client";
 import { projectsApi } from "@/lib/api";
-import {
-  getSidebarNavCountsRevision,
-  subscribeSidebarNavCounts,
-} from "@/lib/sidebar-nav-counts";
+import { getSidebarNavCountsRevision, subscribeSidebarNavCounts } from "@/lib/sidebar-nav-counts";
 import {
   getMailNavSections,
   getNavSections,
@@ -63,13 +60,17 @@ interface SidebarMember {
  * useEffect dep creates an infinite render loop. See TeamTab for the
  * full explanation.
  */
-const sidebarOrgClient = (authClient as unknown as {
-  organization: {
-    list: () => Promise<{ data?: SidebarOrg[] }>;
-    setActive: (opts: { organizationId: string }) => Promise<{ error?: { message?: string } }>;
-    getFullOrganization: (opts?: { organizationId: string }) => Promise<{ data?: { id: string; members?: SidebarMember[] } | null }>;
-  };
-}).organization;
+const sidebarOrgClient = (
+  authClient as unknown as {
+    organization: {
+      list: () => Promise<{ data?: SidebarOrg[] }>;
+      setActive: (opts: { organizationId: string }) => Promise<{ error?: { message?: string } }>;
+      getFullOrganization: (opts?: {
+        organizationId: string;
+      }) => Promise<{ data?: { id: string; members?: SidebarMember[] } | null }>;
+    };
+  }
+).organization;
 
 export function Sidebar() {
   const { user } = useAuth();
@@ -95,12 +96,8 @@ export function Sidebar() {
   // Better Auth user exists yet, e.g. fresh install before onboarding):
   // fall back to machineName, NEVER to the cloud profile.
   const displayName =
-    user?.name ||
-    user?.email?.split("@")[0] ||
-    (isDesktop ? (machineName || "Local User") : "");
-  const displayEmail =
-    user?.email ||
-    (isDesktop ? "Desktop" : "");
+    user?.name || user?.email?.split("@")[0] || (isDesktop ? machineName || "Local User" : "");
+  const displayEmail = user?.email || (isDesktop ? "Desktop" : "");
   const cloudBadge = cloudConnected ? cloudUser : null;
   const displayInitial = displayName?.[0] ?? displayEmail?.[0] ?? "?";
   const isSaaS = !selfHosted || cloudConnected;
@@ -132,9 +129,13 @@ export function Sidebar() {
     return null;
   };
 
-  useEffect(() => subscribeSidebarNavCounts(() => {
-    setNavCountsRevision(getSidebarNavCountsRevision());
-  }), []);
+  useEffect(
+    () =>
+      subscribeSidebarNavCounts(() => {
+        setNavCountsRevision(getSidebarNavCountsRevision());
+      }),
+    [],
+  );
 
   // Org switcher state. Lazy-loaded — `list()` and the active org fetch
   // only fire after the first popover open so the sidebar doesn't pay
@@ -270,8 +271,7 @@ export function Sidebar() {
     }
   }
 
-  const activeOrg =
-    orgs.find((o) => o.id === activeOrgId) ?? orgs[0] ?? null;
+  const activeOrg = orgs.find((o) => o.id === activeOrgId) ?? orgs[0] ?? null;
   const showOrgSwitcher = orgsLoaded && !!activeOrg;
 
   // `?tab=` is only meaningful for the mail rail's entries, which all share the
@@ -280,8 +280,8 @@ export function Sidebar() {
 
   const label = (key: string, source?: "nav" | "mailTab") =>
     source === "mailTab"
-      ? (t.emailsAdmin.panel.tabs as unknown as Record<string, string>)[key] ?? key
-      : (t.dashboard.nav as unknown as Record<string, string>)[key] ?? key;
+      ? ((t.emailsAdmin.panel.tabs as unknown as Record<string, string>)[key] ?? key)
+      : ((t.dashboard.nav as unknown as Record<string, string>)[key] ?? key);
 
   const sectionLabel = (key: string) =>
     (t.dashboard.nav.sections as unknown as Record<string, string>)[key] ?? key;
@@ -297,11 +297,14 @@ export function Sidebar() {
 
   return (
     <aside
-      className={`my-3 ms-3 flex shrink-0 flex-col rounded-2xl border border-border/50 bg-card transition-[width] duration-200 overflow-hidden ${collapsed ? "w-[72px]" : "w-[260px]"
-        }`}
+      className={`my-3 ms-3 flex shrink-0 flex-col rounded-2xl border border-border/50 bg-card transition-[width] duration-200 overflow-hidden ${
+        collapsed ? "w-[72px]" : "w-[260px]"
+      }`}
     >
       {/* ── Header ───────────────────────────────────────────── */}
-      <div className={`app-sidebar-header flex items-center px-5 py-6 ${collapsed ? "flex-col gap-3 pb-3" : "justify-between"}`}>
+      <div
+        className={`app-sidebar-header flex items-center px-5 py-6 ${collapsed ? "flex-col gap-3 pb-3" : "justify-between"}`}
+      >
         <div className="flex items-center gap-2.5 min-w-0">
           <Logo size={26} className="shrink-0" />
           {!collapsed && (
@@ -369,14 +372,18 @@ export function Sidebar() {
                       key={key}
                       href={href}
                       title={collapsed ? label(key, labelSource) : undefined}
-                      className={`flex items-center rounded-xl px-3 py-2.5 text-[15px] font-medium transition-colors ${collapsed ? "justify-center" : "gap-3"
-                        } ${active
+                      className={`flex items-center rounded-xl px-3 py-2.5 text-[15px] font-medium transition-colors ${
+                        collapsed ? "justify-center" : "gap-3"
+                      } ${
+                        active
                           ? "bg-foreground/[0.07] text-foreground"
                           : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground"
-                        }`}
+                      }`}
                     >
                       <Icon className="size-[18px] shrink-0" strokeWidth={1.7} />
-                      {!collapsed && <span className="flex-1 truncate">{label(key, labelSource)}</span>}
+                      {!collapsed && (
+                        <span className="flex-1 truncate">{label(key, labelSource)}</span>
+                      )}
                       {/* Subtle right-aligned tally — Projects & Apps only, hidden
                           at 0 and when collapsed. Muted + tabular so it reads as
                           metadata, not a notification badge. */}
@@ -409,18 +416,17 @@ export function Sidebar() {
 
       {/* ── Primary action ──────────────────────────────────── */}
       {cta && (
-      <div className="px-3 pb-2">
-        <Link
-          href={cta.href}
-          title={collapsed ? label(cta.labelKey) : undefined}
-          className={`relative flex items-center justify-center gap-2.5 rounded-xl px-3 py-2.5 text-sm font-semibold transition-all overflow-hidden ${"bg-gradient-to-r from-violet-500/90 via-primary/90 to-blue-500/90 text-white shadow-sm shadow-primary/20 hover:shadow-md hover:shadow-primary/30 hover:brightness-110 dark:from-amber-400/90! dark:via-orange-500/90! dark:to-rose-500/90! dark:shadow-orange-500/20 dark:hover:shadow-orange-500/30 dim:from-[hsl(86_84%_74%)]! dim:via-[hsl(82_80%_64%)]! dim:to-[hsl(74_74%_54%)]! dim:text-[#0c1206]! dim:shadow-lime-400/25 dim:hover:shadow-lime-400/40"
-            }`}
-        >
-          <span className="absolute inset-0 bg-[radial-gradient(circle_at_30%_50%,rgba(255,255,255,0.15),transparent_70%)]" />
-          <Plus className="relative size-4" strokeWidth={2.5} />
-          {!collapsed && <span className="relative">{label(cta.labelKey)}</span>}
-        </Link>
-      </div>
+        <div className="px-3 pb-2">
+          <Link
+            href={cta.href}
+            title={collapsed ? label(cta.labelKey) : undefined}
+            className={`relative flex items-center justify-center gap-2.5 rounded-xl px-3 py-2.5 text-sm font-semibold transition-all overflow-hidden ${"bg-gradient-to-r from-violet-500/90 via-primary/90 to-blue-500/90 text-white shadow-sm shadow-primary/20 hover:shadow-md hover:shadow-primary/30 hover:brightness-110 dark:from-amber-400/90! dark:via-orange-500/90! dark:to-rose-500/90! dark:shadow-orange-500/20 dark:hover:shadow-orange-500/30 dim:from-[hsl(86_84%_74%)]! dim:via-[hsl(82_80%_64%)]! dim:to-[hsl(74_74%_54%)]! dim:text-[#0c1206]! dim:shadow-lime-400/25 dim:hover:shadow-lime-400/40"}`}
+          >
+            <span className="absolute inset-0 bg-[radial-gradient(circle_at_30%_50%,rgba(255,255,255,0.15),transparent_70%)]" />
+            <Plus className="relative size-4" strokeWidth={2.5} />
+            {!collapsed && <span className="relative">{label(cta.labelKey)}</span>}
+          </Link>
+        </div>
       )}
 
       {/* ── Account / Org switcher ──────────────────────────── */}
@@ -433,17 +439,14 @@ export function Sidebar() {
         )}
 
         {showOrgSwitcher ? (
-          <DismissiblePopover
-            open={orgsOpen}
-            onOpenChange={setOrgsOpen}
-            className="relative"
-          >
+          <DismissiblePopover open={orgsOpen} onOpenChange={setOrgsOpen} className="relative">
             {/* Trigger — current org + chevron, Cloudflare-style */}
             <button
               type="button"
               onClick={() => setOrgsOpen((v) => !v)}
-              className={`group flex w-full items-center rounded-xl px-2 py-2 text-start transition-colors hover:bg-foreground/[0.06] ${collapsed ? "justify-center" : "gap-3"
-                }`}
+              className={`group flex w-full items-center rounded-xl px-2 py-2 text-start transition-colors hover:bg-foreground/[0.06] ${
+                collapsed ? "justify-center" : "gap-3"
+              }`}
               aria-haspopup="dialog"
               aria-expanded={orgsOpen}
               title={collapsed ? activeOrg?.name : undefined}
@@ -461,7 +464,9 @@ export function Sidebar() {
                     </p>
                     <p className="truncate text-[12px] leading-tight text-muted-foreground">
                       {orgs.length > 1
-                        ? interpolate(t.chrome.sidebar.workspacesCount, { count: String(orgs.length) })
+                        ? interpolate(t.chrome.sidebar.workspacesCount, {
+                            count: String(orgs.length),
+                          })
                         : displayEmail}
                     </p>
                   </div>
@@ -473,10 +478,9 @@ export function Sidebar() {
             {/* Popover — shown to the side when collapsed, above when expanded */}
             {orgsOpen && (
               <div
-                className={`absolute z-50 overflow-hidden rounded-2xl border border-border/50 bg-popover shadow-xl shadow-black/[0.08] ${collapsed
-                    ? "start-full bottom-0 ms-2 w-72"
-                    : "start-0 end-0 bottom-full mb-2"
-                  }`}
+                className={`absolute z-50 overflow-hidden rounded-2xl border border-border/50 bg-popover shadow-xl shadow-black/[0.08] ${
+                  collapsed ? "start-full bottom-0 ms-2 w-72" : "start-0 end-0 bottom-full mb-2"
+                }`}
               >
                 {/* Heading */}
                 <div className="px-3 pt-3 pb-2">
@@ -496,8 +500,9 @@ export function Sidebar() {
                         type="button"
                         onClick={() => handleOrgSwitch(o.id)}
                         disabled={!!switchingOrgId}
-                        className={`flex w-full items-center gap-2.5 px-3 py-2 text-start transition-colors hover:bg-foreground/[0.05] disabled:opacity-60 ${isCurrent ? "bg-foreground/[0.03]" : ""
-                          }`}
+                        className={`flex w-full items-center gap-2.5 px-3 py-2 text-start transition-colors hover:bg-foreground/[0.05] disabled:opacity-60 ${
+                          isCurrent ? "bg-foreground/[0.03]" : ""
+                        }`}
                       >
                         <div className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-foreground/[0.08] text-[12px] font-semibold uppercase text-foreground">
                           {o.name?.[0] ?? <Building2 className="size-3.5" />}
@@ -513,10 +518,14 @@ export function Sidebar() {
                               </span>
                             )}
                             {user?.id && o.id === `org_${user.id}` && (
-                              <span className="text-muted-foreground/80">{t.chrome.sidebar.personal}</span>
+                              <span className="text-muted-foreground/80">
+                                {t.chrome.sidebar.personal}
+                              </span>
                             )}
                             {orgRoles[o.id] && (
-                              <span className="capitalize text-muted-foreground/80">{orgRoles[o.id]}</span>
+                              <span className="capitalize text-muted-foreground/80">
+                                {orgRoles[o.id]}
+                              </span>
                             )}
                           </p>
                         </div>
@@ -547,7 +556,9 @@ export function Sidebar() {
                       {cloudBadge?.email && (
                         <p
                           className="truncate text-[10px] leading-tight text-muted-foreground/70"
-                          title={interpolate(t.chrome.sidebar.linkedToCloud, { email: cloudBadge.email })}
+                          title={interpolate(t.chrome.sidebar.linkedToCloud, {
+                            email: cloudBadge.email,
+                          })}
                         >
                           {interpolate(t.chrome.sidebar.cloudLabel, { email: cloudBadge.email })}
                         </p>
@@ -577,8 +588,9 @@ export function Sidebar() {
              the operator can still log out. */
           <>
             <div
-              className={`flex items-center rounded-xl px-2 py-2 ${collapsed ? "justify-center" : "gap-3"
-                }`}
+              className={`flex items-center rounded-xl px-2 py-2 ${
+                collapsed ? "justify-center" : "gap-3"
+              }`}
             >
               <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-foreground/[0.08] text-sm font-semibold uppercase text-foreground">
                 {displayInitial}
@@ -596,7 +608,9 @@ export function Sidebar() {
                     {cloudBadge?.email && (
                       <p
                         className="truncate text-[11px] leading-tight text-muted-foreground/70"
-                        title={interpolate(t.chrome.sidebar.linkedToCloud, { email: cloudBadge.email })}
+                        title={interpolate(t.chrome.sidebar.linkedToCloud, {
+                          email: cloudBadge.email,
+                        })}
                       >
                         {interpolate(t.chrome.sidebar.cloudLabel, { email: cloudBadge.email })}
                       </p>
@@ -657,4 +671,3 @@ export function Sidebar() {
     </aside>
   );
 }
-

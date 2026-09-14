@@ -8,11 +8,11 @@ GitHub, where new deployments land by default, the tokens and AI clients that ta
 your team, and how this install itself is run and updated.
 
 Open it from the dashboard's left navigation (the **Settings** item), or go straight to **`/settings`**. The
-screen has a tab nav on the right (a horizontal strip on mobile) that switches between eight tabs. Each tab
+screen has a tab nav on the right (a horizontal strip on mobile) that switches between sections. Each tab
 is also directly linkable with a `?tab=` query — e.g. `/settings?tab=team` — so you can bookmark or share the
 exact place you mean.
 
-<Callout title="Screenshot">Settings page with the tab nav showing all tabs (General, Tokens, MCP, Team, Notifications, Audit log, Cloud, Instance) and the General tab open. *(screenshot pending)*</Callout>
+<Callout title="Screenshot">Settings page with the tab nav and the General tab open. *(screenshot pending)*</Callout>
 
 <Callout title="Some tabs and sections only appear in some setups" type="info">
 The **Cloud** tab is hidden on the managed Openship Cloud — it shows on self-hosted and desktop installs
@@ -24,19 +24,26 @@ expect, that's why.
 
 ## General
 
-The home tab: your GitHub connection and the defaults applied to new deployments.
+The home tab contains language, interface preferences, and self-hosted build preferences.
 
-### GitHub
+## Git
 
-The **GitHub** card is where you link the account Openship reads your repositories from. If you're not
-connected yet, press **Connect GitHub** and approve the window that pops up. Once linked, the card shows
-your login and how many installations you have, with **Add account**, **Install GitHub App**,
-**Manage on GitHub**, and **Disconnect**. There's also an optional **gh CLI** fallback for cloning repos
-outside your App installations during local builds.
+The **Git** tab owns outbound source-control access. On self-hosted instances, workspace owners first see
+**Self-hosted GitHub Apps**, where they can create Apps with GitHub's manifest flow, register an existing
+GitHub or GitHub Enterprise App, manage installations, rotate credentials, verify health, and choose a
+default source. See [Self-hosted GitHub Apps](/docs/guides/self-hosted-github-app).
+
+The **GitHub** connection card underneath manages the separate local `gh`/device/token identity and the
+managed Openship App fallback. When workspace-owned Apps exist, their install, manage, and delete controls
+remain exclusively in the source cards, so **Disconnect** cannot misleadingly remove only an unrelated
+OAuth account.
+
+The **GitHub clone credentials** card stores a personal token fallback for private clones. On desktop it can
+also forward the local Git identity to remote build servers.
 
 See [Deploy from GitHub](/docs/guides/deploy-from-github) for the full walk-through.
 
-<Callout title="Screenshot">General tab, the "GitHub" card showing a connected account with installation count and the Add account / Manage on GitHub / Disconnect actions. *(screenshot pending)*</Callout>
+<Callout title="Screenshot">Git tab showing workspace-owned GitHub Apps, the GitHub identity card, and clone credentials. *(screenshot pending)*</Callout>
 
 ### Deploy Defaults
 
@@ -57,22 +64,8 @@ Choose the language used across the dashboard. The change applies immediately.
 
 ## Tokens
 
-Credentials that let other things act on your behalf. Two cards live here.
-
-### GitHub clone credentials
-
-A personal GitHub token used to clone **private** repos when the GitHub App isn't installed. Paste a
-classic (`ghp_…`) or fine-grained (`github_pat_…`) token, then toggle **Use as default clone token** to put
-it into the clone chain. It sits second in priority — after any per-project override, before the App
-installation token. Give a classic token the `repo` scope, or fine-grained read access to the repos you
-deploy.
-
-This card also has **Forward my git identity to build servers** — a single per-operator switch (replacing
-the old per-deploy checkbox). When on, a build that runs on a remote server clones directly on that server
-using your local `gh` login, tunneled over SSH just for the clone; nothing is written to the server. When
-off, the server falls back to its own git login, a stored token, the public path, or cloning on Openship
-and transferring. See [Git authentication for private repos](/docs/guides/git-authentication) for the full
-chain.
+Credentials that let other things act on your behalf. GitHub clone credentials live in **Git**; this tab
+contains API access tokens.
 
 ### Personal Access Tokens
 
@@ -87,7 +80,7 @@ permissions unless you narrow it. When creating one you can:
 Press **Create token**, then copy it immediately — this is the only time the value is shown. Existing
 tokens are listed with **read-only** / **scoped** badges and a **Revoke** button.
 
-<Callout title="Screenshot">Tokens tab showing the clone-credentials card and the Personal Access Tokens list with the create form (name, expiry, read-only, limit-to-resources). *(screenshot pending)*</Callout>
+<Callout title="Screenshot">Tokens tab showing the Personal Access Tokens list with the create form (name, expiry, read-only, limit-to-resources). *(screenshot pending)*</Callout>
 
 <Callout title="Copy the token now" type="warn">
 A new token's value is displayed once, at creation. If you lose it you can't recover it — revoke it and

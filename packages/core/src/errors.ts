@@ -70,6 +70,7 @@ export class HostUnreachableError extends AppError {
  *
  * Codes:
  *   PORT_IN_USE - target port is occupied by another process
+ *   FOREIGN_COMPOSE_STACK - an unowned same-project Compose stack exists on the target
  */
 export class DeployError extends AppError {
   constructor(

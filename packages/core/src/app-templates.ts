@@ -611,6 +611,19 @@ export function getOutputService(output: Pick<AppOutput, "service" | "source">):
 }
 
 /**
+ * The CONTAINER port an output's source names (`publicUrl:<service>:<port>`), or
+ * null when it names none. Authoritative for internal-mode rewriting alongside
+ * `getOutputService`: the port that survives into the RESOLVED value is either
+ * absent (a routed `https://<host>`) or the host side of a published mapping, so
+ * only this declaration says which of a multi-endpoint service's ports the output
+ * actually means.
+ */
+export function getOutputPort(output: Pick<AppOutput, "source">): number | null {
+  const m = /^publicUrl:[^:]+:(\d+)$/.exec(output.source ?? "");
+  return m ? Number(m[1]) : null;
+}
+
+/**
  * Resolve the internal docker endpoint (service alias + container port) an
  * internal connection URL should point at: the declared endpoint for `service`,
  * preferring one whose port matches `preferredPort` (the source URL's own port),

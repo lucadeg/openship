@@ -27,7 +27,13 @@
 
 import crypto from "node:crypto";
 import { repos } from "@repo/db";
-import { safeErrorMessage, sanitizeProxySettings } from "@repo/core";
+import { isServiceFailureStatus, safeErrorMessage, sanitizeProxySettings } from "@repo/core";
+// The SHARED bounded-concurrency limiter. This module grew a private copy (`runPool`)
+// of the very thing lib/map-with-limit.ts exists to prevent — and it was the copy
+// driving the SSH-saturating volume transfer.
+import { mapWithLimit } from "../../lib/map-with-limit";
+import { probeOneVolume, probeTargetVolumeConflicts } from "./volume-conflict";
+import { syncProjectManagedEdge } from "../projects/project-runtime.service";
 import {
   resolveExecutor,
   transferVolume,
@@ -36,6 +42,9 @@ import {
   readEdgeFile,
   writeEdgeFile,
   edgeProxy,
+  edgeProxyFor,
+  type EdgeProxyApi,
+  type Platform,
   type ServiceHandle,
   type TransferEndpoint,
   type TransferMode,
@@ -49,13 +58,16 @@ import {
 } from "../../lib/deployment-runtime";
 import { establishDirectLink, PathMissingError, statPath, sq } from "./direct-transfer";
 import type { MigrationRouteSpec } from "./migration-input";
-import { sizeOfMoveSet } from "./migration-size";
+import { sizeOfMoveSet, volumeBytes } from "./migration-size";
 import { withKeyedMutex } from "../../lib/provision-lock";
 import { requestBuildAccess } from "../deployments/build.service";
 import { restartServiceContainer, updateService } from "../services/service.service";
 import { describeLiveState, resolveLiveServiceState } from "../services/live-state";
 import { applyProjectRouting } from "../domains/routing-apply.service";
-import { resolveProjectRouteState, reapplyProjectLiveRoutes } from "../domains/project-route.service";
+import {
+  resolveProjectRouteState,
+  reapplyProjectLiveRoutes,
+} from "../domains/project-route.service";
 import { linkProjectRepo } from "../projects/project-crud.service";
 import type { ProjectCompositeRoute, ProxySettings } from "@repo/core";
 import { teardownProject } from "../projects/project-teardown";
@@ -70,11 +82,15 @@ import type { AdoptResult, RepoComposeService } from "./migrate.service";
 import type { DiscoveredService } from "./docker-reconcile";
 import { loadProjectMoveWorkload, type ProjectMoveIntent } from "./project-move";
 import { cloneProjectToServer } from "../projects/project-clone.service";
-import { applyRelocationEffects, projectRelocationEffects } from "./relocation-effects";
 import { excludeAlreadyManaged } from "./managed-containers";
 import { perService, selectDiscoveredServices } from "./select-services";
 import { isMovableBind } from "./migration-preflight";
 import { migrationRunBus } from "./migration.sse";
+import type { HostPortTargetIdentity } from "../../lib/host-port-target";
+import {
+  convergeTargetHostPortClaimsUnlocked,
+  withHostPortTargetLock,
+} from "../deployments/pinned-host-ports";
 
 /** Per-service volume ownership for a same-server migration.
  *  "reuse" (default) = seize the original volume in place (zero copy).
@@ -90,6 +106,64 @@ export interface ProgressUpdate {
   kind: "image" | "volume";
   movedBytes: number;
   totalBytes: number | null;
+}
+
+/**
+ * Retire a project's managed routes on its old physical target and release only
+ * claims that a strict, post-mutation edge inventory proves are no longer used.
+ *
+ * The route writes and convergence deliberately share the physical-target lock:
+ * otherwise a concurrent deploy could reserve/re-register a port between the
+ * removal and the scan. Any route failure suppresses the entire release pass;
+ * an uncertain removal must fail closed. The convergence primitive itself uses
+ * a forced-fresh strict scan and exact ownership checks.
+ */
+export async function retireSourceManagedRoutes(input: {
+  projectId: string;
+  hostnames: Iterable<string>;
+  routing: Pick<Platform["routing"], "removeRoute">;
+  target: HostPortTargetIdentity;
+  edgeProxy: Pick<EdgeProxyApi, "listLoopbackUpstreamPortsStrict">;
+  /** False while even one source workload survived destructive cutover. */
+  releaseClaims: boolean;
+}): Promise<void> {
+  await withHostPortTargetLock(input.target, async () => {
+    let routesRemoved = true;
+    for (const hostname of new Set(input.hostnames)) {
+      try {
+        // Idempotent (rm -rf semantics), so a hostname the source never served
+        // is a no-op rather than an error.
+        await input.routing.removeRoute(hostname);
+      } catch (err) {
+        routesRemoved = false;
+        console.warn(
+          `[migration] source edge: removeRoute ${hostname} failed; host-port claims retained:`,
+          safeErrorMessage(err),
+        );
+      }
+    }
+
+    // A surviving source container can still hold or later reclaim its bind.
+    // Likewise, a failed route removal is uncertain even when the other vhosts
+    // were removed successfully. In either case, retain every claim.
+    if (!input.releaseClaims || !routesRemoved) return;
+
+    try {
+      await convergeTargetHostPortClaimsUnlocked({
+        target: input.target,
+        projectId: input.projectId,
+        desiredPublishes: [],
+        edgeProxy: input.edgeProxy,
+      });
+    } catch (err) {
+      // Source destruction already completed and the target is serving. Claim
+      // cleanup is best-effort; the safe failure mode is durable retention.
+      console.warn(
+        `[migration] source host-port claim convergence deferred (claims retained):`,
+        safeErrorMessage(err),
+      );
+    }
+  });
 }
 
 export interface StartMigrationInput {
@@ -175,7 +249,13 @@ interface ResolvedWorkload {
 
 /** Re-key a DISCOVERED-name-keyed map onto the adopted ROW names via a
  *  discovered→row rename map. Keys with no rename entry pass through unchanged.
- *  Used so migrate inputs (e.g. routesByServiceName) land on renamed rows. */
+ *  Used so migrate inputs (e.g. routesByServiceName) land on renamed rows.
+ *
+ *  MUST be given `adopt.rowNameByDiscovered`, NOT `adopt.renames`: the latter is keyed
+ *  by service IDENTITY (`serviceUid`), so a name lookup in it misses for every adopted
+ *  container and the key passed through UNRENAMED — `publishRoutes` then looked the row
+ *  up by the discovered name, found nothing, and dropped a renamed service's route with
+ *  no warning. */
 function remapKeys<T>(
   map: Record<string, T> | undefined,
   renames: Record<string, string>,
@@ -322,25 +402,6 @@ const TERMINAL_DEPLOY = new Set([
 /** How many volumes move concurrently — a few in flight without saturating one SSH link. */
 const TRANSFER_CONCURRENCY = 3;
 
-/** Minimal bounded-concurrency runner (no dep): keeps ≤`limit` tasks in flight,
- *  preserves order, propagates the first rejection. */
-async function runPool<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  const worker = async () => {
-    while (next < items.length) {
-      const idx = next++;
-      results[idx] = await fn(items[idx]);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
-}
-
 class MigrationOrchestratorImpl {
   /** Latest data-move progress per run, surfaced through getMigration so the
    *  wizard's existing poll can draw a bar without a second SSE subscription.
@@ -462,6 +523,11 @@ class MigrationOrchestratorImpl {
         // `failed` run re-opened pre-filled (edit & retry).
         inputSnapshot: input as unknown as Record<string, unknown>,
       });
+      if (!run) {
+        throw new Error(
+          "The project is being deleted, so this migration can no longer be started.",
+        );
+      }
       setImmediate(() => {
         void this.run(ctx, run.id, input).catch((err) =>
           console.error(`[migration] ${run.id} crashed:`, safeErrorMessage(err)),
@@ -592,7 +658,9 @@ class MigrationOrchestratorImpl {
   ): Promise<ResolvedWorkload> {
     const { organizationId, sourceServerId, serviceNames } = input;
     const sameServer = sourceServerId === input.targetServerId;
-    log(`${sameServer ? "same-server" : "cross-server"} migration of ${serviceNames.length} service(s): ${serviceNames.join(", ")}`);
+    log(
+      `${sameServer ? "same-server" : "cross-server"} migration of ${serviceNames.length} service(s): ${serviceNames.join(", ")}`,
+    );
     const stack = await discoverServerStack(sourceServerId, organizationId, undefined, {
       flatDocker: input.flatDocker,
     });
@@ -647,7 +715,6 @@ class MigrationOrchestratorImpl {
     const attachChosen = chosen.filter((s) => isAttach(s));
     const deployChosen = chosen.filter((s) => !isAttach(s));
 
-
     // Parse the linked repo's compose so adopted rows take their NATIVE
     // build/image spec (mapped by the wizard) instead of a frozen running-image
     // tag — the fix that makes a later Redeploy reclone + rebuild rather than
@@ -677,11 +744,7 @@ class MigrationOrchestratorImpl {
     return { chosen, attachChosen, deployChosen, adopt, repoServices };
   }
 
-  private async run(
-    ctx: RequestContext,
-    id: string,
-    input: StartMigrationInput,
-  ): Promise<void> {
+  private async run(ctx: RequestContext, id: string, input: StartMigrationInput): Promise<void> {
     const { organizationId, sourceServerId, targetServerId, serviceNames } = input;
     const sameServer = sourceServerId === targetServerId;
     let scannedContainerIds: Record<string, string> = {};
@@ -730,25 +793,41 @@ class MigrationOrchestratorImpl {
       // volume copy) and rollback restarted only one; and `resolveScannedContainerId`
       // looks this up BY ROW NAME, so a renamed or `-2`-suffixed row never resolved
       // its container and fell back to a guessed volume name.
-      const rowNameOf = (svc: (typeof chosen)[number]) => perService(adopt.renames, svc) ?? svc.name;
+      const rowNameOf = (svc: (typeof chosen)[number]) =>
+        perService(adopt.renames, svc) ?? svc.name;
       scannedContainerIds = Object.fromEntries(
-        deployChosen.filter((s) => s.containerId).map((s) => [rowNameOf(s), s.containerId as string]),
+        deployChosen
+          .filter((s) => s.containerId)
+          .map((s) => [rowNameOf(s), s.containerId as string]),
       );
       // Row-keyed too: moveData works in adopted service ROWS, so handing it the
       // request's identity-keyed map would match nothing.
       const rowVolumeStrategies: Record<string, VolumeStrategy> = Object.fromEntries(
         chosen.map((s) => [rowNameOf(s), perService(input.volumeStrategies, s) ?? "reuse"]),
       );
-      await this.transition(id, "adopting", { projectId, scannedContainerIds });
+      // A scan/adopt run did not have a project at enqueue time, and a copy has
+      // just minted a new target project. Bind the durable run through the same
+      // project-row admission lock before any later stop/copy/deploy work. If a
+      // concurrent delete claimed the new row first, rollback restores the
+      // source and this worker never proceeds under an untracked project.
+      const bound = await repos.dockerMigrationRun.bindProject(id, projectId, organizationId, {
+        scannedContainerIds,
+      });
+      if (!bound) {
+        throw new Error("The migration project is being deleted; aborting before data movement.");
+      }
+      await this.transition(id, "adopting", { scannedContainerIds });
 
       // Link the repo (if the user picked one) BEFORE deploy so source + push
       // auto-deploy are bound from the first release. Best-effort: adopted rows
       // carry an image, so the deploy reuses it regardless — a GitHub hiccup must
       // never block the (destructive) migration.
       if (input.gitSource) {
-        const linked = await linkProjectRepo(ctx, projectId, input.gitSource).catch(
-          (err) => ({ ok: false as const, code: "invalid" as const, message: safeErrorMessage(err) }),
-        );
+        const linked = await linkProjectRepo(ctx, projectId, input.gitSource).catch((err) => ({
+          ok: false as const,
+          code: "invalid" as const,
+          message: safeErrorMessage(err),
+        }));
         if (!linked.ok) {
           console.warn(`[migration] ${id}: repo link skipped (${linked.code})`);
         }
@@ -757,17 +836,46 @@ class MigrationOrchestratorImpl {
       // Translate the discovered attach names onto the adopted ROW names (repo
       // names when the wizard mapped them) — the rows are keyed by their final
       // name, so matching by the discovered name would miss every renamed row.
-      const attachNames = new Set(attachChosen.map((s) => adopt.renames[s.name] ?? s.name));
-      const attachRows = (await repos.service.listByProject(projectId)).filter((r) =>
-        attachNames.has(r.name),
-      );
+      // `rowNameOf` (above), NOT `adopt.renames[s.name]`: that map is keyed by service
+      // IDENTITY (serviceUid = containerId), so for any RUNNING container a bare-name
+      // lookup is always undefined and this silently fell back to DISCOVERED names while
+      // the rows are keyed by FINAL ones. `attachRows` then came back empty for a renamed
+      // or `-2`-suffixed row, so the reuse set was never disabled for the build and
+      // `joinReusedContainersToGroup` never ran — the native deploy went on to RECREATE
+      // the still-running containers that reuse mode exists to keep.
+      const attachNames = new Set(attachChosen.map((s) => rowNameOf(s)));
+      const projectRows = await repos.service.listByProject(projectId);
+      const attachRows = projectRows.filter((r) => attachNames.has(r.name));
+      /**
+       * The rows this deploy may touch: everything EXCEPT the reuse set.
+       *
+       * Handed to `requestBuildAccess` as `serviceIds`, which the compose pipeline turns
+       * into "deploy only these, carry live siblings forward untouched, never reap them" —
+       * the exact contract the migration needs, and the one the native per-service deploy
+       * already uses.
+       *
+       * It replaces flipping `enabled:false` on every reuse row for the whole build+verify
+       * window (up to VERIFY_TIMEOUT_MS). That window was PERSISTED, operator-visible
+       * state that nothing recovered: `recoverInterruptedMigrations` restarts source
+       * containers and repairs `project.serverId` but never touched `service.enabled`, so
+       * an API restart mid-verify left the operator's still-running reused services
+       * permanently disabled — and the next full redeploy of that project then destroyed
+       * the container of every disabled service.
+       */
+      const deployRowIds = projectRows
+        .filter((r) => !attachNames.has(r.name) && r.enabled)
+        .map((r) => r.id);
 
       // Repo compose services with no adopted container (e.g. a same-server run
       // whose only running container is `postgres`, but the repo compose also
       // declares web/dashboard/api/redis) are already created as native rows —
       // with their env — by adoptServerStack. This just gates whether the native
       // deploy has to run to build/pull them (and publish their domains).
-      const adoptedRowNames = new Set(chosen.map((s) => adopt.renames[s.name] ?? s.name));
+      // Same accessor, same reason: with discovered names here every wizard-mapped
+      // service read as NEW (`repoServices` is keyed by repo name), so
+      // `hasNewRepoServices` was true and a pure-reuse run that should skip the deploy
+      // entirely entered the deploy branch.
+      const adoptedRowNames = new Set(chosen.map((s) => rowNameOf(s)));
       const hasNewRepoServices = repoServices
         ? [...repoServices.keys()].some((n) => !adoptedRowNames.has(n))
         : false;
@@ -799,8 +907,8 @@ class MigrationOrchestratorImpl {
       }
 
       // Run the native deploy when there are containers to move (cross-server /
-      // copy) OR new repo services to build/pull. Attach-live services are
-      // disabled during the build (below) so they stay zero-downtime; the deploy
+      // copy) OR new repo services to build/pull. Attach-live services are excluded by the
+      // deploy's own `strictServiceScope` (below) so they stay zero-downtime; the deploy
       // only builds the new ones. Only a pure same-server reuse with NO new repo
       // services skips the deploy entirely (the `else`).
       if (deployChosen.length > 0 || hasNewRepoServices) {
@@ -912,49 +1020,77 @@ class MigrationOrchestratorImpl {
         }
 
         // ── deploying ──
-        // Scope the compose deploy to the reuse set: attach-live rows are disabled
-        // so the pipeline builds/deploys ONLY the new/moved services and never
-        // recreates the still-running reused containers. requestBuildAccess kicks
-        // the build off in the BACKGROUND and returns immediately, so the rows must
-        // stay disabled for the ENTIRE build+verify — re-enabling right after the
-        // call returns would race the async build into reading them enabled and
-        // recreating the reused containers. Re-enabled in the finally only AFTER
-        // waitForDeployment resolves (by then the build has read the disabled set);
-        // the finally still restores them on any failure/cancel.
+        // Scoped by `serviceIds` (see deployRowIds): the pipeline builds/deploys ONLY the
+        // new/moved services, carries the still-running reused containers forward
+        // untouched, and never reaps them — without mutating any persisted row.
         this.throwIfCancelled(id);
-        await this.transition(id, "deploying");
-        for (const r of attachRows) {
-          await repos.service.update(r.id, { enabled: false });
+        // An EMPTY scope must never reach `requestBuildAccess`: it drops `serviceIds` when
+        // the list is empty, and an unscoped compose deploy recreates every service — the
+        // reuse set included, which is the one outcome adopt-in-place exists to prevent.
+        // Reaching here with nothing to deploy would be a bug in the branch condition
+        // above (`deployChosen.length > 0 || hasNewRepoServices`), so say so and stop
+        // rather than deploying the wrong thing.
+        if (deployRowIds.length === 0) {
+          throw new Error(
+            "Nothing to deploy on the target, but the run reached the deploy step — " +
+              "refusing to run an unscoped deploy that would recreate the reused containers.",
+          );
         }
+        await this.transition(id, "deploying");
         log(`deploying to target server…`);
-        try {
-          const dep = await requestBuildAccess(ctx, {
-            projectId,
-            deployTarget: "server",
-            serverId: targetServerId,
-            runtimeMode: "docker",
-            serviceDeploymentMode: "services",
-            // One-time cutover: native `build:` rows reuse the transferred/running
-            // image on THIS deploy (no rebuild); a later Redeploy has no handover
-            // and rebuilds from the repo.
-            handoverImages: adopt.handover,
+        {
+          const dep = await requestBuildAccess(
+            ctx,
+            {
+              projectId,
+              deployTarget: "server",
+              serverId: targetServerId,
+              runtimeMode: "docker",
+              serviceDeploymentMode: "services",
+              // Deploy ONLY the new/moved rows. `requestBuildAccess` ignores an EMPTY list
+              // (`serviceIds && length > 0`), which would silently mean "deploy everything"
+              // and recreate the reuse set — so the caller refuses to get here with one
+              // (see the guard above this block).
+              serviceIds: deployRowIds,
+            },
             /**
-             * The SINGLE-APP twin of the map above, and the reason a moved single app rebuilt
-             * itself from source on the target.
+             * EXCLUSIVE scope, not just "prefer these".
              *
-             * `handoverImages` is the COMPOSE field: `pinnedServiceImage` looks a service NAME up
-             * in it. A single-app deploy asks `pinnedAppImage`, which reads this scalar — and
-             * `snapshotNeedsGitSource` keys off the same thing, so with it unset the target cloned
-             * the repo and ran a full `docker build`. For `makieon` that meant streaming 725 MB of
-             * image across, then rebuilding it from git anyway: minutes of wasted work whose only
-             * visible symptom was a migration that looked stuck on its last step.
-             *
-             * Set only when the workload IS one service, so a compose project keeps using the map.
+             * `serviceIds` on its own means "build these, CARRY the rest forward", and carry
+             * reads `project.activeDeploymentId` — which is null here: a freshly adopted
+             * project has no previous release, and this run's own runtime rows are written by
+             * `attachLiveRuntime` AFTER the deploy. So without this the reuse rows would be
+             * neither carried nor skipped: enabled and holding a real image, they'd deploy
+             * normally and put a SECOND container on the still-running originals' bare
+             * volumes (reuse rows keep `namespaceVolumes: false`) — two writers on one
+             * dataset, the exact opposite of what reuse mode promises.
              */
-            ...(Object.keys(adopt.handover).length === 1
-              ? { handoverAppImage: Object.values(adopt.handover)[0] }
-              : {}),
-          });
+            {
+              strictServiceScope: true,
+              // Internal-only artifact provenance. A public deploy request must
+              // never be able to bypass build/pull with an arbitrary host ref.
+              // One-time cutover: native `build:` rows reuse the transferred/running
+              // image on THIS deploy (no rebuild); a later Redeploy has no handover
+              // and rebuilds from the repo.
+              handoverImages: adopt.handover,
+              /**
+               * The SINGLE-APP twin of the map above, and the reason a moved single app rebuilt
+               * itself from source on the target.
+               *
+               * `handoverImages` is the COMPOSE field: `pinnedServiceImage` looks a service NAME up
+               * in it. A single-app deploy asks `pinnedAppImage`, which reads this scalar — and
+               * `snapshotNeedsGitSource` keys off the same thing, so with it unset the target cloned
+               * the repo and ran a full `docker build`. For `makieon` that meant streaming 725 MB of
+               * image across, then rebuilding it from git anyway: minutes of wasted work whose only
+               * visible symptom was a migration that looked stuck on its last step.
+               *
+               * Set only when the workload IS one service, so compose keeps using the map.
+               */
+              ...(Object.keys(adopt.handover).length === 1
+                ? { handoverAppImage: Object.values(adopt.handover)[0] }
+                : {}),
+            },
+          );
           deploymentId = dep.deployment_id;
           await this.transition(id, "deploying", { deploymentId });
           log(`target deployment ${deploymentId} started; verifying health…`);
@@ -972,10 +1108,6 @@ class MigrationOrchestratorImpl {
               ? `it was still deploying after ${mins} minutes`
               : await this.describeDeployFailure(deploymentId, verified);
             throw new Error(`The target deployment did not become ready — ${reason}.`);
-          }
-        } finally {
-          for (const r of attachRows) {
-            await repos.service.update(r.id, { enabled: true }).catch(() => {});
           }
         }
 
@@ -1035,7 +1167,7 @@ class MigrationOrchestratorImpl {
       await this.publishRoutes(
         ctx,
         projectId,
-        remapKeys(input.routesByServiceName, adopt.renames),
+        remapKeys(input.routesByServiceName, adopt.rowNameByDiscovered),
         log,
       );
 
@@ -1045,15 +1177,45 @@ class MigrationOrchestratorImpl {
       // adopted (foreign labels) or replaced looks identical in the run log to
       // one that landed cleanly — the operator only found out from the panel.
       // Log-only: never changes the run's outcome.
-      // Everything that RECORDED the old server now has to point at the new one. One list, run
-      // and logged uniformly, because that set only grows — see `relocation-effects`. After
-      // `publishRoutes` on purpose: several effects re-point things that exist only once the
-      // project's routes do (the free-subdomain mapping is the first of them).
+      /**
+       * Re-point what RECORDED the old server.
+       *
+       * A free `*.opsh.io` subdomain is a hostname→SERVER mapping held by the cloud edge, and
+       * `syncProjectManagedEdge` reads the server from the project's ACTIVE deployment — which
+       * is why it runs HERE and not in the deploy: at that point the target deployment was not
+       * active yet, so the sync inside the deploy re-pointed the subdomain at the server the
+       * project was leaving. It must also run AFTER `publishRoutes`, because the mapping only
+       * exists once the routes do.
+       *
+       * Best-effort, and deliberately so: the workload is already up and verified on the
+       * target, so failing the migration over a record the dashboard's own "Retry routing" can
+       * repair would tear down a working stack. The warning the operator sees is set by the
+       * sync itself.
+       *
+       * Inline. This used to be a 186-line `RelocationEffect` registry — interface, ordered
+       * list, per-effect logging, plus a test asserting the shape of a one-element array — for
+       * this single call, justified prospectively by "the set only grows". It didn't. A second
+       * effect can be added right here, where the ordering constraint it depends on is
+       * actually visible.
+       */
       if (input.projectMove && !sameServer) {
-        await applyRelocationEffects(
-          projectRelocationEffects({ projectId, organizationId, targetServerId }),
-          log,
-        );
+        try {
+          const moved = await repos.project.findById(projectId);
+          if (!moved) {
+            log("free subdomain routing: project not found — nothing to update");
+          } else {
+            const { ok, failures } = await syncProjectManagedEdge(moved, organizationId);
+            log(
+              ok
+                ? "free subdomain routing: re-pointed at the new server"
+                : `free subdomain routing: still pointing at the old server — ${
+                    failures.join("; ") || "sync failed"
+                  }`,
+            );
+          }
+        } catch (err) {
+          log(`free subdomain routing: not updated — ${safeErrorMessage(err)}`);
+        }
       }
 
       await this.logLiveState(projectId, targetServerId, organizationId, log);
@@ -1087,7 +1249,11 @@ class MigrationOrchestratorImpl {
           this.throwIfCancelled(id);
           await this.transition(id, "cutover");
           log(`cutover: stopping + removing the source originals`);
-          const { failed } = await this.cutover(sourceServerId, organizationId, scannedContainerIds);
+          const { failed } = await this.cutover(
+            sourceServerId,
+            organizationId,
+            scannedContainerIds,
+          );
           await this.transition(id, "succeeded");
           // The migration DID succeed — the target is live — so the status stays `succeeded`.
           // But a container still standing on the old server is something the operator has to
@@ -1165,9 +1331,7 @@ class MigrationOrchestratorImpl {
     sourceProjectSlug?: string,
   ): Promise<MoveResult> {
     const rtA = await createServerDockerRuntime(sourceServerId, organizationId);
-    const rtB = sameServer
-      ? null
-      : await createServerDockerRuntime(targetServerId, organizationId);
+    const rtB = sameServer ? null : await createServerDockerRuntime(targetServerId, organizationId);
     try {
       // Quiesce originals for a consistent copy (and to free ports/volumes on
       // a same-server redeploy). Best-effort — a missing container is fine.
@@ -1175,15 +1339,47 @@ class MigrationOrchestratorImpl {
         await rtA.stop(cid).catch(() => {});
       }
 
-      // Cross-server DEFAULT: move data DIRECTLY server-to-server (rsync +
-      // docker save|ssh|load), single hop, no byte through the API host. The
-      // "stream" transfer mode is the explicit opt-back-in to the API-host relay
-      // below (for when the two servers can't reach each other).
-      if (rtB && transfer.mode !== "stream") {
-        // On-the-wire rsync compression is opt-in ("zstd"/"gzip" → -z); "auto"/
-        // unset stays OFF (a fast LAN link usually beats the compressor).
-        const compress =
-          transfer.compression === "zstd" || transfer.compression === "gzip";
+      /**
+       * Which MECHANISM moves the bytes — decided once, in the adapter's own vocabulary.
+       *
+       * The four mode names the settings API validates (`auto | stream | direct | rsync`)
+       * used to collapse to `mode !== "stream"`, which made the vocabulary lie in both
+       * directions: `"direct"` on a CROSS-server run did rsync-over-SSH rather than the
+       * adapter's direct (one helper mounting both volumes on one daemon), and `"rsync"` on
+       * a SAME-server run reached `transferVolume`, whose `resolvePlan` logs
+       * "rsync not yet available → stream". An operator who picked a mechanism got a
+       * different one with nothing saying so.
+       *
+       * Server-to-server rsync only exists here (the adapter reserves `"rsync"` for it and
+       * falls back to stream until it lands), so this is the one place that can honour it:
+       *   • cross-server + `rsync`/`direct`/`auto` → the server-to-server pipeline;
+       *   • cross-server + `stream`               → the API-host relay (the documented
+       *                                             opt-in for firewalled server↔server);
+       *   • same-server                           → the relay's local copy, where the
+       *                                             adapter's own `direct` applies.
+       * Anything that is NOT what the operator asked for is LOGGED, matching `resolvePlan`'s
+       * "never silently downgrades" contract.
+       */
+      const requestedMode = transfer.mode ?? "auto";
+      if (rtB && requestedMode !== "stream") {
+        if (requestedMode === "direct") {
+          log(
+            "transfer mode 'direct' applies to a single daemon; these are two servers — " +
+              "moving server-to-server (rsync over SSH) instead",
+          );
+        }
+        /**
+         * rsync's `-z` is ZLIB, not zstd. Reporting the requested name would claim a
+         * compression that never ran, so both the flag and the log say what actually
+         * happens. "auto"/unset stays OFF — a fast LAN link usually beats the compressor.
+         */
+        const compress = transfer.compression === "zstd" || transfer.compression === "gzip";
+        if (transfer.compression === "zstd") {
+          log("compression 'zstd' is not available over rsync — using rsync -z (zlib)");
+        }
+        log(
+          `transfer: server-to-server rsync${compress ? " with zlib compression" : ", uncompressed"}`,
+        );
         return await this.moveDataDirect(
           projectId,
           sourceServerId,
@@ -1200,6 +1396,15 @@ class MigrationOrchestratorImpl {
           scannedContainerIds,
           sourceProjectSlug,
         );
+      }
+
+      if (rtB) log("transfer: relaying through the control host (mode 'stream')");
+      else if (requestedMode === "rsync") {
+        // Say what the adapter will ACTUALLY do. `resolvePlan` has no rsync mechanism — it
+        // notes "rsync not yet available → stream" — so claiming "the local copy applies"
+        // named the one thing that does not happen. (`direct` needs no note: on one daemon
+        // it IS the adapter's direct, which is what it asked for.)
+        log("transfer mode 'rsync' is not available on a single daemon — streaming locally");
       }
 
       // Relay path (same-server copy, or the explicit "stream" override): the
@@ -1294,6 +1499,18 @@ class MigrationOrchestratorImpl {
         // both, so data lands with no remap).
         const execB = resolveExecutor("docker", rtB);
         for (const svc of services) {
+          /**
+           * SOURCE enumeration reads the LIVE container, exactly as the direct path does.
+           *
+           * This used to force `containerId: null` "→ bare-named ids", which made the two
+           * transfer paths enumerate different data for the same run:
+           * `resolveScannedContainerId`'s own docblock says passing null for an adopted
+           * service makes `listSources` GUESS the volume name, and adopted rows get their
+           * `volumes` from `volumeToComposeString`, which DROPS anonymous volumes. So a
+           * service with an anonymous volume had it moved on the default path and silently
+           * left behind on the relay path — same run, same services, different data moved
+           * depending on which transferMode the operator picked.
+           */
           const handle: ServiceHandle = {
             id: svc.id,
             projectId,
@@ -1301,14 +1518,31 @@ class MigrationOrchestratorImpl {
             image: svc.image ?? null,
             env: {},
             volumes: svc.volumes ?? [],
-            containerId: null, // force the DB-fallback branch → bare-named ids
+            containerId: resolveScannedContainerId(svc.name, scannedContainerIds),
             projectSlug,
             namespaceVolumes: svc.namespaceVolumes,
           };
+          /**
+           * DESTINATION handles stay DB-declared (`containerId: null`): the target has no
+           * container yet, and cross-server lands on BARE names. Built per source so the
+           * dst enumerates exactly the volume this task writes — a live-read source id can
+           * be an anonymous volume's hash, which the target's declared list would not
+           * contain at all.
+           */
+          const dstHandleFor = (src: { source: string; target: string }): ServiceHandle => ({
+            ...handle,
+            containerId: null,
+            volumes: [`${src.source}:${src.target || "/data"}`],
+            namespaceVolumes: false,
+          });
           // Scoped dst handle for a "clone"-resolved volume (target volume →
           // openship-<slug>-<name>); mirrors the same-server copy branch. Lazy —
           // only computed when this service actually has a clone volume.
-          const scopedHandle: ServiceHandle = { ...handle, namespaceVolumes: true };
+          const scopedHandle: ServiceHandle = {
+            ...handle,
+            containerId: null,
+            namespaceVolumes: true,
+          };
           let scopedSrcs: Awaited<ReturnType<typeof execB.listSources>> | null = null;
           const sources = await execA.listSources(handle);
           for (const src of sources) {
@@ -1322,7 +1556,18 @@ class MigrationOrchestratorImpl {
             // target volume; override/none = bare (clearTarget overwrites).
             const action = src.type === "volume" ? conflictResolution[src.source] : undefined;
             if (action === "keep") continue;
-            let dst: TransferEndpoint = { exec: execB, handle, sourceId: src.id };
+            // Resolve the dst id from the target's OWN enumeration of that bare name, so a
+            // source id that came from live Mounts (possibly an anonymous volume's hash)
+            // still lands on a name the target can address.
+            const dstHandle = dstHandleFor(src);
+            const dstSource = (await execB.listSources(dstHandle)).find(
+              (d) => d.type === src.type && d.source === src.source,
+            );
+            let dst: TransferEndpoint = {
+              exec: execB,
+              handle: dstHandle,
+              sourceId: dstSource?.id ?? src.id,
+            };
             if (action === "clone") {
               if (!scopedSrcs) scopedSrcs = await execB.listSources(scopedHandle);
               const sd = scopedSrcs.find((d) => d.type === "volume" && d.target === src.target);
@@ -1365,10 +1610,23 @@ class MigrationOrchestratorImpl {
         const conflicts: string[] = [];
         for (const task of tasks) {
           if (conflictResolution[task.source] || relayFallback) continue; // resolved / inherited
-          const probe = await task.dst.exec.probeVolume?.(task.dst.handle, task.dst.sourceId);
-          if (!probe?.exists || probe.empty) continue;
+          // The SHARED verdict, so this path has the same fail-safe as the other two. It
+          // used to read `!probe?.exists` — which is TRUE when the executor has no
+          // `probeVolume` at all, i.e. "cannot check" silently became "no conflict", the
+          // same fail-OPEN the shell copies had.
+          const verdict = await probeOneVolume(
+            task.dst.exec,
+            task.dst.handle,
+            task.dst.sourceId,
+            log,
+          );
+          if (!verdict) continue;
           const name = task.dst.sourceId;
-          if (relayOurPrefix && name.startsWith(relayOurPrefix) && name.length > relayOurPrefix.length) {
+          if (
+            relayOurPrefix &&
+            name.startsWith(relayOurPrefix) &&
+            name.length > relayOurPrefix.length
+          ) {
             log(
               `${name}: left on the target by an earlier attempt at this move — ` +
                 `its contents are replaced by this transfer`,
@@ -1405,7 +1663,7 @@ class MigrationOrchestratorImpl {
           .updateTargetVolumes(runId, plannedTargetVolumes)
           .catch(() => {});
       }
-      const results = await runPool(tasks, TRANSFER_CONCURRENCY, async (t) => {
+      const results = await mapWithLimit(tasks, TRANSFER_CONCURRENCY, async (t) => {
         // Cancel check BEFORE the resilience try (see the direct path).
         this.throwIfCancelled(runId);
         const task = `volume:${t.label}/${t.src.sourceId}`;
@@ -1420,7 +1678,9 @@ class MigrationOrchestratorImpl {
               onProgress?.({ task, kind: "volume", movedBytes: relayMoved(), totalBytes: null });
             },
           });
-          log(`${t.label}/${t.src.sourceId}: ${r.strategy} (${r.compression}) — ${r.bytesMoved} bytes`);
+          log(
+            `${t.label}/${t.src.sourceId}: ${r.strategy} (${r.compression}) — ${r.bytesMoved} bytes`,
+          );
           return r.bytesMoved;
         } catch (err) {
           const message = safeErrorMessage(err);
@@ -1503,9 +1763,12 @@ class MigrationOrchestratorImpl {
     try {
       log(`direct link established (${link.direction})`);
 
-      // Enumerate the source's movable data FIRST: bare-named volumes + movable
-      // bind paths (same enumeration the relay path uses; forced DB-fallback
-      // ids) + the built images actually present on the source.
+      // Enumerate the source's movable data FIRST: bare-named volumes + movable bind
+      // paths + the built images actually present on the source. The SAME enumeration the
+      // relay path uses — both read the LIVE container via `resolveScannedContainerId`.
+      // (That claim used to be false: this path passed a real id and the relay path forced
+      // the DB fallback, so an adopted service's anonymous volumes moved on one and not
+      // the other.)
       const services = await repos.service.listByProject(projectId);
       const project = await repos.project.findById(projectId);
       const projectSlug = project?.slug ?? "";
@@ -1571,25 +1834,34 @@ class MigrationOrchestratorImpl {
       const ourSlug = sourceProjectSlug || projectSlug;
       const ourVolumePrefix = ourSlug ? scopedVolumeName(ourSlug, "") : null;
       const isOurNamespacedVolume = (name: string) =>
-        Boolean(ourVolumePrefix) && name.startsWith(ourVolumePrefix!) && name.length > ourVolumePrefix!.length;
+        Boolean(ourVolumePrefix) &&
+        name.startsWith(ourVolumePrefix!) &&
+        name.length > ourVolumePrefix!.length;
       log(
         `conflict resolution: ${Object.keys(conflictResolution).length ? JSON.stringify(conflictResolution) : "none"}` +
           `; enumerated volumes: ${[...volumeNames].join(", ") || "none"}`,
       );
+      // Through the ADAPTER, fail-safe, like the relay path — not the shell probe this
+      // replaces, whose `.catch(() => "")` meant an unreadable root-only
+      // /var/lib/docker/volumes (any non-root SSH account) read as "no conflict" and this
+      // path overwrote a populated volume that `transferMode: "stream"` would have refused.
+      const unresolved = [...volumeNames].filter((name) => !resolution[name]);
+      const occupied = await probeTargetVolumeConflicts({
+        targetServerId,
+        organizationId,
+        projectId,
+        projectSlug,
+        queries: unresolved.map((name) => ({ serviceName: owner.get(name) ?? name, volume: name })),
+        onLog: log,
+      });
       const conflicts: string[] = [];
-      for (const name of volumeNames) {
-        if (resolution[name]) continue; // resolved (by volume) — not blocking
-        const out = await target.executor
-          .exec(
-            `if docker volume inspect ${sq(name)} >/dev/null 2>&1; then ` +
-              `mp=$(docker volume inspect ${sq(name)} -f '{{.Mountpoint}}'); ` +
-              `[ -n "$(ls -A "$mp" 2>/dev/null)" ] && echo CONFLICT || true; fi`,
-          )
-          .catch(() => "");
-        if (!out.includes("CONFLICT")) continue;
+      for (const name of unresolved) {
+        if (!occupied.has(name)) continue;
         if (fallback) {
           resolution[name] = fallback;
-          log(`conflict ${name}: no explicit choice — applying '${fallback}' (matches your other choices)`);
+          log(
+            `conflict ${name}: no explicit choice — applying '${fallback}' (matches your other choices)`,
+          );
           continue;
         }
         // OUR OWN DEBRIS IS NOT A CONFLICT.
@@ -1608,7 +1880,10 @@ class MigrationOrchestratorImpl {
           const users = await target.executor
             .exec(`docker ps --filter volume=${sq(name)} --format '{{.Names}}' 2>/dev/null || true`)
             .catch(() => "");
-          const running = users.split("\n").map((s) => s.trim()).filter(Boolean);
+          const running = users
+            .split("\n")
+            .map((s) => s.trim())
+            .filter(Boolean);
           if (running.length === 0) {
             resolution[name] = "override";
             log(
@@ -1622,10 +1897,26 @@ class MigrationOrchestratorImpl {
         conflicts.push(name);
       }
       if (conflicts.length > 0) {
-        throw new Error(
-          `Target server already has data in volume(s): ${conflicts.join(", ")}. ` +
-            "Remove or rename them on the target, then retry — refusing to overwrite existing data.",
-        );
+        // Two different sentences, because they need two different actions. "Already has
+        // data" is a lie when the daemon never answered — that reads as a data problem and
+        // sends the operator looking for volumes that may be empty, while the real fault
+        // (target unreachable, or its docker API unusable by the SSH account) goes unnamed.
+        const unverified = conflicts.filter((n) => occupied.get(n) === "unknown");
+        const holdingData = conflicts.filter((n) => occupied.get(n) !== "unknown");
+        const parts: string[] = [];
+        if (holdingData.length > 0) {
+          parts.push(
+            `Target server already has data in volume(s): ${holdingData.join(", ")}. ` +
+              "Remove or rename them on the target, then retry.",
+          );
+        }
+        if (unverified.length > 0) {
+          parts.push(
+            `Could not verify target volume(s): ${unverified.join(", ")}. ` +
+              "Check the target is reachable and its docker API is usable by the SSH account.",
+          );
+        }
+        throw new Error(`${parts.join(" ")} Refusing to overwrite data we cannot rule out.`);
       }
 
       // Scan the payload size on the source → the progress-bar denominator.
@@ -1638,20 +1929,20 @@ class MigrationOrchestratorImpl {
         customPaths: customPaths.map((c) => c.source),
       }).catch(() => null);
       const totalBytes = sized && sized.totalBytes > 0 ? sized.totalBytes : null;
-      log(`transfer plan: ${totalBytes ?? "?"} bytes across ${volumeNames.size} volume(s), ` +
-        `${bindPaths.size} bind(s), ${imagesToMove.length} image(s), ${customPaths.length} path(s)`);
+      log(
+        `transfer plan: ${totalBytes ?? "?"} bytes across ${volumeNames.size} volume(s), ` +
+          `${bindPaths.size} bind(s), ${imagesToMove.length} image(s), ${customPaths.length} path(s)`,
+      );
 
       const bytesByTask = new Map<string, number>();
-      const track =
-        (task: string, kind: "image" | "volume") =>
-        (bytes: number) => {
-          // Per-task floor: a resumed rsync re-reports from a lower offset, so
-          // clamp to the max seen — the bar never rewinds on a resume/retry.
-          bytesByTask.set(task, Math.max(bytesByTask.get(task) ?? 0, bytes));
-          let movedBytes = 0;
-          for (const b of bytesByTask.values()) movedBytes += b;
-          onProgress?.({ task, kind, movedBytes, totalBytes });
-        };
+      const track = (task: string, kind: "image" | "volume") => (bytes: number) => {
+        // Per-task floor: a resumed rsync re-reports from a lower offset, so
+        // clamp to the max seen — the bar never rewinds on a resume/retry.
+        bytesByTask.set(task, Math.max(bytesByTask.get(task) ?? 0, bytes));
+        let movedBytes = 0;
+        for (const b of bytesByTask.values()) movedBytes += b;
+        onProgress?.({ task, kind, movedBytes, totalBytes });
+      };
 
       // Images first — sequential (large; save|load contends on the link). Every
       // image the source has locally is MOVED as data (docker save|load), so a
@@ -1698,7 +1989,7 @@ class MigrationOrchestratorImpl {
       if (runId && targetVolumes.length > 0) {
         await repos.dockerMigrationRun.updateTargetVolumes(runId, targetVolumes).catch(() => {});
       }
-      await runPool(items, TRANSFER_CONCURRENCY, async (it) => {
+      await mapWithLimit(items, TRANSFER_CONCURRENCY, async (it) => {
         // Cancel check BEFORE the resilience try — a cancel must abort the run,
         // not get swallowed into pendingItems as if the path failed.
         this.throwIfCancelled(runId);
@@ -1711,20 +2002,29 @@ class MigrationOrchestratorImpl {
             if (action === "keep") {
               log(`volume ${it.ref}: keeping existing target data (not transferred)`);
             } else {
-              const dstName = action === "clone" ? scopedVolumeName(projectSlug, it.ref) : undefined;
+              const dstName =
+                action === "clone" ? scopedVolumeName(projectSlug, it.ref) : undefined;
               // No push here — `targetVolumes` was recorded in full before the pool started,
               // precisely so a mid-transfer abort still leaves a cleanable record.
               await link.transferVolume(it.ref, track(`volume:${it.ref}`, "volume"), dstName);
               verifyVolumes.push({ src: it.ref, dst: dstName ?? it.ref });
             }
-          } else if (it.kind === "bind") await link.transferBind(it.ref, track(`bind:${it.ref}`, "volume"));
+          } else if (it.kind === "bind")
+            await link.transferBind(it.ref, track(`bind:${it.ref}`, "volume"));
           else await link.transferPath(it.source, it.dest, track(`path:${it.source}`, "volume"));
         } catch (err) {
           const missing = err instanceof PathMissingError;
           const message = safeErrorMessage(err);
           const pending: PendingItem =
             it.kind === "path"
-              ? { key: `path:${it.source}`, kind: "path", source: it.source, dest: it.dest, reason: missing ? "missing" : "error", message }
+              ? {
+                  key: `path:${it.source}`,
+                  kind: "path",
+                  source: it.source,
+                  dest: it.dest,
+                  reason: missing ? "missing" : "error",
+                  message,
+                }
               : {
                   key: `${it.kind}:${it.ref}`,
                   kind: it.kind,
@@ -1744,30 +2044,25 @@ class MigrationOrchestratorImpl {
       // the bytes landed (and flags a surprise mismatch). Best-effort; a small
       // delta is normal (filesystem block/overhead differences), so it warns
       // rather than fails.
-      const duVolume = async (
-        exec: { exec: (c: string) => Promise<string> },
-        name: string,
-      ): Promise<number | null> => {
-        const out = await exec
-          .exec(
-            `mp=$(docker volume inspect ${sq(name)} -f '{{.Mountpoint}}' 2>/dev/null) && ` +
-              `du -sb "$mp" 2>/dev/null | cut -f1 || echo`,
-          )
-          .catch(() => "");
-        const n = Number(out.trim());
-        return Number.isFinite(n) && n > 0 ? n : null;
-      };
+      // `volumeBytes`, not a local re-spelling of it. The copy dropped BOTH of that
+      // helper's timeouts (inspect 10s, du 20s) — which migration-size.ts documents as
+      // existing precisely "so a giant/slow `du` yields null … rather than hanging the
+      // wizard or the move". This loop runs on both hosts for every moved volume AFTER the
+      // data has already landed, so an unbounded `du` parked a finished migration in
+      // `moving_data` with nothing to break it.
       for (const v of verifyVolumes) {
         const [srcBytes, dstBytes] = await Promise.all([
-          duVolume(source.executor, v.src),
-          duVolume(target.executor, v.dst),
+          volumeBytes(source.executor, v.src),
+          volumeBytes(target.executor, v.dst),
         ]);
         if (srcBytes == null || dstBytes == null) {
           log(`verify ${v.dst}: size unavailable — skipped`);
           continue;
         }
         const ok = Math.abs(srcBytes - dstBytes) <= Math.max(4096, srcBytes * 0.01);
-        log(`verify ${v.dst}: source ${srcBytes} → target ${dstBytes} bytes ${ok ? "✓" : "⚠ size mismatch"}`);
+        log(
+          `verify ${v.dst}: source ${srcBytes} → target ${dstBytes} bytes ${ok ? "✓" : "⚠ size mismatch"}`,
+        );
       }
 
       let total = 0;
@@ -1886,7 +2181,10 @@ class MigrationOrchestratorImpl {
         [...entries].sort(
           (a, b) => (a.spec.targetPath ?? "/").length - (b.spec.targetPath ?? "/").length,
         )[0];
-      const extras = entries.filter((e) => e !== root && e.spec.targetPath);
+      // If an exact route is the only match for a domain it also has to seed the
+      // mandatory root upstream, but retain it as an explicit location so the
+      // exact-match bit survives persistence and every later re-render.
+      const extras = entries.filter((e) => e.spec.targetPath && (e !== root || e.spec.exact));
 
       // Root mints the domain row + exposes.
       try {
@@ -1921,7 +2219,11 @@ class MigrationOrchestratorImpl {
           hostname: domain,
           isCustomDomain: root.spec.domainType === "custom",
           rootServiceId: root.svcId,
-          locations: extras.map((e) => ({ pathPrefix: e.spec.targetPath!, serviceId: e.svcId })),
+          locations: extras.map((e) => ({
+            pathPrefix: e.spec.targetPath!,
+            serviceId: e.svcId,
+            ...(e.spec.exact ? { exact: true } : {}),
+          })),
         });
       }
     }
@@ -2117,7 +2419,12 @@ class MigrationOrchestratorImpl {
     let failedSvcs = "";
     try {
       const rows = await repos.serviceDeployment.listByDeployment(deploymentId);
-      const failed = rows.filter((r) => /fail|error/i.test(r.status));
+      // The shared classifier, not a regex over the status string. `/fail|error/` misses
+      // `cancelled` — which the canonical set includes and the build-cancel paths write —
+      // so a run that ended `partial_failure` because a service was CANCELLED named no
+      // culprit at all and fell back to a bare status, the one thing this function exists
+      // to prevent. It would also have matched an in-flight status containing "error".
+      const failed = rows.filter((r) => isServiceFailureStatus(r.status));
       if (failed.length > 0) {
         failedSvcs = failed
           .map((r) => {
@@ -2136,8 +2443,6 @@ class MigrationOrchestratorImpl {
     return base || `the deployment ended as "${dep.status}"`;
   }
 
-  /** Destroy the originals on the source (by scanned container id — they carry
-   *  no openship.* labels). Never removes the source's volumes. */
   /**
    * Remove this project's vhosts from the SOURCE server's edge, after a confirmed
    * project-move cutover.
@@ -2147,37 +2452,38 @@ class MigrationOrchestratorImpl {
    * the wrong box and delete the vhosts that just started serving.
    *
    * Best-effort, and deliberately so — unlike the pause path, which fails loudly because
-   * a failed removal means a site the operator asked to stop is still up. Here the site
-   * is already up on the target and the source's containers are already gone; a leftover
-   * vhost is a 502 on a machine nothing should be pointing at any more. Failing the
-   * cutover for it would strand a run whose destructive half already succeeded.
+   * a failed removal means a site the operator asked to stop is still up. Here the target
+   * is already serving and source cleanup has already been attempted; a leftover vhost is
+   * a 502 (or an unsafe surviving copy) on the old box. Failing the cutover for route/claim
+   * maintenance would strand a run whose destructive half already ran. Claims are released
+   * only when every original was removed and every route removal succeeded.
    */
   private async retireSourceRoutes(
     projectId: string,
     sourceServerId: string,
     organizationId: string,
+    releaseClaims: boolean,
   ): Promise<void> {
     try {
       const hostnames = (await repos.domain.listByProject(projectId)).map((d) => d.hostname);
-      if (hostnames.length === 0) return;
       await withDeploymentPlatform(
         {
           meta: { deployTarget: "server", serverId: sourceServerId, runtimeMode: "docker" },
           organizationId,
         } as Parameters<typeof withDeploymentPlatform>[0],
-        async ({ routing }) => {
-          for (const hostname of hostnames) {
-            // Idempotent (rm -rf semantics), so a hostname the source never served is a
-            // no-op rather than an error.
-            await routing
-              .removeRoute(hostname)
-              .catch((err) =>
-                console.warn(
-                  `[migration] source edge: removeRoute ${hostname} failed:`,
-                  safeErrorMessage(err),
-                ),
-              );
+        async ({ routing, executor, hostPortTarget }) => {
+          if (!hostPortTarget || !executor) {
+            throw new Error("Source server did not resolve a physical host-port target");
           }
+
+          await retireSourceManagedRoutes({
+            projectId,
+            hostnames,
+            routing,
+            target: hostPortTarget,
+            edgeProxy: edgeProxyFor(executor, "openresty", { ours: true }),
+            releaseClaims,
+          });
         },
       );
     } catch (err) {
@@ -2242,27 +2548,23 @@ class MigrationOrchestratorImpl {
   async cancel(
     id: string,
     organizationId: string,
-  ): Promise<
-    | { ok: true }
-    | { ok: false; status: number; error: string }
-  > {
+  ): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
     const run = await repos.dockerMigrationRun.findById(id);
     if (!run || run.organizationId !== organizationId) {
       return { ok: false, status: 404, error: "Migration not found" };
     }
     const CANCELLABLE = ["queued", "adopting", "moving_data", "deploying", "verifying"];
     if (!CANCELLABLE.includes(run.status)) {
-      return { ok: false, status: 409, error: `Migration is not cancellable (status: ${run.status})` };
+      return {
+        ok: false,
+        status: 409,
+        error: `Migration is not cancellable (status: ${run.status})`,
+      };
     }
     const reg = this.cancelByRun.get(id) ?? { cancelled: false };
     reg.cancelled = true;
     this.cancelByRun.set(id, reg);
-    await this.killTransfer(
-      run.sourceServerId,
-      run.targetServerId,
-      run.organizationId,
-      reg.runTag,
-    );
+    await this.killTransfer(run.sourceServerId, run.targetServerId, run.organizationId, reg.runTag);
     return { ok: true };
   }
 
@@ -2291,80 +2593,113 @@ class MigrationOrchestratorImpl {
   }
 
   /** Confirm the destructive cutover (or finish keeping the originals stopped).
-   *  Timing-safe token compare. Only valid from `awaiting_cutover`. */
+   *  A failed destructive attempt remains `cutover` and may retry only the same
+   *  irreversible choice. Timing-safe token compare on every attempt. */
   async resolveCutover(
     id: string,
     organizationId: string,
     confirmationToken: string,
     kill: boolean,
   ): Promise<
-    | { ok: true; leftBehind: LeftBehindContainer[] }
-    | { ok: false; status: number; error: string }
+    { ok: true; leftBehind: LeftBehindContainer[] } | { ok: false; status: number; error: string }
   > {
     const run = await repos.dockerMigrationRun.findById(id);
     if (!run || run.organizationId !== organizationId) {
       return { ok: false, status: 404, error: "Migration not found" };
     }
-    if (run.status !== "awaiting_cutover") {
-      return { ok: false, status: 409, error: `Migration is not awaiting cutover (status: ${run.status})` };
+    if (run.status !== "awaiting_cutover" && run.status !== "cutover") {
+      return {
+        ok: false,
+        status: 409,
+        error: `Migration is not awaiting or retrying cutover (status: ${run.status})`,
+      };
+    }
+    if (run.status === "cutover" && !kill) {
+      return {
+        ok: false,
+        status: 409,
+        error: "Source removal already started; retry with kill=true to finish cutover",
+      };
     }
     const expected = Buffer.from(run.confirmationToken ?? "");
     const supplied = Buffer.from(confirmationToken ?? "");
-    if (
-      expected.length !== supplied.length ||
-      !crypto.timingSafeEqual(expected, supplied)
-    ) {
+    if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) {
       return { ok: false, status: 403, error: "Invalid confirmation token" };
     }
 
-    const leftBehind: LeftBehindContainer[] = [];
-    if (kill && run.sourceServerId) {
-      await this.transition(id, "cutover");
-      const { failed } = await this.cutover(
-        run.sourceServerId,
-        organizationId,
-        (run.scannedContainerIds ?? {}) as Record<string, string>,
-      );
-      leftBehind.push(...failed);
-      const remainder = describeCutoverRemainder(failed);
-      if (remainder) this.appendLog(id, `cutover: ${remainder}`);
-      // A project move also has to leave the OLD EDGE. Door A never needs this: an
-      // adopted stack sat behind the operator's own proxy, which the migration
-      // deliberately never touches. Ours was served by Openship's edge on the source,
-      // and destroying a container does not remove the vhost pointing at it — so the old
-      // server would keep answering for the project's domains with a 502, which is worse
-      // than not answering, and would silently win for as long as DNS still resolves
-      // there (or anyone hits that IP directly).
-      if (run.mode === "project_move" && run.projectId) {
-        await this.retireSourceRoutes(run.projectId, run.sourceServerId, organizationId);
-      }
-    } else if (
-      !kill &&
-      run.sourceServerId &&
-      run.sourceServerId !== run.targetServerId &&
-      // A PROJECT MOVE's originals stay stopped. For an adopted stack "keep" means the
-      // old server becomes a live standby, which is safe because those containers were
-      // never Openship's. Here they ARE this project's: the row now names the target, so
-      // restarting them would leave ONE project live on TWO servers — two copies of the
-      // same volumes diverging, both still answering for the same domain from the source's
-      // edge. Kept-but-stopped is a rollback point; kept-and-running is a split brain.
-      run.mode !== "project_move"
-    ) {
-      // Keep + cross-server: moveData quiesced the source for a consistent copy,
-      // so bring the originals back UP — the old server returns to running as a
-      // live standby until the user manually cleans it up (nothing is removed).
-      // Same-server keep leaves them stopped: the target now holds the same
-      // ports/volumes, so both can't run at once.
-      await this.restartSourceOriginals(
-        run.sourceServerId,
-        organizationId,
-        (run.scannedContainerIds ?? {}) as Record<string, string>,
-      );
+    // The HTTP precheck above protects the token; the DB claim below owns the
+    // state transition and project-deletion admission atomically. Keeping the
+    // status parked for a non-destructive "keep" is intentional: boot recovery
+    // must never infer that source destruction was requested.
+    const claimed = await repos.dockerMigrationRun.claimExecution({
+      id,
+      organizationId,
+      from: run.status,
+      to: kill ? "cutover" : "awaiting_cutover",
+    });
+    if (!claimed) {
+      return {
+        ok: false,
+        status: 409,
+        error: "Migration state changed or one of its projects is being deleted",
+      };
     }
-    await this.transition(id, "succeeded");
-    // Reported, not swallowed: the caller shows the operator that the old server still has
-    // containers on it. An empty list is the normal, fully-clean case.
-    return { ok: true, leftBehind };
+
+    try {
+      const leftBehind: LeftBehindContainer[] = [];
+      if (kill && claimed.sourceServerId) {
+        const { failed } = await this.cutover(
+          claimed.sourceServerId,
+          organizationId,
+          (claimed.scannedContainerIds ?? {}) as Record<string, string>,
+        );
+        leftBehind.push(...failed);
+        const remainder = describeCutoverRemainder(failed);
+        if (remainder) this.appendLog(id, `cutover: ${remainder}`);
+        // A project move also has to leave the OLD EDGE. Door A never needs this: an
+        // adopted stack sat behind the operator's own proxy, which the migration
+        // deliberately never touches. Ours was served by Openship's edge on the source,
+        // and destroying a container does not remove the vhost pointing at it.
+        if (claimed.mode === "project_move" && claimed.projectId) {
+          await this.retireSourceRoutes(
+            claimed.projectId,
+            claimed.sourceServerId,
+            organizationId,
+            failed.length === 0,
+          );
+        }
+      } else if (
+        !kill &&
+        claimed.sourceServerId &&
+        claimed.sourceServerId !== claimed.targetServerId &&
+        // A project move's originals must stay stopped; restarting them would
+        // make one project's writable data live on two servers.
+        claimed.mode !== "project_move"
+      ) {
+        await this.restartSourceOriginals(
+          claimed.sourceServerId,
+          organizationId,
+          (claimed.scannedContainerIds ?? {}) as Record<string, string>,
+        );
+      }
+      await this.transition(id, "succeeded");
+      // Reported, not swallowed: the caller shows any source containers that
+      // could not be retired. Empty is the normal fully-clean result.
+      return { ok: true, leftBehind };
+    } catch (err) {
+      // Destructive intent is irreversible: some originals/routes may already
+      // be gone. Keep `cutover`, record why it parked, and allow only kill=true
+      // to claim a later idempotent retry.
+      await this.transition(id, "cutover", {
+        errorMessage: `Cutover incomplete — retry source cleanup: ${safeErrorMessage(err)}`.slice(
+          0,
+          4096,
+        ),
+      }).catch(() => {});
+      throw err;
+    } finally {
+      await repos.dockerMigrationRun.acknowledgeExecutionFinished(id);
+    }
   }
 
   /**
@@ -2385,17 +2720,42 @@ class MigrationOrchestratorImpl {
       return { ok: false, status: 404, error: "Migration not found" };
     }
     if (run.status !== "partial") {
-      return { ok: false, status: 409, error: `Migration is not resumable (status: ${run.status})` };
+      return {
+        ok: false,
+        status: 409,
+        error: `Migration is not resumable (status: ${run.status})`,
+      };
     }
     if (!run.sourceServerId || !run.targetServerId) {
       return { ok: false, status: 409, error: "Source/target server is no longer available" };
     }
-    // Flip out of `partial` first (guards a concurrent resume), then run async.
-    await this.transition(id, "moving_data");
+    const claimed = await repos.dockerMigrationRun.claimExecution({
+      id,
+      organizationId,
+      from: "partial",
+      to: "moving_data",
+    });
+    if (!claimed) {
+      return {
+        ok: false,
+        status: 409,
+        error: "Migration state changed or one of its projects is being deleted",
+      };
+    }
+
+    // The durable claim above, not process-local scheduling, guards duplicate
+    // deliveries across API replicas and survives a crash between this response
+    // and the callback starting.
     setImmediate(() => {
-      void this.runResume(ctx, run, organizationId, opts).catch((err) =>
-        console.error(`[migration] resume ${id} crashed:`, safeErrorMessage(err)),
-      );
+      void (async () => {
+        try {
+          await this.runResume(ctx, claimed, organizationId, opts);
+        } catch (err) {
+          console.error(`[migration] resume ${id} crashed:`, safeErrorMessage(err));
+        } finally {
+          await repos.dockerMigrationRun.acknowledgeExecutionFinished(id);
+        }
+      })();
     });
     return { ok: true };
   }
@@ -2477,7 +2837,9 @@ class MigrationOrchestratorImpl {
     const stillPending: PendingItem[] = [];
     const resolvedServices = new Set<string>();
     try {
-      log(`resume: retrying ${toRetry.length}, skipping ${pending.length - toRetry.length} item(s)`);
+      log(
+        `resume: retrying ${toRetry.length}, skipping ${pending.length - toRetry.length} item(s)`,
+      );
       const [source, target] = await Promise.all([
         createServerCommandExecutor(run.sourceServerId!, organizationId),
         createServerCommandExecutor(run.targetServerId!, organizationId),
@@ -2649,12 +3011,29 @@ class MigrationOrchestratorImpl {
       deploymentId,
     );
 
+    // Undo what the run did to the TARGET and to the project's own record. Shared with boot
+    // recovery, which used to skip both — see `undoTargetSideEffects`.
+    await this.undoTargetSideEffects(
+      await repos.dockerMigrationRun.findById(id).catch(() => null),
+      servers,
+      ctx.organizationId,
+      (m) => this.appendLog(id, m),
+    );
+
+    await this.transition(id, "rolled_back", {
+      errorMessage: errorMessage.slice(0, 4096),
+    });
+
     // A failed migration must not leave the draft project it created behind.
     // Only projects THIS run created are dropped (never a pre-existing one the
-    // user already had). Reuse the canonical teardown (force = cancel the
-    // in-flight/timed-out deploy first, then drop rows) so no divergent delete
-    // path — but never wipe volumes (the reused originals hold production data),
-    // and never let a cleanup hiccup mask the real migration error.
+    // user already had). This MUST run after the migration is terminal: project
+    // teardown now correctly treats this run as active work, so invoking it
+    // while this sole worker is still `adopting`/`deploying` would ask the run to
+    // cancel itself and then deadlock waiting for its own terminal transition.
+    //
+    // All source/target migration effects are already undone above. The final
+    // draft cleanup is protected by the draft project's own deletion lock, and
+    // a cleanup hiccup must never mask the real migration error.
     if (createdProjectId) {
       try {
         await teardownProject(ctx, createdProjectId, {
@@ -2669,19 +3048,6 @@ class MigrationOrchestratorImpl {
         );
       }
     }
-
-    // Undo what the run did to the TARGET and to the project's own record. Shared with boot
-    // recovery, which used to skip both — see `undoTargetSideEffects`.
-    await this.undoTargetSideEffects(
-      await repos.dockerMigrationRun.findById(id).catch(() => null),
-      servers,
-      ctx.organizationId,
-      (m) => this.appendLog(id, m),
-    );
-
-    await this.transition(id, "rolled_back", {
-      errorMessage: errorMessage.slice(0, 4096),
-    });
   }
 
   /**
@@ -2765,9 +3131,45 @@ class MigrationOrchestratorImpl {
       return;
     }
     for (const run of runs) {
+      const hasLiveExecution = Boolean(run.executionStartedAt && !run.executionFinishedAt);
+
+      // listInFlight deliberately includes terminal-looking rows whose callback
+      // had not acknowledged exit. On a self-hosted boot the prior process is
+      // gone, so closing that orphaned lease is safe; Cloud never runs this
+      // process-local recovery sweep.
+      if (["succeeded", "failed", "rolled_back"].includes(run.status)) {
+        if (hasLiveExecution) {
+          await repos.dockerMigrationRun.acknowledgeExecutionFinished(run.id).catch(() => {});
+        }
+        continue;
+      }
+
       // Parked states survive a restart untouched: the target is UP and the run
       // waits on an interactive resolve (cutover confirm / pending-path resume).
-      if (run.status === "awaiting_cutover" || run.status === "partial") continue;
+      // A keep/cutover callback can crash after claiming but before doing work;
+      // process restart proves that callback is gone, so release only its lease.
+      if (run.status === "awaiting_cutover" || run.status === "partial") {
+        if (hasLiveExecution) {
+          await repos.dockerMigrationRun.acknowledgeExecutionFinished(run.id).catch(() => {});
+        }
+        continue;
+      }
+
+      // `claimExecution(partial → moving_data)` marks resumed work. Unlike an
+      // initial migration failure, a resume must never tear down the already-live
+      // target. Put it back in its parked state; an empty pending list is valid
+      // and the next resume advances it to cutover without copying anything.
+      if (run.status === "moving_data" && hasLiveExecution) {
+        try {
+          await repos.dockerMigrationRun.transition(run.id, "partial", {
+            errorMessage: "Resume was interrupted — review pending paths and retry.",
+          });
+          await repos.dockerMigrationRun.acknowledgeExecutionFinished(run.id);
+        } catch (err) {
+          console.warn(`[migration] recovery resume ${run.id} failed:`, safeErrorMessage(err));
+        }
+        continue;
+      }
       const scanned = (run.scannedContainerIds ?? {}) as Record<string, string>;
 
       // A crash mid-CUTOVER is NOT a rollback: the target was already verified
@@ -2777,18 +3179,40 @@ class MigrationOrchestratorImpl {
       // (idempotent) cutover — destroying an already-gone container is a no-op —
       // and mark it succeeded.
       if (run.status === "cutover") {
-        if (run.sourceServerId) {
-          try {
-            await this.cutover(run.sourceServerId, run.organizationId, scanned);
-          } catch (err) {
-            console.warn(`[migration] recovery cutover ${run.id} failed:`, safeErrorMessage(err));
+        try {
+          let sourceFullyRetired = false;
+          if (run.sourceServerId) {
+            const { failed } = await this.cutover(run.sourceServerId, run.organizationId, scanned);
+            sourceFullyRetired = failed.length === 0;
+
+            // A crash can land after source destruction but before route/claim
+            // retirement. Replay that half idempotently. If cleanup was partial or
+            // unreachable, remove stale routes but retain claims for survivors.
+            if (run.mode === "project_move" && run.projectId) {
+              await this.retireSourceRoutes(
+                run.projectId,
+                run.sourceServerId,
+                run.organizationId,
+                sourceFullyRetired,
+              );
+            }
           }
+          await repos.dockerMigrationRun.transition(run.id, "succeeded");
+        } catch (err) {
+          const message = safeErrorMessage(err);
+          console.warn(`[migration] recovery cutover ${run.id} failed:`, message);
+          await repos.dockerMigrationRun
+            .transition(run.id, "cutover", {
+              errorMessage: `Cutover recovery incomplete — retry source cleanup: ${message}`.slice(
+                0,
+                4096,
+              ),
+            })
+            .catch(() => {});
         }
-        await repos.dockerMigrationRun
-          .transition(run.id, "succeeded")
-          .catch((err) =>
-            console.warn(`[migration] recovery transition ${run.id} failed:`, safeErrorMessage(err)),
-          );
+        if (hasLiveExecution) {
+          await repos.dockerMigrationRun.acknowledgeExecutionFinished(run.id).catch(() => {});
+        }
         continue;
       }
 
@@ -2816,12 +3240,14 @@ class MigrationOrchestratorImpl {
       }
       await repos.dockerMigrationRun
         .transition(run.id, "rolled_back", {
-          errorMessage:
-            "Recovered after an interruption — the original containers were restarted.",
+          errorMessage: "Recovered after an interruption — the original containers were restarted.",
         })
         .catch((err) =>
           console.warn(`[migration] recovery transition ${run.id} failed:`, safeErrorMessage(err)),
         );
+      if (hasLiveExecution) {
+        await repos.dockerMigrationRun.acknowledgeExecutionFinished(run.id).catch(() => {});
+      }
     }
   }
 }

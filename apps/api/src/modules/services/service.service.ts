@@ -2,20 +2,50 @@
  * Service business logic - CRUD and compose sync.
  */
 
-import { normalizeRoutingFields, repos, composeSpecDiff, type Project, type Service, type ServicePublicEndpoint } from "@repo/db";
-import { aliasConflictsWithSiblings, getProjectType, mergeAdvanced, normalizeServiceLabel, normalizeAliasStrict, resolveCommandArgv, safeErrorMessage, withTimeout, type ComposeAdvanced, type ServiceContainerState, type StackId } from "@repo/core";
+import {
+  normalizeRoutingFields,
+  repos,
+  composeSpecDiff,
+  type Project,
+  type Service,
+  type ServicePublicEndpoint,
+} from "@repo/db";
+import {
+  aliasConflictsWithSiblings,
+  getProjectType,
+  isValidEnvKey,
+  looksLikeSecretKey,
+  mergeAdvanced,
+  normalizeServiceLabel,
+  normalizeAliasStrict,
+  resolveCommandArgv,
+  safeErrorMessage,
+  type ComposeAdvanced,
+  type ServiceContainerState,
+  type StackId,
+} from "@repo/core";
 import {
   BuildLogger,
   DockerRuntime,
   isMultiServiceRuntime,
+  ownsBuiltImage,
   type LogEntry,
   type ContainerStatus,
   type RuntimeAdapter,
 } from "@repo/adapters";
 import { scopedVolumeName, type CommandExecutor } from "@repo/adapters";
+import { isArtifactRef } from "../../lib/container-ref";
+import { assertValidGeneratedConfigFiles } from "../../lib/generated-config-files";
 import { execInContainer } from "../../lib/agent-exec";
 import { encrypt, decrypt } from "../../lib/encryption";
-import { ENV_MASK, hasMaskedValue, maskDriftChanges, maskServiceEnv, unmaskEnv } from "../../lib/secret-env";
+import {
+  ENV_MASK,
+  hasMaskedValue,
+  maskDriftChanges,
+  maskServiceEnv,
+  mergeServiceEnv,
+  unmaskEnv,
+} from "../../lib/secret-env";
 import {
   assertNotControlPlane,
   assertNotControlPlaneById,
@@ -35,13 +65,23 @@ import {
   resolveServicePlatform,
   resolveServiceRuntimeForRead,
 } from "./service-container";
-import { resolveLiveServiceState, type LiveMatchKind } from "./live-state";
+import {
+  liveMatchTiersForDeployment,
+  resolveLiveServiceState,
+  type LiveMatchKind,
+} from "./live-state";
 import { parseVolumeSpec, type VolumeKind } from "./volume-spec";
 import { sq } from "../migration/direct-transfer";
 import { bounded, duBytes, volumeBytes } from "../migration/migration-size";
 import { deployComposeServices } from "../deployments/compose/deploy.service";
+import { ServiceConfigStaleError, resolveStaleEnvKeysForService } from "../deployments/env-drift";
 import { deploymentWorkload } from "../deployments/deployment-class";
-import { hasSourceBuildRecipe } from "../../lib/deployable-service";
+import {
+  hasSourceBuildRecipe,
+  isStaticService,
+  resolveSubAppRecipe,
+} from "../../lib/deployable-service";
+import { inferComposeEnvironmentTemplates } from "../../lib/compose-parser";
 import { deriveProjectRouteState } from "../domains/project-route.service";
 import { registerStartupHook } from "../../lib/startup";
 import {
@@ -57,7 +97,11 @@ import {
 import { resolveRuntimeResources } from "../../lib/resources";
 import { assertFreeEndpointsAllowed } from "../../lib/free-domain-guard";
 import { assertPlanAllowsServices, assertRunningServiceQuota } from "../../lib/plan-guard";
-import { ensurePendingServiceDomain, removeServiceDomain, reuseServerCertForDomain } from "../domains/domain.service";
+import {
+  ensurePendingServiceDomain,
+  removeServiceDomain,
+  reuseServerCertForDomain,
+} from "../domains/domain.service";
 import {
   buildUpstreamUrl,
   resolveLiveUpstreamUrl,
@@ -69,28 +113,25 @@ import {
   type RouteRegister,
   type RouteRemove,
 } from "../../lib/route-apply.service";
+import type { HostPortTargetIdentity } from "../../lib/host-port-target";
+import { observedLoopbackPublishFromUrl } from "../deployments/observed-host-port-claims";
 import { compileProjectRoutingFields } from "../../lib/project-routing-fields";
 import type {
   TCreateServiceBody,
   TUpdateServiceBody,
   TSetServiceEnvVarsBody,
 } from "./service.schema";
+import { withLiveProjectRuntimeMutation } from "../../lib/project-runtime-lock";
 
-/** Cap how long a route update AWAITS the (SSH) edge re-register before
- *  returning. Past this, the DB change is already saved and the edge apply
- *  finishes in the background — so a slow REMOTE edge never hangs the modal on a
- *  change that already took effect. Routing is best-effort; routingUnsynced
- *  surfaces if the background apply lags. */
+/** Cap how long the HTTP path waits for the SSH edge re-register. The underlying
+ *  operation keeps the project runtime lock until it really settles, so a slow
+ *  write may outlive the response but can never outlive a concurrent teardown. */
 const ROUTE_EDGE_APPLY_TIMEOUT_MS = 6000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Verify a service exists and belongs to a project in the given org */
-async function assertServiceAccess(
-  ctx: RequestContext,
-  projectId: string,
-  serviceId: string,
-) {
+async function assertServiceAccess(ctx: RequestContext, projectId: string, serviceId: string) {
   const project = await repos.project.findById(projectId);
   assertResourceInOrg(project, "Project", ctx.organizationId, projectId);
   const svc = await repos.service.findById(serviceId);
@@ -207,8 +248,12 @@ export async function validateServiceName(
 export { aliasConflictsWithSiblings };
 
 function withDrift(svc: Service) {
+  // The baselines are internal merge state. Returning them would bypass the
+  // environment masker (and now may contain raw Compose expressions with
+  // literal defaults); clients consume the already-masked `drift.changes` only.
+  const { importedSpec: _importedSpec, driftSpec: _driftSpec, ...publicService } = svc;
   return {
-    ...maskServiceEnv(svc),
+    ...maskServiceEnv(publicService),
     drift: svc.driftSpec
       ? { changes: maskDriftChanges(composeSpecDiff(svc.importedSpec ?? {}, svc.driftSpec)) }
       : null,
@@ -223,11 +268,7 @@ export async function listServices(ctx: RequestContext, projectId: string) {
   return (await repos.service.listByProject(projectId)).map(withDrift);
 }
 
-export async function getService(
-  ctx: RequestContext,
-  projectId: string,
-  serviceId: string,
-) {
+export async function getService(ctx: RequestContext, projectId: string, serviceId: string) {
   const { svc } = await assertServiceAccess(ctx, projectId, serviceId);
   return withDrift(svc);
 }
@@ -267,6 +308,7 @@ export async function acceptServiceDrift(
     image: theirs.image ?? null,
     build: theirs.build ?? null,
     dockerfile: theirs.dockerfile ?? null,
+    buildArgs: theirs.buildArgs ?? {},
     ports: theirs.ports ?? [],
     dependsOn: theirs.dependsOn ?? [],
     environment: theirs.environment ?? {},
@@ -291,11 +333,7 @@ export async function acceptServiceDrift(
  * Keep the user's edits: advance the baseline to the upstream spec (so it stops
  * re-flagging on every deploy) WITHOUT changing the row's current values.
  */
-export async function keepServiceDrift(
-  ctx: RequestContext,
-  projectId: string,
-  serviceId: string,
-) {
+export async function keepServiceDrift(ctx: RequestContext, projectId: string, serviceId: string) {
   const { svc } = await assertServiceAccess(ctx, projectId, serviceId);
   if (!svc.driftSpec) return withDrift(svc);
   await repos.service.update(serviceId, { importedSpec: svc.driftSpec, driftSpec: null });
@@ -548,9 +586,7 @@ export async function createService(
   // sentinel the client sent is dropped (never persist "••••••••"). Warn so a
   // real value accidentally lost this way is traceable.
   if (data.environment && hasMaskedValue(data.environment)) {
-    console.warn(
-      `[services] create "${name}": dropping masked env value(s) with no stored source`,
-    );
+    console.warn(`[services] create "${name}": dropping masked env value(s) with no stored source`);
     data = { ...data, environment: unmaskEnv(data.environment, null) };
   }
 
@@ -616,6 +652,14 @@ export async function createService(
   // strips the `null`-means-remove sentinels the update path accepts, so a
   // caller can send one payload shape to both.
   const advanced = mergeAdvanced(null, data.advanced);
+  if (advanced.files !== undefined) {
+    assertValidGeneratedConfigFiles(advanced.files);
+  }
+  if (data.buildArgs !== undefined && !Object.hasOwn(data.advanced ?? {}, "buildArgTemplateKeys")) {
+    // Direct/manual values are literal. Raw Compose parsing supplies its own
+    // non-empty marker when interpolation is required.
+    advanced.buildArgTemplateKeys = [];
+  }
   // Same alias gate as updateService — normalize + reject invalid/colliding
   // custom aliases BEFORE the insert, so a create can't persist an alias the
   // update path would refuse. No serviceId yet, so pass "" — every existing
@@ -629,6 +673,7 @@ export async function createService(
     image: trimOrNull(data.image),
     build: trimOrNull(data.build),
     dockerfile: trimOrNull(data.dockerfile),
+    buildArgs: data.buildArgs ?? {},
     ports: data.ports ?? [],
     dependsOn: data.dependsOn ?? [],
     environment: data.environment ?? {},
@@ -694,13 +739,17 @@ export async function updateService(
   // When domainType changes, clear the irrelevant domain field.
   const patch: Record<string, any> = { ...data };
 
-  // #336: env values are masked on read. Restore any sentinel the client echoed
-  // back to the stored value so editing an unrelated field never overwrites a
-  // secret with "••••••••". A real (revealed-and-changed) value passes through.
+  // #336/#619: env values are masked on read, so a client cannot see what it is
+  // about to overwrite. Merge onto what's stored rather than replacing: a partial
+  // body used to delete every variable it merely failed to mention, and because
+  // reveal is off the automation surface (see service.routes.ts) the caller could
+  // not read those values back. Sentinels the client echoed restore to the stored
+  // value, so editing an unrelated field never writes "••••••••" over a secret; a
+  // revealed-and-changed value passes through; an explicit null removes the key.
   if ("environment" in patch) {
-    patch.environment = unmaskEnv(
-      patch.environment,
+    patch.environment = mergeServiceEnv(
       svc.environment as Record<string, string> | null,
+      patch.environment,
     );
   }
 
@@ -718,7 +767,25 @@ export async function updateService(
   // deep merge would make a partially-specified healthcheck inherit stale fields.
   if ("advanced" in patch) {
     patch.advanced = mergeAdvanced(svc.advanced as ComposeAdvanced | null, patch.advanced);
-    await validateServiceAlias(projectId, serviceId, patch.advanced as ComposeAdvanced, project.internalAlias);
+    if ((patch.advanced as ComposeAdvanced).files !== undefined) {
+      assertValidGeneratedConfigFiles((patch.advanced as ComposeAdvanced).files);
+    }
+    await validateServiceAlias(
+      projectId,
+      serviceId,
+      patch.advanced as ComposeAdvanced,
+      project.internalAlias,
+    );
+  }
+
+  if ("buildArgs" in patch && !Object.hasOwn(data.advanced ?? {}, "buildArgTemplateKeys")) {
+    // A manual arg edit replaces the old value's provenance as well as its
+    // value. Otherwise a literal `$HOME` could inherit a repo-template marker
+    // and be expanded on the next deploy.
+    patch.advanced = mergeAdvanced(
+      ("advanced" in patch ? patch.advanced : svc.advanced) as ComposeAdvanced | null,
+      { buildArgTemplateKeys: [] },
+    );
   }
 
   if ("name" in patch && typeof patch.name === "string") {
@@ -739,6 +806,15 @@ export async function updateService(
     if (key in patch) {
       patch[key] = trimOrNull(patch[key]);
     }
+  }
+  if ("image" in patch && patch.image !== svc.image) {
+    // An image edited through the service API is a literal override. Do not
+    // leave the old Compose expression attached or deployment would silently
+    // replace the operator's edit with a newly interpolated value.
+    patch.advanced = mergeAdvanced(
+      ("advanced" in patch ? patch.advanced : svc.advanced) as ComposeAdvanced | null,
+      { imageTemplate: null },
+    );
   }
   // #332: `commandArgv` wins over `command` at deploy time, so a command edit that
   // leaves a stale argv behind silently keeps running the OLD command — the form's
@@ -785,9 +861,7 @@ export async function updateService(
     // mergeServiceRoutingPatch. Before this, an array on the row shadowed the
     // scalars outright: the user's chosen custom domain was dropped and the gate
     // below then judged the stored "free" primary instead.
-    const normalized = normalizeRoutingPatch(
-      mergeServiceRoutingPatch({ patch, stored: svc }),
-    );
+    const normalized = normalizeRoutingPatch(mergeServiceRoutingPatch({ patch, stored: svc }));
 
     // Write the merged routing through VERBATIM, nulls included. `normalized` is
     // the row's whole intended routing state (unexposing only closes the gate — it
@@ -847,6 +921,7 @@ export async function updateService(
     // Resolved below only when there's a container to inspect; disposed in the
     // `finally` because it may own an SSH bridge to the serving box.
     let runtime: RuntimeAdapter | undefined;
+    let hostPortTarget: HostPortTargetIdentity | null | undefined;
     try {
       const runtimeName = platform().runtime.name;
       // `enabled` / `exposed` are non-nullable DB columns - no need to
@@ -855,15 +930,28 @@ export async function updateService(
       // Diff the SET of routes (a service can publish several ports). A hostname
       // present before but gone now is removed; every current route is
       // (re-)registered (register is additive/idempotent upstream).
-      const oldRoutes = buildServiceRouteDomains({ project, service: svc, runtimeName, usesManagedRouting: true });
+      const oldRoutes = buildServiceRouteDomains({
+        project,
+        service: svc,
+        runtimeName,
+        usesManagedRouting: true,
+      });
       const nextRoutes = isRoutable
-        ? buildServiceRouteDomains({ project, service: updated, runtimeName, usesManagedRouting: true })
+        ? buildServiceRouteDomains({
+            project,
+            service: updated,
+            runtimeName,
+            usesManagedRouting: true,
+          })
         : [];
       const nextByHost = new Map(nextRoutes.map((route) => [route.hostname.toLowerCase(), route]));
 
       const removes: RouteRemove[] = oldRoutes
         .filter((route) => !nextByHost.has(route.hostname.toLowerCase()))
-        .map((route) => ({ hostname: route.hostname, isCustomDomain: route.domainType === "custom" }));
+        .map((route) => ({
+          hostname: route.hostname,
+          isCustomDomain: route.domainType === "custom",
+        }));
 
       // Single reused path: cloud → page/workspace primitives, self-hosted →
       // the deployment's own routing (local box or remote server/sandbox).
@@ -877,18 +965,19 @@ export async function updateService(
       // loopback port when there is one, else the container IP. Publishing a
       // domain is exactly when a migrated/adopted workload gets its first route,
       // and those containers were never published to 127.0.0.1 — so the stored
-      // row is only a cache here, used when the container can't be inspected.
-      // Cloud ignores targetUrl.
+      // row is only a hint for a successful live inspection. A cached host port
+      // or bridge IP is not ownership evidence: after a stop/remove, either can
+      // belong to another workload. Cloud ignores targetUrl.
       let stored: StoredUpstream | undefined;
       let containerId: string | undefined;
       if (isRoutable && nextRoutes.length > 0 && dep && project.activeDeploymentId) {
         const rows = await repos.service.listByDeployment(project.activeDeploymentId);
         const row = rows.find((r) => r.serviceId === serviceId);
-        stored = { ip: row?.ip, hostPort: row?.hostPort };
+        stored = { ip: row?.ip, hostPort: row?.hostPort, hostPorts: row?.hostPorts };
         containerId = row?.containerId ?? undefined;
         if (containerId) {
           try {
-            ({ runtime } = await resolveDeploymentRuntimeForRead(dep));
+            ({ runtime, hostPortTarget } = await resolveDeploymentRuntimeForRead(dep));
           } catch (err) {
             console.warn(
               `[SERVICE] ${svc.name}: could not resolve runtime for upstream, using stored row: ${safeErrorMessage(err)}`,
@@ -906,13 +995,28 @@ export async function updateService(
               containerId,
               containerPort,
               stored,
+              requireLiveObservation: true,
             })) ?? undefined
           );
         }
-        return buildUpstreamUrl({ strategy, ip: stored?.ip, hostPort: stored?.hostPort, containerPort }) ?? undefined;
+        // This is a live route write. If a self-hosted row names no container,
+        // or its runtime could not be resolved, leave the existing vhost alone
+        // instead of re-registering a targetless cache that may have been reused.
+        if (dep) return undefined;
+        return (
+          buildUpstreamUrl({
+            strategy,
+            ip: stored?.ip,
+            hostPort: stored?.hostPort,
+            hostPorts: stored?.hostPorts,
+            containerPort,
+          }) ?? undefined
+        );
       };
       const targetUrls = await Promise.all(
-        nextRoutes.map((route) => (route.targetPort ? resolveTargetUrl(route.targetPort) : undefined)),
+        nextRoutes.map((route) =>
+          route.targetPort ? resolveTargetUrl(route.targetPort) : undefined,
+        ),
       );
       // The project's compiled vercel.json rules. The DEPLOY path already puts them on
       // a service's own domain (via `serviceRouteOptions`), and `registerRoute`
@@ -925,6 +1029,16 @@ export async function updateService(
         targetUrl: targetUrls[i],
         port: route.targetPort,
         isCustomDomain: route.domainType === "custom",
+        ...(() => {
+          const observed = route.targetPort
+            ? observedLoopbackPublishFromUrl({
+                targetUrl: targetUrls[i],
+                serviceId,
+                containerPort: route.targetPort,
+              })
+            : null;
+          return observed ? { observedLoopbackPublishes: [observed] } : {};
+        })(),
       }));
 
       // Authoritative port: the upstream above is rebuilt from the LIVE
@@ -982,15 +1096,23 @@ export async function updateService(
       // request: bound the await and, past the cap, RETURN while it finishes in
       // the background. Otherwise the modal spins and times out on a change that
       // already applied (the reported "keeps loading, but it took effect").
-      const applyEdge = (async () => {
-        await reconcileProjectRoutes(project, { deployment: dep, registers, removes });
+      const applyEdge = withLiveProjectRuntimeMutation(project.id, async (liveProject) => {
+        // A newer deployment makes every captured upstream below stale. Do not
+        // overwrite its routes even though the project itself is still live.
+        if (dep && liveProject.activeDeploymentId !== dep.id) return;
+        await reconcileProjectRoutes(liveProject, {
+          deployment: dep,
+          hostPortTarget,
+          registers,
+          removes,
+        });
         // AFTER reconcile so installDomainCert re-registers the vhost with TLS on
         // top of the live HTTP route — adopt an existing cert for a freshly
         // published custom domain (migration / takeover) instead of ACME.
         for (const domainId of freshlyPublishedDomainIds) {
           await reuseServerCertForDomain(ctx, domainId).catch(() => {});
         }
-      })();
+      });
       applyEdge.catch((err) => console.error(`[SERVICE] edge apply for ${svc.name}:`, err));
       await Promise.race([
         applyEdge,
@@ -999,8 +1121,9 @@ export async function updateService(
     } catch (err) {
       console.error(`[SERVICE] Failed to update route for ${svc.name}:`, err);
     } finally {
-      // `applyEdge` may still be running past the race above, but it resolves its
-      // own routing/executor from the deployment — it never touches this runtime.
+      // `applyEdge` may still be running past the race above, but it retains the
+      // project runtime lock and resolves its own routing/executor from the
+      // deployment — it never touches this runtime.
       await runtime?.dispose?.().catch(() => {});
     }
   }
@@ -1008,72 +1131,58 @@ export async function updateService(
   return maskServiceEnv(updated);
 }
 
-/** Best-effort runtime/route teardown is bounded so a slow or unreachable box
- *  can't hang the delete request past the DB-row removal (the authoritative op). */
-const SERVICE_TEARDOWN_TIMEOUT_MS = 20_000;
-
-export async function deleteService(
-  ctx: RequestContext,
-  projectId: string,
-  serviceId: string,
-) {
-  const { project, svc } = await assertServiceAccess(ctx, projectId, serviceId);
-  // The self-app project's services ARE the Openship stack (api, dashboard, edge,
-  // postgres, redis), linked so the dashboard can show their state, logs and shell.
-  // One shared policy for every mutating surface — see controller-helpers.
-  assertNotControlPlane(project);
-
+async function deleteLiveService(project: Project, svc: Service): Promise<void> {
+  const serviceId = svc.id;
   if (project.activeDeploymentId) {
     const dep = await repos.deployment.findById(project.activeDeploymentId);
     const serviceDeployments = await repos.service.listByDeployment(project.activeDeploymentId);
     const serviceDeployment = serviceDeployments.find((row) => row.serviceId === serviceId);
 
     if (dep && serviceDeployment?.containerId) {
-      // Runtime teardown is best-effort AND time-bounded: reaching the box is an
-      // SSH round-trip, so a slow/unreachable server or a stale container (e.g. a
-      // legacy row whose container is already gone) must never HANG the request.
-      // The `.catch()`es only cover rejection — a hang would block until the HTTP
-      // request aborts and the DB removal below (the authoritative, atomic op)
-      // would never run, so the row could never be deleted. withTimeout converts a
-      // hang into a caught failure; a lingering container is reaped by images:gc /
-      // manual cleanup. Keyed on serviceId throughout — never by name.
+      // Keep the project runtime lock until the underlying mutation genuinely
+      // settles. Promise-racing a destroy only stops waiting; it cannot stop the
+      // remote command, which could otherwise remove a freshly redeployed
+      // resource after this delete released the lock. Keyed on serviceId
+      // throughout—never by name.
       const containerId = serviceDeployment.containerId;
-      await withTimeout(
-        (async () => {
-          const { platform } = await resolveServicePlatform(project, dep);
-          // `finally`, because this resolve BOUND a loopback listener for the
-          // Docker-over-SSH bridge and only dispose closes it. Every failure below is
-          // caught, so the old straight-line dispose looked equivalent — but the whole
-          // block runs under `withTimeout`, and a teardown that exceeds it rejects out of
-          // here from the `await`, past a trailing statement. Fourteen deletes of a service
-          // on a slow box then leak fourteen listeners for the life of the process, which
-          // surfaces as fd exhaustion nowhere near this function.
-          try {
-            await platform.runtime.destroy(containerId).catch((err: unknown) => {
-              console.error(`[SERVICE] Failed to destroy service container ${containerId}:`, err);
+      await (async () => {
+        const { platform } = await resolveServicePlatform(project, dep);
+        // `finally`, because this resolve BOUND a loopback listener for the
+        // Docker-over-SSH bridge and only dispose closes it. Every failure below is
+        // caught, so the old straight-line dispose looked equivalent. `finally`
+        // also closes the Docker-over-SSH bridge on every settled failure.
+        try {
+          await platform.runtime.destroy(containerId).catch((err: unknown) => {
+            console.error(`[SERVICE] Failed to destroy service container ${containerId}:`, err);
+          });
+          // Reclaim this service's built artifact NOW — the FK cascade in
+          // repos.service.remove() below erases the imageRef record, so a later
+          // teardown could never enumerate it. Best-effort; images:gc is the backstop.
+          //
+          // Two shapes, and the `openship/` tag guard answers for only one: a
+          // STATIC sub-app's imageRef is a host DIRECTORY (`/opt/openship/static/…`),
+          // which fails that prefix test, so deleting a static service used to leak
+          // its doc-root with nothing left in the DB to find it by (issue #640's
+          // third door). The tag guard stays for the image case: a base/third-party
+          // image (postgres:16-alpine, redis:7-alpine) is PULLED, shared, and must
+          // never be removed.
+          if (isArtifactRef(serviceDeployment.imageRef)) {
+            await platform.runtime.destroy(serviceDeployment.imageRef!).catch((err: unknown) => {
+              console.error(`[SERVICE] Failed to remove static output for ${svc.name}:`, err);
             });
-            // Reclaim this service's built image NOW — the FK cascade in
-            // repos.service.remove() below erases the imageRef record, so a later
-            // teardown could never enumerate it. Guarded to `openship/…` build tags:
-            // a base/third-party image (postgres:16-alpine, redis:7-alpine) is PULLED,
-            // shared, and must never be removed. Best-effort; images:gc is the backstop.
-            if (
-              serviceDeployment.imageRef?.startsWith("openship/") &&
-              platform.runtime instanceof DockerRuntime
-            ) {
-              await platform.runtime
-                .removeImage(serviceDeployment.imageRef)
-                .catch((err: unknown) => {
-                  console.error(`[SERVICE] Failed to remove image for ${svc.name}:`, err);
-                });
-            }
-          } finally {
-            disposePlatform(platform);
+          } else if (
+            serviceDeployment.imageRef &&
+            ownsBuiltImage(serviceDeployment.imageRef) &&
+            platform.runtime instanceof DockerRuntime
+          ) {
+            await platform.runtime.removeImage(serviceDeployment.imageRef).catch((err: unknown) => {
+              console.error(`[SERVICE] Failed to remove image for ${svc.name}:`, err);
+            });
           }
-        })(),
-        SERVICE_TEARDOWN_TIMEOUT_MS,
-        `runtime teardown timed out for ${svc.name}`,
-      ).catch((err: unknown) => {
+        } finally {
+          disposePlatform(platform);
+        }
+      })().catch((err: unknown) => {
         console.error(`[SERVICE] Runtime teardown skipped for ${svc.name} (best-effort):`, err);
       });
     }
@@ -1097,17 +1206,13 @@ export async function deleteService(
           !project.cloudWorkspaceId && project.activeDeploymentId
             ? await repos.deployment.findById(project.activeDeploymentId)
             : null;
-        await withTimeout(
-          reconcileProjectRoutes(project, {
-            deployment: dep,
-            removes: routes.map((route) => ({
-              hostname: route.hostname,
-              isCustomDomain: route.domainType === "custom",
-            })),
-          }),
-          SERVICE_TEARDOWN_TIMEOUT_MS,
-          `route teardown timed out for ${svc.name}`,
-        );
+        await reconcileProjectRoutes(project, {
+          deployment: dep,
+          removes: routes.map((route) => ({
+            hostname: route.hostname,
+            isCustomDomain: route.domainType === "custom",
+          })),
+        });
       }
     } catch (err) {
       console.error(`[SERVICE] Failed to remove route for ${svc.name}:`, err);
@@ -1119,6 +1224,29 @@ export async function deleteService(
   await repos.domain.deleteByServiceId(serviceId);
 
   await repos.service.remove(serviceId);
+}
+
+export async function deleteService(ctx: RequestContext, projectId: string, serviceId: string) {
+  const { project } = await assertServiceAccess(ctx, projectId, serviceId);
+  // The self-app project's services ARE the Openship stack (api, dashboard, edge,
+  // postgres, redis), linked so the dashboard can show their state, logs and shell.
+  assertNotControlPlane(project);
+
+  const deleted = await withLiveProjectRuntimeMutation(projectId, async (liveProject) => {
+    // Re-read the service under the shared teardown lock. Authorization above is
+    // intentionally outside the lock, while this existence/ownership read closes
+    // a concurrent service delete or project teardown race.
+    const liveService = await repos.service.findById(serviceId);
+    if (!liveService || liveService.projectId !== projectId) {
+      throw new Error("service-not-found");
+    }
+    assertNotControlPlane(liveProject);
+    await deleteLiveService(liveProject, liveService);
+    return true;
+  });
+  if (!deleted) {
+    throw new Error("project-deletion-in-progress");
+  }
 }
 
 // ─── Service Environment Variables ───────────────────────────────────────────
@@ -1147,15 +1275,52 @@ export async function setServiceEnvVars(
 ) {
   await assertServiceAccess(ctx, projectId, serviceId);
 
-  // Encrypt values before storage
-  const encrypted = data.vars.map((v) => ({
-    key: v.key,
-    value: encrypt(v.value),
-    isSecret: v.isSecret,
-  }));
+  const seenKeys = new Set<string>();
+  for (const variable of data.vars) {
+    if (!isValidEnvKey(variable.key)) throw new Error(`invalid-env-key:${variable.key}`);
+    if (seenKeys.has(variable.key)) throw new Error(`duplicate-env-key:${variable.key}`);
+    seenKeys.add(variable.key);
+  }
+
+  // GET masks secrets. Preserve the existing ciphertext when that sentinel is
+  // submitted unchanged; never encrypt and persist the sentinel itself. The
+  // stable row id also lets a masked secret be renamed without revealing it.
+  const existing = await repos.project.listEnvVars(projectId, data.environment, serviceId);
+  const existingByKey = new Map(existing.map((row) => [row.key, row]));
+  const existingById = new Map(existing.map((row) => [row.id, row]));
+  const usedSourceIds = new Set<string>();
+  const encrypted = data.vars.map((v) => {
+    const prior = v.sourceId ? existingById.get(v.sourceId) : existingByKey.get(v.key);
+    if (v.sourceId && !prior) throw new Error(`invalid-env-source:${v.sourceId}`);
+    if (prior?.id) {
+      if (usedSourceIds.has(prior.id)) throw new Error(`duplicate-env-source:${prior.id}`);
+      usedSourceIds.add(prior.id);
+    }
+    if (v.value === ENV_MASK) {
+      if (!prior?.isSecret) throw new Error(`masked-env-without-source:${v.key}`);
+      return { key: v.key, value: prior.value, isSecret: v.isSecret ?? prior.isSecret };
+    }
+    return {
+      key: v.key,
+      value: encrypt(v.value),
+      isSecret: v.isSecret ?? prior?.isSecret ?? looksLikeSecretKey(v.key),
+    };
+  });
 
   await repos.project.bulkSetEnvVars(projectId, data.environment, encrypted, serviceId);
   return { count: encrypted.length };
+}
+
+/** Full internal map; the controller returns only explicitly requested keys. */
+export async function revealServiceEnvVars(
+  ctx: RequestContext,
+  projectId: string,
+  serviceId: string,
+  environment: string,
+): Promise<Record<string, string>> {
+  await assertServiceAccess(ctx, projectId, serviceId);
+  const rows = await repos.project.listEnvVars(projectId, environment, serviceId);
+  return Object.fromEntries(rows.map((row) => [row.key, decrypt(row.value)]));
 }
 
 // ─── Compose Sync ────────────────────────────────────────────────────────────
@@ -1168,9 +1333,13 @@ export async function syncComposeServices(
     image?: string;
     build?: string;
     dockerfile?: string;
+    buildArgs?: Record<string, string | null>;
     ports?: string[];
     dependsOn?: string[];
     environment?: Record<string, string>;
+    /** Optional explicit provenance from a trusted parser. When absent, this
+     * compose-sync boundary derives it with the canonical parser helper. */
+    environmentTemplates?: Record<string, string>;
     volumes?: string[];
     command?: string;
     commandArgv?: string[] | null;
@@ -1212,11 +1381,39 @@ export async function syncComposeServices(
   // resolveCommandArgv) is the ONE place that decides whether an unchanged string
   // keeps the stored argv or a changed one re-derives — so every writer into that
   // path, including the deploy request's own service list, gets the same rule.
-  const reconciled = parsed.map((svc) =>
-    svc.environment
-      ? { ...svc, environment: unmaskEnv(svc.environment, storedEnvByName.get(svc.name) ?? null) }
-      : svc,
-  );
+  const reconciled = parsed.map((svc) => {
+    const environment = svc.environment
+      ? unmaskEnv(svc.environment, storedEnvByName.get(svc.name) ?? null)
+      : svc.environment;
+    const advanced = svc.advanced as ComposeAdvanced | undefined;
+    const hasExplicitTemplateMarker = Object.hasOwn(advanced ?? {}, "environmentTemplateKeys");
+    const markedTemplateKeys = advanced?.environmentTemplateKeys ?? [];
+    // Three provenance levels, in priority order:
+    //   1. a trusted parser sent the exact raw expressions;
+    //   2. a normalized producer (notably `docker compose config`) sent a
+    //      names-only marker, where [] explicitly means "all values are final";
+    //   3. a manual/raw sync sent only environment values, so infer Compose
+    //      expressions with the canonical parser helper.
+    // This avoids both literal `${VAR}` containers and double-expanding `$$`.
+    const environmentTemplates =
+      svc.environmentTemplates ??
+      (hasExplicitTemplateMarker
+        ? Object.fromEntries(
+            markedTemplateKeys
+              .filter((key) => environment && Object.hasOwn(environment, key))
+              .map((key) => [key, environment![key]!]),
+          )
+        : inferComposeEnvironmentTemplates(environment));
+    const persistTemplateProvenance =
+      svc.environmentTemplates !== undefined ||
+      (!hasExplicitTemplateMarker && environment !== undefined);
+
+    return {
+      ...svc,
+      ...(environment && { environment }),
+      ...(persistTemplateProvenance && { environmentTemplates }),
+    };
+  });
 
   // composeAuthoritative: this endpoint's contract is "the FULL service list from
   // the compose file" — it already removes services missing from it. So an absent
@@ -1326,8 +1523,9 @@ export interface LiveServiceContainer {
  * migration attaches running containers in place and docker labels can't be
  * changed in place, so an attached container keeps the OLD deployment label and
  * reported "stopped" while serving traffic. Identity is now resolved by
- * label → canonical name → tracked id → compose label (see live-state.ts) and
- * the status comes off whatever that resolves to.
+ * label → canonical name → tracked id, plus compose labels only for an explicit
+ * adopt deployment (see live-state.ts), and the status comes off whatever that
+ * resolves to.
  */
 export async function getActiveServiceContainers(
   ctx: RequestContext,
@@ -1403,6 +1601,7 @@ export async function getActiveServiceContainers(
             projectId,
             slug: project.slug,
             trackedIds,
+            tiers: liveMatchTiersForDeployment(dep.meta as Record<string, unknown> | null),
           });
           return (
             services
@@ -1445,7 +1644,8 @@ export async function getActiveServiceContainers(
                   matchedBy: null,
                   duplicates: [],
                 };
-                if (!hint?.containerId) return { ...base, status: "stopped" as ServiceContainerState };
+                if (!hint?.containerId)
+                  return { ...base, status: "stopped" as ServiceContainerState };
                 const info = await runtime.getContainerInfo(hint.containerId).catch(() => null);
                 return {
                   ...base,
@@ -1522,6 +1722,11 @@ const VOL_SIZE_TTL_MS = 60_000;
 // the exact container, so re-opening the tab doesn't re-`du` every time.
 const volSizeCache = new Map<string, { at: number; value: ServiceVolumeSizes }>();
 
+/** Drop measurements keyed by project/service rows replaced by an import. */
+export function clearServiceVolumeSizeCache(): void {
+  volSizeCache.clear();
+}
+
 /** Resolve a named volume's real on-host name (it may be namespaced at deploy
  *  time as `openship-<slug>-<name>`) and `du` its mountpoint. Only used as a
  *  fallback when the container isn't running to report authoritative mounts. */
@@ -1577,7 +1782,8 @@ export async function getServiceVolumeSizes(
     partial: parsed.length > 0,
   });
 
-  if (parsed.length === 0) return { measurable: true, volumes: [], totalBytes: null, partial: false };
+  if (parsed.length === 0)
+    return { measurable: true, volumes: [], totalBytes: null, partial: false };
   if (!project.activeDeploymentId) return unmeasured(false);
 
   const dep = await repos.deployment.findById(project.activeDeploymentId);
@@ -1645,20 +1851,36 @@ export async function getServiceVolumeSizes(
     }
   }
 
-  const volumes = await bounded(parsed, VOL_SIZE_CONCURRENCY, async (p): Promise<ServiceVolumeSize> => {
-    const hostPath = p.target ? mountsByDest.get(p.target) : undefined;
-    let bytes: number | null;
-    if (hostPath) {
-      bytes = await duBytes(executor, hostPath);
-    } else if (p.kind === "bind" && p.source) {
-      bytes = await duBytes(executor, p.source);
-    } else if (p.kind === "named" && p.source) {
-      bytes = await namedVolumeBytesByName(executor, project.slug, p.source, !!svc.namespaceVolumes);
-    } else {
-      bytes = null; // anonymous volume with no running container → unknown
-    }
-    return { raw: p.raw, source: p.source, target: p.target, kind: p.kind, readOnly: p.readOnly, bytes };
-  });
+  const volumes = await bounded(
+    parsed,
+    VOL_SIZE_CONCURRENCY,
+    async (p): Promise<ServiceVolumeSize> => {
+      const hostPath = p.target ? mountsByDest.get(p.target) : undefined;
+      let bytes: number | null;
+      if (hostPath) {
+        bytes = await duBytes(executor, hostPath);
+      } else if (p.kind === "bind" && p.source) {
+        bytes = await duBytes(executor, p.source);
+      } else if (p.kind === "named" && p.source) {
+        bytes = await namedVolumeBytesByName(
+          executor,
+          project.slug,
+          p.source,
+          !!svc.namespaceVolumes,
+        );
+      } else {
+        bytes = null; // anonymous volume with no running container → unknown
+      }
+      return {
+        raw: p.raw,
+        source: p.source,
+        target: p.target,
+        kind: p.kind,
+        readOnly: p.readOnly,
+        bytes,
+      };
+    },
+  );
 
   let totalBytes: number | null = null;
   let partial = false;
@@ -1686,11 +1908,7 @@ export async function getServiceVolumeSizes(
  * (it's the only key an adopted container with a foreign name has) — see
  * live-state.ts for the resolution order.
  */
-async function resolveServiceContainer(
-  ctx: RequestContext,
-  projectId: string,
-  serviceId: string,
-) {
+async function resolveServiceContainer(ctx: RequestContext, projectId: string, serviceId: string) {
   const project = await repos.project.findById(projectId);
   assertResourceInOrg(project, "Project", ctx.organizationId, projectId);
   if (!project.activeDeploymentId) throw new Error("No active deployment");
@@ -1790,10 +2008,23 @@ async function provisionServiceContainer(
     await repos.service.update(serviceId, { enabled: true });
   }
 
+  // Direct Start has no build result to establish artifact provenance. It may
+  // classify the target as static, but deployComposeServices will accept a host
+  // path only when the prior successful row also owns the exact canonical
+  // release directory. Resolve row inheritance from the active snapshot just
+  // like the normal compose build path; raw nullable row fields are incomplete.
+  const staticServiceIds = isStaticService(
+    resolveSubAppRecipe(service, (dep.meta ?? {}) as Record<string, string | null | undefined>),
+  )
+    ? new Set([serviceId])
+    : undefined;
+
   const resolved = await resolveServicePlatform(project, dep);
   const runtime = resolved.platform.runtime;
   if (!isMultiServiceRuntime(runtime)) {
-    throw new Error(`The ${runtime.name} runtime cannot run services — enable Docker on this target.`);
+    throw new Error(
+      `The ${runtime.name} runtime cannot run services — enable Docker on this target.`,
+    );
   }
 
   // Surface the per-service provisioning trace (and any Oblien failure reason)
@@ -1820,11 +2051,13 @@ async function provisionServiceContainer(
       // unrelated one. Full compose deploys (Mode 2) don't pass this flag.
       targetServiceIds: new Set([serviceId]),
       strictScope: true,
+      staticServiceIds,
       routing: resolved.platform.routing,
       ssl: resolved.platform.ssl,
       system: resolved.platform.system,
       executor: resolved.platform.executor,
       localHost: resolved.platform.localHost,
+      hostPortTarget: resolved.hostPortTarget,
       usesManagedRouting: resolved.usesManagedRouting,
       serverId: resolved.serverId ?? undefined,
     });
@@ -1880,11 +2113,7 @@ export async function stopServiceContainer(
   serviceId: string,
 ) {
   await assertNotControlPlaneById(projectId);
-  const { runtime, containerId, row } = await resolveServiceContainer(
-    ctx,
-    projectId,
-    serviceId,
-  );
+  const { runtime, containerId, row } = await resolveServiceContainer(ctx, projectId, serviceId);
   try {
     await runtime.stop(containerId);
     // Deploy-history bookkeeping only — the panel reads state from the host.
@@ -1897,17 +2126,65 @@ export async function stopServiceContainer(
   }
 }
 
+/**
+ * Bounce a service's container — `docker restart`, nothing more.
+ *
+ * It deliberately does NOT apply configuration: a container's environment is
+ * fixed when it is CREATED, so a restart re-runs whatever env the running
+ * container was built with. The old failure mode (GH-615) was that this endpoint
+ * answered `{success:true}` to an operator who had just changed an env var and
+ * expected the restart to pick it up — a silent no-op is the worst possible
+ * answer, because nothing tells you to go do the thing that actually works.
+ *
+ * So a restart with pending env changes REFUSES (409 `SERVICE_CONFIG_STALE`) and
+ * names both the drifted keys and the refresh deploy that applies them. Recreating
+ * the container from here instead would make a cheap bounce silently destroy and
+ * replace the container (downtime, new private IP) — and the platform already has
+ * the surgical path for that, `POST /deployments {refresh:true, serviceIds:[id]}`,
+ * which the dashboard's env editor has always used.
+ *
+ * `force` skips the guard: a crash-looping container still has to be bounceable
+ * without first applying an unrelated config change.
+ */
 export async function restartServiceContainer(
   ctx: RequestContext,
   projectId: string,
   serviceId: string,
+  opts?: { force?: boolean },
 ) {
   await assertNotControlPlaneById(projectId);
-  const { runtime, containerId, row } = await resolveServiceContainer(
-    ctx,
-    projectId,
-    serviceId,
-  );
+
+  // Checked BEFORE resolving a container: this is DB-only, so the honest answer
+  // costs no transport — resolving first would allocate an SSH bridge only to
+  // abandon it on the throw path.
+  if (!opts?.force) {
+    const project = await repos.project.findById(projectId);
+    assertResourceInOrg(project, "Project", ctx.organizationId, projectId);
+    const dep = project.activeDeploymentId
+      ? await repos.deployment.findById(project.activeDeploymentId).catch(() => null)
+      : null;
+    const service = (await repos.service.listByProject(projectId)).find((s) => s.id === serviceId);
+    if (dep && service) {
+      const staleEnvKeys = await resolveStaleEnvKeysForService(project, dep.environment, serviceId);
+      if (staleEnvKeys.length > 0) {
+        // Channel-neutral on purpose: this message is rendered in a dashboard
+        // toast, a CLI stderr line, and an MCP tool result. It names both routes
+        // to the fix and leaves the channel-specific phrasing (the exact CLI
+        // command) to the CLI, which has the structured fields to build it.
+        throw new ServiceConfigStaleError(
+          `"${service.name}" has ${staleEnvKeys.length} pending environment change(s) that a restart cannot apply — ` +
+            `a container's environment is fixed when it is created. Re-apply them with a refresh deploy ` +
+            `(dashboard: Redeploy → Refresh env; API: POST /api/deployments ` +
+            `{"projectId":"${projectId}","refresh":true,"serviceIds":["${serviceId}"]}). ` +
+            `Restart with force=true to bounce the container anyway, leaving the changes unapplied.`,
+          staleEnvKeys,
+          service.name,
+        );
+      }
+    }
+  }
+
+  const { runtime, containerId, row } = await resolveServiceContainer(ctx, projectId, serviceId);
   try {
     await runtime.restart(containerId);
     if (row) {
@@ -1925,11 +2202,7 @@ export async function getServiceRuntimeLogs(
   serviceId: string,
   tail?: number,
 ) {
-  const { runtime, containerId } = await resolveServiceContainer(
-    ctx,
-    projectId,
-    serviceId,
-  );
+  const { runtime, containerId } = await resolveServiceContainer(ctx, projectId, serviceId);
   try {
     return await runtime.getRuntimeLogs(containerId, tail);
   } finally {
@@ -2006,4 +2279,3 @@ export async function streamServiceRuntimeLogs(
   };
   return { cleanup, serverId };
 }
-

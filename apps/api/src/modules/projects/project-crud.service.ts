@@ -21,16 +21,19 @@ import {
   compareSemver,
   compareCommitSha,
   isReleaseProvider,
+  releaseArtifactKind,
+  renderReleaseImage,
+  validateReleaseRepository,
+  validateReleaseVersionUrl,
   isBehind,
   GITHUB_REPO,
   normalizeRollbackWindow,
   normalizeAliasStrict,
   aliasConflictsWithSiblings,
   normalizeFramework,
-  deriveProjectDeployTarget,
+  isServicesFramework,
   resolveWorkload,
   toWorkloadType,
-  type DeployTarget,
   type ReleaseSource,
   type UpdatableIdentity,
   type WorkloadType,
@@ -38,22 +41,30 @@ import {
 } from "@repo/core";
 import type { ResourceConfig } from "@repo/adapters";
 import { encodeResources } from "../../lib/resources";
-import { resolveLatestVersion, resolveLatestReleaseTag, readApiVersion } from "../../lib/release-resolver";
+import {
+  resolveLatestVersion,
+  resolveLatestReleaseTag,
+  readApiVersion,
+} from "../../lib/release-resolver";
 import { resolveLatestImageDigest } from "../../lib/image-registry";
+import { normalizeProjectRootDirectory } from "../../lib/project-root-detector";
 import { env } from "../../config";
 import { assertResourceInOrg } from "../../lib/controller-helpers";
 import type { RequestContext } from "../../lib/request-context";
 import {
   resolveDefaultBranch,
   listBranches as listGitHubBranches,
+  compareCommits,
   getLatestCommit,
+  getWebhookStrategy,
   resolveWebhookStrategy,
 } from "../github/github.service";
-import { getInstallationIdByOrg, getInstallUrl } from "../github/github.auth";
+import { projectMatchesChanges } from "../github/webhook-changed-files";
+import { getInstallationIdByOrg, resolveInstallUrl } from "../github/github.auth";
+import { hasActiveGitHubSource, resolveGitHubWebBaseUrl } from "../github/github-source.service";
 import { domainWebhookUrl } from "../../lib/public-url";
-import { ensureSharedWebhook } from "./project-git-webhook";
+import { ensureSharedWebhook, findSharedWebhookId } from "./project-git-webhook";
 import {
-  deriveEnvironmentPublicEndpoints,
   deriveNextProjectRouteState,
   listProjectRouteRows,
   persistProjectRouteState,
@@ -66,11 +77,7 @@ import { applyProjectRouting } from "../domains/routing-apply.service";
 import { syncProjectManagedEdge } from "./project-runtime.service";
 import { normalizeStoredPublicEndpoints, publicEndpointHostname } from "../../lib/public-endpoints";
 import { assertFreeEndpointsAllowed } from "../../lib/free-domain-guard";
-import {
-  currentPlanTier,
-  planProjectLimit,
-  PlanUpgradeRequiredError,
-} from "../../lib/plan-guard";
+import { currentPlanTier, planProjectLimit, PlanUpgradeRequiredError } from "../../lib/plan-guard";
 import { assertValidCustomDomains, customHostnamesOf } from "../../lib/custom-domain-guard";
 import { hasMaskedValue, unmaskEnv } from "../../lib/secret-env";
 import { getFolderSession } from "./folder/session-store";
@@ -79,8 +86,13 @@ import type {
   TCreateProjectEnvironmentBody,
   TEnsureProjectBody,
   TUpdateProjectBody,
+  TSetReleaseSourceBody,
 } from "./project.schema";
 import { UpdateProjectBody } from "./project.schema";
+import { readDeployMeta, resolveProjectDeployTarget } from "./project-deploy-target";
+import { withLiveProjectRuntimeMutation } from "../../lib/project-runtime-lock";
+import { requireOrgServer } from "../../lib/server-target";
+export { resolveProjectDeployTarget } from "./project-deploy-target";
 
 /**
  * Mass-assignment allow-list for PATCH /projects/:id — the exact set of
@@ -105,6 +117,7 @@ const GIT_SOURCE_IDENTITY_KEYS = new Set([
   "gitOwner",
   "gitRepo",
   "installationId",
+  "releaseSource",
 ]);
 
 /**
@@ -128,60 +141,6 @@ type EnsureProjectBody = TEnsureProjectBody;
 type ParsedComposeServiceInput = NonNullable<EnsureProjectBody["services"]>[number];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/** Where a project runs, for every read surface. This is the one place that
- *  resolution happens, so enrichProject, its batch variant, and getGitInfo cannot
- *  answer it differently. Server *name* resolution stays at the call site because
- *  single vs batch fetch it differently (one `server.get` vs a prefetched map).
- *
- *  The target is DERIVED (`deriveProjectDeployTarget`) from the cloud binding and the
- *  server id resolved here, NOT read from `meta.deployTarget` as it used to be. That
- *  snapshot is per-deploy state a fresh or partial redeploy can drop, and the drop was
- *  silent: a cloud project then reported `deployTarget: null`, which flips `isCloud`
- *  below — swapping the resource ceilings the dashboard renders — and switches off every
- *  cloud gate in the dashboard, where `deployTarget === "cloud"` IS the cloud test. It
- *  also left the two fields disagreeing, since `serverId` already coalesced to its
- *  column while the target did not. */
-function readDeployMeta(
-  p: Pick<Project, "cloudWorkspaceId" | "serverId" | "activeDeploymentId">,
-  dep: Deployment | null | undefined,
-): { deployTarget: DeployTarget | null; serverId: string | null } {
-  const meta = (dep?.meta ?? null) as { serverId?: string } | null;
-  // Snapshot first, column second, and deliberately so: meta.serverId is where the live
-  // release ACTUALLY runs, the column is where the project is bound, and this projection
-  // answers the former. The column fills in when a fresh or partial deploy dropped the
-  // snapshot, or when a deleted server nulled the column (ON DELETE SET NULL) — the same
-  // coalesce `resolveOrgServer` and `project.repo.countActiveByServer` use, so the id
-  // here names the machine a deploy would actually reach. Pinned by
-  // test/modules/projects/enrich-project-server-id.test.ts.
-  const serverId = meta?.serverId ?? p.serverId ?? null;
-  // Bound to nothing and never deployed: no target yet. Answering "local" here would be
-  // picking one on the operator's behalf — the hosting badge renders none, and the deploy
-  // wizard seeds a validated target rather than inheriting a guess from this projection.
-  if (!p.cloudWorkspaceId && !serverId && !p.activeDeploymentId) {
-    return { deployTarget: null, serverId: null };
-  }
-  const deployTarget = deriveProjectDeployTarget({ cloudWorkspaceId: p.cloudWorkspaceId, serverId });
-  // The pair must agree. A cloud-bound project can still carry a server id — from the
-  // column it was bound to before it moved, or from the snapshot of that last deploy —
-  // and emitting both is how a card ends up labelled "Cloud" while holding a server's
-  // name, or a wizard hydrates its target from one field and its destination from the
-  // other. The target won; the id it didn't come from goes.
-  return { deployTarget, serverId: deployTarget === "server" ? serverId : null };
-}
-
-/** `readDeployMeta` for callers that don't already hold the active deployment row.
- *  Exported so the project DETAIL read resolves the target through this rule instead
- *  of re-deriving it inline — the detail payload is what the deploy wizard hydrates
- *  its target from, so a second copy of the rule there is a wrong destination. */
-export async function resolveProjectDeployTarget(
-  p: Pick<Project, "cloudWorkspaceId" | "serverId" | "activeDeploymentId">,
-): Promise<{ deployTarget: DeployTarget | null; serverId: string | null }> {
-  const activeDep = p.activeDeploymentId
-    ? ((await repos.deployment.findById(p.activeDeploymentId)) ?? null)
-    : null;
-  return readDeployMeta(p, activeDep);
-}
 
 // The attention predicates live in a dependency-free leaf module so the
 // pending-actions aggregator can share them without importing this file's graph.
@@ -225,7 +184,9 @@ async function loadActiveMigration(projectId: string) {
 }
 
 /** {@link loadActiveMigration} for a whole list — ONE statement for N projects, same rules. */
-async function loadActiveMigrations(projectIds: string[]): Promise<Map<string, DockerMigrationRun>> {
+async function loadActiveMigrations(
+  projectIds: string[],
+): Promise<Map<string, DockerMigrationRun>> {
   if (!MIGRATIONS_POSSIBLE) return new Map();
   try {
     return await repos.dockerMigrationRun.findActiveForProjects(projectIds);
@@ -410,20 +371,173 @@ function projectGitUrl(owner?: string | null, repo?: string | null) {
   return owner && repo ? `https://github.com/${owner}/${repo}.git` : undefined;
 }
 
+/** Validate and normalize one complete release source before it can become a
+ * project's source identity. Keeping this at the service boundary means create,
+ * ensure and the explicit source-transition endpoint cannot persist shapes the
+ * resolver/runtime interpret differently. */
+function normalizeReleaseSource(input: ReleaseSource): ReleaseSource {
+  if (!input || typeof input !== "object") {
+    throw new ValidationError("Release source must be an object.");
+  }
+  if (input.mode !== "github" && input.mode !== "url") {
+    throw new ValidationError('Release source mode must be "github" or "url".');
+  }
+
+  let artifactKind: ReturnType<typeof releaseArtifactKind>;
+  try {
+    artifactKind = releaseArtifactKind(input);
+  } catch (err) {
+    throw new ValidationError(safeErrorMessage(err));
+  }
+
+  type ReleaseSourceStringKey = Exclude<
+    keyof ReleaseSource,
+    "mode" | "artifactKind" | "trackReleases"
+  >;
+  const optionalString = (key: ReleaseSourceStringKey): string | undefined => {
+    const value = input[key];
+    if (value === undefined) return undefined;
+    if (typeof value !== "string") {
+      throw new ValidationError(`releaseSource.${key} must be a string.`);
+    }
+    return value.trim() || undefined;
+  };
+
+  if (input.trackReleases !== undefined && typeof input.trackReleases !== "boolean") {
+    throw new ValidationError("releaseSource.trackReleases must be a boolean.");
+  }
+
+  const strings = {
+    repo: optionalString("repo"),
+    assetTemplate: optionalString("assetTemplate"),
+    imageTemplate: optionalString("imageTemplate"),
+    os: optionalString("os"),
+    arch: optionalString("arch"),
+    distUrl: optionalString("distUrl"),
+    sha256Url: optionalString("sha256Url"),
+    sha256: optionalString("sha256"),
+    versionUrl: optionalString("versionUrl"),
+    channel: optionalString("channel"),
+    pinnedVersion: optionalString("pinnedVersion"),
+  };
+
+  // Persist an explicit allow-list, not the request object. Apart from keeping
+  // imported/runtime JSON honest, this prevents a future caller from smuggling
+  // an unrelated field into releaseSource and accidentally turning it into a
+  // second source contract that only one layer understands.
+  const source: ReleaseSource = {
+    mode: input.mode,
+    ...(input.artifactKind !== undefined ? { artifactKind } : {}),
+    ...(strings.repo ? { repo: strings.repo } : {}),
+    ...(strings.assetTemplate ? { assetTemplate: strings.assetTemplate } : {}),
+    ...(strings.imageTemplate ? { imageTemplate: strings.imageTemplate } : {}),
+    ...(strings.os ? { os: strings.os } : {}),
+    ...(strings.arch ? { arch: strings.arch } : {}),
+    ...(strings.distUrl ? { distUrl: strings.distUrl } : {}),
+    ...(strings.sha256Url ? { sha256Url: strings.sha256Url } : {}),
+    ...(strings.sha256 ? { sha256: strings.sha256 } : {}),
+    ...(strings.versionUrl ? { versionUrl: strings.versionUrl } : {}),
+    ...(strings.channel ? { channel: strings.channel } : {}),
+    ...(strings.pinnedVersion ? { pinnedVersion: strings.pinnedVersion } : {}),
+    ...(input.trackReleases !== undefined ? { trackReleases: input.trackReleases } : {}),
+  };
+
+  if (source.mode === "github") {
+    const invalidRepo = validateReleaseRepository(source.repo ?? "");
+    if (invalidRepo) throw new ValidationError(invalidRepo);
+  }
+
+  if (artifactKind === "image") {
+    if (!source.imageTemplate) {
+      throw new ValidationError("A container release source requires imageTemplate.");
+    }
+    if (source.mode === "url" && !source.versionUrl && !source.pinnedVersion) {
+      throw new ValidationError(
+        "A URL-based container release requires versionUrl or pinnedVersion.",
+      );
+    }
+    if (source.versionUrl) {
+      const invalidUrl = validateReleaseVersionUrl(source.versionUrl);
+      if (invalidUrl) throw new ValidationError(invalidUrl);
+    }
+    if (
+      source.assetTemplate ||
+      source.distUrl ||
+      source.sha256Url ||
+      source.sha256 ||
+      source.os ||
+      source.arch
+    ) {
+      throw new ValidationError(
+        "Container release sources cannot include archive asset, dist, checksum, OS, or architecture fields.",
+      );
+    }
+    if (source.mode === "url" && source.repo) {
+      throw new ValidationError("A URL-based release source cannot also specify a GitHub repo.");
+    }
+    if (source.mode === "github" && source.versionUrl) {
+      throw new ValidationError("A GitHub release source cannot also specify versionUrl.");
+    }
+    try {
+      // A pinned release is already known, so validate the exact reference the
+      // first deployment will use. Dynamic sources use a representative safe
+      // tag to validate placement, placeholders and the resulting OCI shape
+      // without resolving any network source during configuration.
+      const tag = source.pinnedVersion ?? "v1.2.3";
+      renderReleaseImage(source.imageTemplate, { version: tag.replace(/^v/i, ""), tag });
+    } catch (err) {
+      throw new ValidationError(safeErrorMessage(err));
+    }
+  } else if (source.imageTemplate) {
+    throw new ValidationError(
+      'imageTemplate requires artifactKind: "image"; omitted artifactKind is the legacy archive mode.',
+    );
+  }
+
+  return source;
+}
+
 function resolveProjectSource(data: TCreateProjectBody) {
   // Release/dist source: a prebuilt dist, no git repo and no stored localPath
   // (its dir is resolved per-deploy). The source repo, if any, lives in
   // releaseSource — the project-level gitOwner/gitRepo columns stay null so the
   // commit-drift path is never taken for it.
   const isRelease = isReleaseProvider(data.gitProvider);
-  // Release/dist deploys resolve a prebuilt dir onto THIS box's filesystem
-  // (download + extract into ~/.openship) — a self-hosted runtime concern.
-  // Blocked in cloud mode, same as localPath below: the SaaS builds in Oblien
-  // sandboxes and must never write a tenant's dist onto the shared control plane.
-  if (isRelease && env.CLOUD_MODE) {
+  if (isRelease && !data.releaseSource) {
+    throw new ValidationError("A release project requires releaseSource.");
+  }
+  const releaseSource = isRelease
+    ? normalizeReleaseSource(data.releaseSource as ReleaseSource)
+    : null;
+  const isReleaseImage = releaseSource !== null && releaseArtifactKind(releaseSource) === "image";
+  if (
+    isReleaseImage &&
+    (data.projectType === "services" || data.composePath || isServicesFramework(data.framework))
+  ) {
+    throw new ValidationError(
+      "A project-level release image deploys one app; configure images on individual services for a multi-service project.",
+    );
+  }
+  const releaseWorkload = isReleaseImage
+    ? resolveWorkloadColumns({
+        workloadType: data.workloadType,
+        hasServer: data.hasServer,
+        productionMode: data.productionMode,
+      })
+    : null;
+  if (releaseWorkload?.workloadType === "static") {
+    throw new ValidationError(
+      "A prebuilt container image must be configured as a web app or worker, not a static site.",
+    );
+  }
+  // Archive releases resolve a prebuilt dir onto THIS box's filesystem and are
+  // therefore self-hosted-only. Container releases are materialized by the
+  // selected runtime (Docker pull / Cloud image workspace) and are cloud-safe.
+  if (isRelease && env.CLOUD_MODE && releaseArtifactKind(releaseSource!) === "archive") {
     throw new ForbiddenError("Release/dist source projects are not available in cloud mode");
   }
-  const safeLocalPath = !isRelease && data.localPath && !env.CLOUD_MODE ? data.localPath : undefined;
+  const safeLocalPath =
+    !isRelease && data.localPath && !env.CLOUD_MODE ? data.localPath : undefined;
   const gitOwner = isRelease || safeLocalPath ? undefined : data.gitOwner;
   const gitRepo = isRelease || safeLocalPath ? undefined : data.gitRepo;
 
@@ -433,7 +547,7 @@ function resolveProjectSource(data: TCreateProjectBody) {
     gitRepo,
     gitProvider: isRelease ? "release" : safeLocalPath ? "local" : (data.gitProvider ?? "github"),
     gitUrl: projectGitUrl(gitOwner, gitRepo),
-    releaseSource: isRelease ? ((data.releaseSource as ReleaseSource | undefined) ?? null) : null,
+    releaseSource,
   };
 }
 
@@ -462,11 +576,7 @@ function environmentNameFromSlug(slug: string) {
   );
 }
 
-async function ensureProjectApp(
-  data: TCreateProjectBody,
-  slug: string,
-  organizationId: string,
-) {
+async function ensureProjectApp(data: TCreateProjectBody, slug: string, organizationId: string) {
   let app = await repos.projectGroup.findBySlugInOrg(organizationId, slug);
   if (app) return { app, created: false };
 
@@ -544,17 +654,23 @@ function buildProductionProjectInput(
   organizationId: string,
 ): Omit<NewProject, "id"> {
   const source = resolveProjectSource(data);
+  const isReleaseImage =
+    source.releaseSource !== null && releaseArtifactKind(source.releaseSource) === "image";
   // Workload triad, resolved once. Absent any axis signal a new project is a web
   // app (hasServer=true / host) — the historical create default.
   const workload = resolveWorkloadColumns({
     workloadType: data.workloadType,
     hasServer: data.hasServer,
     productionMode: data.productionMode,
-  }) ?? { workloadType: "web" as WorkloadType, hasServer: true, productionMode: "host" as ProductionMode };
-
+  }) ?? {
+    workloadType: "web" as WorkloadType,
+    hasServer: true,
+    productionMode: "host" as ProductionMode,
+  };
   return {
     organizationId,
     groupId,
+    serverId: data.serverId ?? null,
     name: data.name,
     slug,
     environmentName: "Production",
@@ -585,16 +701,14 @@ function buildProductionProjectInput(
     productionMode: workload.productionMode,
     port: data.port ?? 3000,
     hasServer: workload.hasServer,
-    hasBuild: data.hasBuild ?? true,
+    hasBuild: isReleaseImage ? false : (data.hasBuild ?? true),
     workloadType: workload.workloadType,
     // Source/build axes are explicit OVERRIDES only — null means "derive at
     // read time from framework/source", which is what every existing row does.
-    sourceKind: data.sourceKind ?? null,
-    buildKind: data.buildKind ?? null,
+    sourceKind: isReleaseImage ? "image" : (data.sourceKind ?? null),
+    buildKind: isReleaseImage ? "prebuilt" : (data.buildKind ?? null),
     workspacePrepareCommand:
-      data.projectType === "monorepo"
-        ? data.monorepoWorkspace?.prepareCommand ?? null
-        : null,
+      data.projectType === "monorepo" ? (data.monorepoWorkspace?.prepareCommand ?? null) : null,
     routingConfig: data.routingConfig ?? null,
     rollbackWindow:
       data.rollbackWindow !== undefined ? normalizeRollbackWindow(data.rollbackWindow) : null,
@@ -616,14 +730,13 @@ function buildProductionProjectInput(
     // not supported on the bare runtime". Git apps/monorepos stay null (chosen at
     // deploy time).
     runtimeMode:
-      data.projectType === "services" || data.projectType === "docker" ? "docker" : null,
+      isReleaseImage || data.projectType === "services" || data.projectType === "docker"
+        ? "docker"
+        : null,
   };
 }
 
-async function persistMonorepoApps(
-  projectId: string,
-  data: TCreateProjectBody,
-): Promise<void> {
+async function persistMonorepoApps(projectId: string, data: TCreateProjectBody): Promise<void> {
   if (data.projectType !== "monorepo" || !data.monorepoApps?.length) return;
 
   // #336: monorepo rows are masked on read too (withDrift has no kind filter),
@@ -666,7 +779,7 @@ async function persistMonorepoApps(
       domainType: app.domainType ?? "free",
       environment: hasMaskedValue(app.environment)
         ? unmaskEnv(app.environment, storedEnvByName.get(app.name) ?? null)
-        : app.environment ?? {},
+        : (app.environment ?? {}),
     })),
   );
 }
@@ -736,7 +849,13 @@ async function persistComposeServices(
     });
   }
 
-  await repos.service.syncFromCompose(projectId, services);
+  // The ensure contract requires the FULL freshly scanned compose service list
+  // (and already removes rows missing from it), so it is authoritative about
+  // compose-owned fields too. In particular, omitting `buildArgs` after removing
+  // the whole `args:` key must clear stale values rather than replay them.
+  await repos.service.syncFromCompose(projectId, services, {
+    composeAuthoritative: true,
+  });
 }
 
 async function createProductionProject(
@@ -744,6 +863,14 @@ async function createProductionProject(
   slug: string,
   organizationId: string,
 ) {
+  // A server id is a host-root capability, not an arbitrary foreign key. Verify
+  // it through the same org-scoped repository used by deployment preflight,
+  // and do it before ensureProjectApp writes anything so a rejected binding is
+  // atomic (no orphan project-group row).
+  if (data.serverId) {
+    await requireOrgServer(data.serverId, organizationId);
+  }
+
   // Multi-tenant SaaS: never trust a client-supplied installationId. It binds the
   // project to a GitHub App installation, and the push-webhook fan-out deploys by
   // matching project.installationId to the DELIVERY's installation (webhook-push.ts
@@ -760,7 +887,11 @@ async function createProductionProject(
   // force-enables autoDeploy. Same shape as every other gate we have had to move:
   // put it where the row is written, not on one of the roads leading there.
   // (linkProjectRepo resolves it server-side on its own path.)
-  if (env.CLOUD_MODE) {
+  if (
+    env.CLOUD_MODE ||
+    getWebhookStrategy() === "app" ||
+    (await hasActiveGitHubSource(organizationId).catch(() => false))
+  ) {
     const owner = data.gitOwner?.trim();
     data.installationId = owner
       ? ((await getInstallationIdByOrg(organizationId, owner)) ?? undefined)
@@ -791,12 +922,15 @@ async function createProductionProject(
     ...((data as Partial<EnsureProjectBody>).services ?? []),
   ]);
   const { app, created: appCreated } = await ensureProjectApp(data, slug, organizationId);
-  const routing = deriveNextProjectRouteState({
-    slug,
-  }, {
-    nextPublicEndpoints: data.publicEndpoints,
-    slug,
-  });
+  const routing = deriveNextProjectRouteState(
+    {
+      slug,
+    },
+    {
+      nextPublicEndpoints: data.publicEndpoints,
+      slug,
+    },
+  );
 
   try {
     const created = await repos.project.create(
@@ -910,78 +1044,218 @@ export async function linkProjectRepo(
   const { organizationId } = ctx;
   const owner = input.owner?.trim();
   const repo = input.repo?.trim();
-  if (!owner || !repo) return { ok: false, code: "invalid", message: "owner and repo are required" };
+  if (!owner || !repo)
+    return { ok: false, code: "invalid", message: "owner and repo are required" };
 
+  const result = await withLiveProjectRuntimeMutation(
+    projectId,
+    async (project): Promise<LinkProjectRepoOutcome> => {
+      try {
+        assertResourceInOrg(project, "Project", organizationId, projectId);
+      } catch {
+        return { ok: false, code: "not_found" } as const;
+      }
+
+      const sourceWebBaseUrl = await resolveGitHubWebBaseUrl(organizationId, owner).catch(
+        () => null,
+      );
+      const gitUrl = sourceWebBaseUrl
+        ? `${sourceWebBaseUrl.replace(/\/+$/, "")}/${owner}/${repo}.git`
+        : projectGitUrl(owner, repo);
+      const defaultBranch = await resolveDefaultBranch(ctx, owner, repo, input.branch);
+      // A project_app is one source identity even if an old/partial write left its
+      // environments inconsistent. Linking Git converges the whole group, so clear
+      // release-only class overrides when ANY sibling still carries that source.
+      const leavingReleaseSource = project!.groupId
+        ? (await repos.project.listByGroup(project!.groupId)).some((sibling) =>
+            isReleaseProvider(sibling.gitProvider),
+          )
+        : isReleaseProvider(project!.gitProvider);
+
+      const gitFields: Record<string, unknown> = {
+        gitProvider: "github",
+        gitOwner: owner,
+        gitRepo: repo,
+        gitBranch: defaultBranch,
+        gitUrl,
+        // Source transition: a Git repo and a release image are mutually exclusive.
+        // Clear every release-only/clone-bypass override atomically so the next
+        // deploy derives its normal source/build class from the linked repository.
+        releaseSource: null,
+        localPath: null,
+        sourceKind: null,
+        // Release projects deliberately override these columns to describe a
+        // prebuilt artifact. Clear those overrides when (and only when) leaving a
+        // release source. Relinking an ordinary Git/local project must retain its
+        // intentional Docker/build/runtime settings.
+        ...(leavingReleaseSource
+          ? { buildKind: null, hasBuild: true, runtimeMode: null, startCommand: null }
+          : {}),
+        webhookId: null,
+        installationId: null,
+        autoDeploy: false,
+      };
+
+      const strategy = await resolveWebhookStrategy(project!, organizationId);
+
+      if (strategy === "app") {
+        const resolvedInstId = await getInstallationIdByOrg(organizationId, owner);
+        if (!resolvedInstId) {
+          const install = await resolveInstallUrl(ctx);
+          return { ok: false, code: "app_not_installed", owner, installUrl: install.url };
+        }
+        gitFields.installationId = resolvedInstId;
+        gitFields.autoDeploy = true;
+      } else if (strategy === "domain" || strategy === "repo") {
+        // Register/reuse the repo webhook via the SHARED reconciler (org+repo scoped,
+        // deactivates a superseded hook, fans the webhookId across same-repo projects)
+        // — the exact path setAutoDeploy uses, instead of a bespoke registerWebhook.
+        // A failure just means no auto-deploy yet; the link still succeeds and the
+        // user can enable it later.
+        const webhookUrl =
+          strategy === "domain" ? domainWebhookUrl(project!.webhookDomain!) : undefined;
+        const hookId = await ensureSharedWebhook(ctx, project!, owner, repo, webhookUrl).catch(
+          () => null,
+        );
+        if (hookId) {
+          gitFields.webhookId = hookId;
+          gitFields.autoDeploy = true;
+        }
+      }
+
+      if (project!.groupId) {
+        const sharedGitFields = {
+          gitProvider: "github",
+          gitOwner: owner,
+          gitRepo: repo,
+          gitUrl,
+          installationId:
+            typeof gitFields.installationId === "number"
+              ? gitFields.installationId
+              : (input.installationId ?? null),
+          releaseSource: null,
+          localPath: null,
+          sourceKind: null,
+          ...(leavingReleaseSource
+            ? { buildKind: null, hasBuild: true, runtimeMode: null, startCommand: null }
+            : {}),
+          webhookId: typeof gitFields.webhookId === "number" ? gitFields.webhookId : null,
+          autoDeploy: Boolean(gitFields.autoDeploy),
+        };
+        await repos.project.updateSourceByApp(project!.groupId, sharedGitFields, {
+          gitProvider: "github",
+          gitOwner: owner,
+          gitRepo: repo,
+          gitUrl,
+          installationId: sharedGitFields.installationId,
+        });
+        // Environments intentionally keep their own branches; only the environment
+        // the operator linked adopts the selected/default branch.
+        await repos.project.update(projectId, { gitBranch: defaultBranch });
+      } else {
+        await repos.project.update(projectId, gitFields);
+      }
+
+      return {
+        ok: true,
+        owner,
+        repo,
+        branch: defaultBranch,
+        strategy,
+        autoDeploy: !!gitFields.autoDeploy,
+      };
+    },
+  );
+
+  return result ?? { ok: false, code: "not_found" };
+}
+
+/** Atomically transition a whole project-environment group to a tracked
+ * prebuilt container release. This is intentionally separate from generic
+ * PATCH: source identity spans several columns and must never be half-written. */
+export async function setProjectReleaseImageSource(
+  projectId: string,
+  organizationId: string,
+  input: TSetReleaseSourceBody,
+) {
   const project = await repos.project.findById(projectId);
-  try {
-    assertResourceInOrg(project, "Project", organizationId, projectId);
-  } catch {
-    return { ok: false, code: "not_found" };
+  assertResourceInOrg(project, "Project", organizationId, projectId);
+
+  const source = normalizeReleaseSource(input as ReleaseSource);
+  if (releaseArtifactKind(source) !== "image") {
+    throw new ValidationError('artifactKind must be "image" for this source transition.');
   }
 
-  const gitUrl = projectGitUrl(owner, repo);
-  const defaultBranch = await resolveDefaultBranch(ctx, owner, repo, input.branch);
-
-  const gitFields: Record<string, unknown> = {
-    gitProvider: "github",
-    gitOwner: owner,
-    gitRepo: repo,
-    gitBranch: defaultBranch,
-    gitUrl,
-  };
-
-  const strategy = await resolveWebhookStrategy(project!);
-
-  if (strategy === "app") {
-    const resolvedInstId = await getInstallationIdByOrg(organizationId, owner);
-    if (!resolvedInstId) {
-      return { ok: false, code: "app_not_installed", owner, installUrl: getInstallUrl() };
+  const siblings = project!.groupId
+    ? await repos.project.listByGroup(project!.groupId)
+    : [project!];
+  for (const sibling of siblings) {
+    if (sibling.composePath?.trim() || isServicesFramework(sibling.framework)) {
+      throw new ValidationError(
+        `Environment "${sibling.environmentName ?? sibling.name}" is configured for multiple services. Configure release images on its individual services instead.`,
+      );
     }
-    gitFields.installationId = resolvedInstId;
-    gitFields.autoDeploy = true;
-  } else if (strategy === "domain" || strategy === "repo") {
-    // Register/reuse the repo webhook via the SHARED reconciler (org+repo scoped,
-    // deactivates a superseded hook, fans the webhookId across same-repo projects)
-    // — the exact path setAutoDeploy uses, instead of a bespoke registerWebhook.
-    // A failure just means no auto-deploy yet; the link still succeeds and the
-    // user can enable it later.
-    const webhookUrl =
-      strategy === "domain" ? domainWebhookUrl(project!.webhookDomain!) : undefined;
-    const hookId = await ensureSharedWebhook(ctx, project!, owner, repo, webhookUrl).catch(
-      () => null,
-    );
-    if (hookId) {
-      gitFields.webhookId = hookId;
-      gitFields.autoDeploy = true;
+    if (resolveWorkload(sibling.workloadType, sibling.hasServer) === "static") {
+      throw new ValidationError(
+        `Environment "${sibling.environmentName ?? sibling.name}" is static. Change it to a web app or worker before selecting a container image source.`,
+      );
+    }
+  }
+  const serviceSets = await Promise.all(
+    siblings.map((sibling) => repos.service.listByProject(sibling.id)),
+  );
+  for (const services of serviceSets) {
+    const enabledServices = services.filter((service) => service.enabled !== false);
+    if (enabledServices.length > 0) {
+      throw new ValidationError(
+        "A project-level release image deploys one app. Remove or disable project services, or configure release images per service.",
+      );
     }
   }
 
-  await repos.project.update(projectId, gitFields);
+  const isExistingReleaseImage = siblings.every(
+    (sibling) =>
+      isReleaseProvider(sibling.gitProvider) &&
+      sibling.releaseSource !== null &&
+      releaseArtifactKind(sibling.releaseSource as ReleaseSource) === "image",
+  );
+  const releaseFields = {
+    gitProvider: "release",
+    gitOwner: null,
+    gitRepo: null,
+    gitUrl: null,
+    installationId: null,
+    localPath: null,
+    releaseSource: source,
+    sourceKind: "image",
+    buildKind: "prebuilt",
+    hasBuild: false,
+    runtimeMode: "docker",
+    // On the initial source transition, a command from Git/local is not an
+    // image override, so clear it and preserve the image's baked-in command.
+    // On image-to-image edits, omit the column entirely: every environment may
+    // already carry an intentional command override and must retain it.
+    ...(isExistingReleaseImage ? {} : { startCommand: null }),
+    composePath: null,
+    webhookId: null,
+    webhookDomain: null,
+    autoDeploy: false,
+  } as const;
+
   if (project!.groupId) {
-    const sharedGitFields = {
-      gitProvider: "github",
-      gitOwner: owner,
-      gitRepo: repo,
-      gitUrl,
-      installationId: (gitFields.installationId as number | undefined) ?? input.installationId,
-      ...(typeof gitFields.webhookId === "number" ? { webhookId: gitFields.webhookId } : {}),
-    };
-    await repos.projectGroup.update(project!.groupId, {
-      gitProvider: "github",
-      gitOwner: owner,
-      gitRepo: repo,
-      gitUrl,
-      installationId: (gitFields.installationId as number | undefined) ?? input.installationId,
+    await repos.project.updateSourceByApp(project!.groupId, releaseFields, {
+      gitProvider: "release",
+      gitOwner: null,
+      gitRepo: null,
+      gitUrl: null,
+      installationId: null,
     });
-    const siblings = await repos.project.listByGroup(project!.groupId);
-    await Promise.all(
-      siblings
-        .filter((sibling) => sibling.id !== projectId)
-        .map((sibling) => repos.project.update(sibling.id, sharedGitFields)),
-    );
+  } else {
+    await repos.project.update(projectId, releaseFields);
   }
 
-  return { ok: true, owner, repo, branch: defaultBranch, strategy, autoDeploy: !!gitFields.autoDeploy };
+  const updated = await repos.project.findById(projectId);
+  return enrichProject(updated!);
 }
 
 /** Exported for the project CLONE, which needs the same "-2, -3, …" rule a fresh project gets —
@@ -1097,7 +1371,10 @@ async function findProjectByAppSlug(
  */
 export async function assertProjectQuota(organizationId: string): Promise<void> {
   if (!env.CLOUD_MODE) {
-    const { total } = await repos.projectGroup.listByOrganization(organizationId, { page: 1, perPage: 1 });
+    const { total } = await repos.projectGroup.listByOrganization(organizationId, {
+      page: 1,
+      perPage: 1,
+    });
     if (total >= SYSTEM.PROJECTS.MAX_PER_USER) {
       throw new ValidationError(`Project limit reached (${SYSTEM.PROJECTS.MAX_PER_USER})`);
     }
@@ -1106,7 +1383,10 @@ export async function assertProjectQuota(organizationId: string): Promise<void> 
 
   const planCap = await planProjectLimit(organizationId);
   const cap = planCap ?? env.CLOUD_MAX_PROJECTS_PER_USER;
-  const { total } = await repos.projectGroup.listByOrganization(organizationId, { page: 1, perPage: 1 });
+  const { total } = await repos.projectGroup.listByOrganization(organizationId, {
+    page: 1,
+    perPage: 1,
+  });
   if (total >= cap) {
     throw new PlanUpgradeRequiredError(
       `Your plan includes ${cap} projects and you're using ${total}. Upgrade to add more.`,
@@ -1116,10 +1396,7 @@ export async function assertProjectQuota(organizationId: string): Promise<void> 
   }
 }
 
-export async function ensureProject(
-  data: EnsureProjectBody,
-  organizationId: string,
-) {
+export async function ensureProject(data: EnsureProjectBody, organizationId: string) {
   const nameSlug = slugify(data.name);
   const desiredSlug = data.slug || nameSlug;
 
@@ -1141,11 +1418,7 @@ export async function ensureProject(
     // No existing match → this ensure will create. Enforce the cap here too
     // (the folder-upload deploy flow reaches creation only through ensure).
     await assertProjectQuota(organizationId);
-    project = await createProductionProject(
-      data,
-      desiredSlug,
-      organizationId,
-    );
+    project = await createProductionProject(data, desiredSlug, organizationId);
     created = true;
   } else {
     // Defensive: if we matched an existing project but its org_id doesn't
@@ -1281,10 +1554,10 @@ export async function listProjects(
 
   // organizationId is required across the codebase — the route-level
   // requirePermission middleware ensures it's set before the controller runs.
-  const { rows: projects } = await repos.project.listByOrganization(
-    organizationId,
-    { page: 1, perPage: 1000 },
-  );
+  const { rows: projects } = await repos.project.listByOrganization(organizationId, {
+    page: 1,
+    perPage: 1000,
+  });
 
   const byGroup = new Map<string, Project[]>();
   for (const p of projects) {
@@ -1315,10 +1588,7 @@ export async function getProject(projectId: string, organizationId: string) {
 // ─── Create project ──────────────────────────────────────────────────────────
 
 /** @scope org — only reads organizationId as a DB key. */
-export async function createProject(
-  data: TCreateProjectBody,
-  organizationId: string,
-) {
+export async function createProject(data: EnsureProjectBody, organizationId: string) {
   const slug = slugify(data.name);
 
   await assertProjectQuota(organizationId);
@@ -1329,11 +1599,41 @@ export async function createProject(
   // installationId is resolved server-side inside createProductionProject, which
   // both creating entry points share — see the comment there.
   const p = await createProductionProject(data, slug, organizationId);
+  // Keep create and ensure on the same compose persistence helper. Most create
+  // callers carry no services and this is a no-op; scanner-backed local imports
+  // carry the canonical unmasked rows and must materialize them immediately.
+  await persistComposeServices(p.id, organizationId, data);
 
   return enrichProject(p);
 }
 
 // ─── Update project ──────────────────────────────────────────────────────────
+
+/**
+ * Re-emit the complete live route surface in its required last-writer order.
+ * Project-level rows establish the base vhosts; service/composite/fan-out
+ * registrations then replace only the hostnames whose richer topology they own.
+ * Both halves are best-effort because the project edit is already persisted.
+ */
+async function reapplyCompleteProjectRouting(
+  project: Project,
+  previousHostnames: string[],
+  options?: Parameters<typeof reapplyProjectLiveRoutes>[2],
+) {
+  const projectRoutes = options
+    ? reapplyProjectLiveRoutes(project, previousHostnames, options)
+    : reapplyProjectLiveRoutes(project, previousHostnames);
+  await projectRoutes.catch((err) =>
+    console.warn(
+      `[updateProject] project route re-apply failed (non-fatal, applies next deploy): ${safeErrorMessage(err)}`,
+    ),
+  );
+  await applyProjectRouting(project.id).catch((err) =>
+    console.warn(
+      `[updateProject] service/topology route re-apply failed (non-fatal, applies next deploy): ${safeErrorMessage(err)}`,
+    ),
+  );
+}
 
 export async function updateProject(
   projectId: string,
@@ -1404,9 +1704,7 @@ export async function updateProject(
     update.routeStrategy !== undefined &&
     !["auto", "loopback-port", "container-ip"].includes(update.routeStrategy as string)
   ) {
-    throw new ValidationError(
-      "routeStrategy must be 'auto', 'loopback-port', or 'container-ip'",
-    );
+    throw new ValidationError("routeStrategy must be 'auto', 'loopback-port', or 'container-ip'");
   }
 
   // ── monorepoSharedPaths validation ──────────────────────────────────
@@ -1415,11 +1713,8 @@ export async function updateProject(
   // deployable service would force-rebuild every service on every push
   // to web (defeating the point of smart per-service deploys).
   if (data.monorepoSharedPaths !== undefined && data.monorepoSharedPaths !== null) {
-    const normalize = (s: string) =>
-      s.trim().replace(/^\/+/, "").replace(/\/+$/, "").toLowerCase();
-    const prefixes = data.monorepoSharedPaths
-      .map(normalize)
-      .filter((s) => s.length > 0);
+    const normalize = (s: string) => s.trim().replace(/^\/+/, "").replace(/\/+$/, "").toLowerCase();
+    const prefixes = data.monorepoSharedPaths.map(normalize).filter((s) => s.length > 0);
     if (prefixes.length > 0) {
       const services = await repos.service.listByProject(projectId).catch(() => []);
       const serviceRoots = services
@@ -1427,7 +1722,8 @@ export async function updateProject(
         .filter((s) => s.length > 0);
       const overlap = prefixes.find((prefix) =>
         serviceRoots.some(
-          (root) => root === prefix || root.startsWith(`${prefix}/`) || prefix.startsWith(`${root}/`),
+          (root) =>
+            root === prefix || root.startsWith(`${prefix}/`) || prefix.startsWith(`${root}/`),
         ),
       );
       if (overlap) {
@@ -1443,9 +1739,7 @@ export async function updateProject(
   // ── defaultRollbackStrategy ────────────────────────────────────────
   if (data.defaultRollbackStrategy !== undefined) {
     if (data.defaultRollbackStrategy !== "git" && data.defaultRollbackStrategy !== "snapshot") {
-      throw new ValidationError(
-        `defaultRollbackStrategy must be "git" or "snapshot"`,
-      );
+      throw new ValidationError(`defaultRollbackStrategy must be "git" or "snapshot"`);
     }
     update.defaultRollbackStrategy = data.defaultRollbackStrategy;
   }
@@ -1460,9 +1754,7 @@ export async function updateProject(
     } else {
       const alias = normalizeAliasStrict(String(data.internalAlias));
       if (!alias) {
-        throw new ValidationError(
-          "internalAlias must contain at least one letter or digit",
-        );
+        throw new ValidationError("internalAlias must contain at least one letter or digit");
       }
       // Reject an internalAlias that collides with a sidecar service's name or
       // custom alias on this project's network (embedded DNS is first-match).
@@ -1492,7 +1784,9 @@ export async function updateProject(
   // No slug term: the slug is immutable here (PROJECT_IDENTITY_KEYS), so a rename
   // never re-syncs routes — which is the point. Its hostname is edited as a domain.
   const routesReapplied =
-    data.publicEndpoints !== undefined || update.port !== undefined;
+    data.publicEndpoints !== undefined ||
+    update.port !== undefined ||
+    (update.routeStrategy !== undefined && update.routeStrategy !== p.routeStrategy);
   if (routesReapplied) {
     // Snapshot the live hostnames before the sync so re-application can tear
     // down any the edit drops — AND so the free-cloud gate only fires for
@@ -1512,10 +1806,7 @@ export async function updateProject(
       // (the latter also covers a PENDING route that has no domain row yet), so a
       // remaining pending route is never mistaken for net-new.
       const priorHosts = new Set(
-        [
-          ...previousHostnames,
-          ...(beforeState?.publicEndpoints ?? []).map((e) => e.hostname),
-        ]
+        [...previousHostnames, ...(beforeState?.publicEndpoints ?? []).map((e) => e.hostname)]
           .filter((h): h is string => typeof h === "string" && h.length > 0)
           .map((h) => h.trim().toLowerCase()),
       );
@@ -1543,70 +1834,47 @@ export async function updateProject(
     }
 
     // Re-apply the live route so a domain/port edit takes effect without a
-    // redeploy. Remote routing can take longer than the dashboard's request
-    // timeout (SSH connection + route removal/registration), while the domain
-    // rows above are already canonical. Keep this best-effort work in the
-    // background so the mutation can return success as soon as persistence is
-    // complete instead of surfacing a false client-side timeout.
-    const refreshed = await repos.project.findById(projectId);
-    if (refreshed) {
-      void (async () => {
-        // `managedEdgeSyncedByCaller`: the `syncProjectManagedEdge` below already
-        // covers every managed hostname on the project, including the ones added by
-        // this edit. Letting the re-apply sync them too raced its own follow-up —
-        // two challenges for one target, the second resetting the first's token.
-        await reapplyProjectLiveRoutes(refreshed, previousHostnames, {
-          managedEdgeSyncedByCaller: true,
+    // redeploy. This MUST be awaited and serialized with teardown: a detached
+    // SSH writer could otherwise start before DELETE, finish after DELETE, and
+    // recreate a vhost after its project/orphan record was gone.
+    await withLiveProjectRuntimeMutation(projectId, async (refreshed) => {
+      // `managedEdgeSyncedByCaller`: the `syncProjectManagedEdge` below already
+      // covers every managed hostname on the project, including the ones added by
+      // this edit. Letting the re-apply sync them too raced its own follow-up —
+      // two challenges for one target, the second resetting the first's token.
+      await reapplyCompleteProjectRouting(refreshed, previousHostnames, {
+        managedEdgeSyncedByCaller: true,
+      });
+      // A free (*.opsh.io) domain resolves only through Openship Cloud's edge.
+      // reapplyProjectLiveRoutes handles the self-hosted OpenResty side; the
+      // managed edge must be re-registered too or an edited/added free URL
+      // 404s with no signal. Only meaningful once deployed (no live target
+      // otherwise — the next deploy syncs). On failure this sets
+      // meta.edgeUnsynced so the project surfaces "Retry routing" instead of
+      // silently returning a dead URL.
+      if (refreshed.activeDeploymentId) {
+        await syncProjectManagedEdge(refreshed, organizationId, {
+          markOnFailure: true,
         }).catch((err) =>
           console.warn(
-            `[updateProject] live route re-apply failed (non-fatal): ${safeErrorMessage(err)}`,
+            `[updateProject] managed edge sync failed (non-fatal): ${safeErrorMessage(err)}`,
           ),
         );
-        // A free (*.opsh.io) domain resolves only through Openship Cloud's edge.
-        // reapplyProjectLiveRoutes handles the self-hosted OpenResty side; the
-        // managed edge must be re-registered too or an edited/added free URL
-        // 404s with no signal. Only meaningful once deployed (no live target
-        // otherwise — the next deploy syncs). On failure this sets
-        // meta.edgeUnsynced so the project surfaces "Retry routing" instead of
-        // silently returning a dead URL.
-        if (refreshed.activeDeploymentId) {
-          await syncProjectManagedEdge(refreshed, organizationId, {
-            markOnFailure: true,
-          }).catch((err) =>
-            console.warn(
-              `[updateProject] managed edge sync failed (non-fatal): ${safeErrorMessage(err)}`,
-            ),
-          );
-        }
-      })();
-    }
+      }
+    });
   }
 
   // Editing the vercel.json routing (rewrites/redirects/headers) re-applies it to
   // the live deployment without a rebuild — the routing counterpart to the
   // domain/port re-sync above. Self-hosted → OpenResty, cloud → the Oblien edge;
   // best-effort internally.
-  if (data.routingConfig !== undefined) {
-    await applyProjectRouting(projectId);
-    // `applyProjectRouting` only emits the COMPOSITE (1 static + 1 server) and migration
-    // fan-out shapes — for a single-app or lone-static project it builds no registers and
-    // returns having written nothing, so the Domains-tab save reported success and changed
-    // nothing on the edge. The per-domain path is what carries the rules for those, so run
-    // it here.
-    //
-    // Skipped when the block above already queued one: that re-apply is fire-and-forget,
-    // and two writers on one vhost can interleave their snapshot/rollback — the loser
-    // restores a file the winner had already replaced.
-    if (!routesReapplied) {
-      const forRouting = await repos.project.findById(projectId);
-      if (forRouting) {
-        await reapplyProjectLiveRoutes(forRouting, []).catch((err) =>
-          console.warn(
-            `[updateProject] routing re-apply failed (non-fatal, applies next deploy): ${safeErrorMessage(err)}`,
-          ),
-        );
-      }
-    }
+  // Skipped when the block above already queued the complete ordered pass:
+  // concurrent writers on one vhost can interleave snapshot/rollback, and the
+  // loser may restore a file the winner already replaced.
+  if (data.routingConfig !== undefined && !routesReapplied) {
+    await withLiveProjectRuntimeMutation(projectId, async (forRouting) => {
+      await reapplyCompleteProjectRouting(forRouting, []);
+    });
   }
 
   if (p.groupId) {
@@ -1628,10 +1896,7 @@ export async function updateProject(
 
 // ─── Project environments ───────────────────────────────────────────────────
 
-export async function listProjectEnvironments(
-  projectId: string,
-  organizationId: string,
-) {
+export async function listProjectEnvironments(projectId: string, organizationId: string) {
   const p = await repos.project.findById(projectId);
   assertResourceInOrg(p, "Project", organizationId, projectId);
 
@@ -1699,7 +1964,9 @@ export async function createProjectEnvironment(
     const branches = await listGitHubBranches(ctx, base.gitOwner, base.gitRepo);
     const exists = branches.some((branch) => branch.name === gitBranch);
     if (!exists) {
-      throw new ValidationError(`Branch "${gitBranch}" was not found for ${base.gitOwner}/${base.gitRepo}`);
+      throw new ValidationError(
+        `Branch "${gitBranch}" was not found for ${base.gitOwner}/${base.gitRepo}`,
+      );
     }
   }
 
@@ -1725,6 +1992,7 @@ export async function createProjectEnvironment(
     gitBranch,
     gitUrl: app?.gitUrl ?? base.gitUrl,
     installationId: app?.installationId ?? base.installationId,
+    releaseSource: base.releaseSource,
     framework: base.framework,
     packageManager: base.packageManager,
     installCommand: base.installCommand,
@@ -1740,6 +2008,10 @@ export async function createProjectEnvironment(
     port: base.port,
     hasServer: base.hasServer,
     hasBuild: base.hasBuild,
+    sourceKind: base.sourceKind,
+    buildKind: base.buildKind,
+    workloadType: base.workloadType,
+    runtimeMode: base.runtimeMode,
     resources: base.resources,
     buildResources: base.buildResources,
     sleepMode: base.sleepMode,
@@ -1751,17 +2023,28 @@ export async function createProjectEnvironment(
     autoDeploy: base.autoDeploy,
   });
 
-  const baseRouteState = await resolveProjectRouteState(base);
-  const environmentEndpoints = deriveEnvironmentPublicEndpoints(
-    baseRouteState.publicEndpoints,
-    projectSlug,
-  );
-  // Every environment mints its OWN free subdomain, so this path could walk an
-  // org past its allowance one environment at a time — it had neither the Cloud
-  // gate nor the quota check the project create/update paths have.
-  await assertFreeEndpointsAllowed(organizationId, environmentEndpoints);
-  await persistProjectRouteState(created.id, environmentEndpoints);
-
+  // NOTHING runs between the create above and this return, and that is the point.
+  //
+  // This used to derive a free subdomain for the new environment and then call
+  // `assertFreeEndpointsAllowed` — AFTER `repos.project.create` had already
+  // committed. On a Cloud-disconnected instance that gate throws, so the request
+  // answered 400 while leaving a real environment row behind: the retry then hit
+  // the `existing` check above ("already exists"), and a reload showed a
+  // switchable, half-built environment with no routing. One failed click produced
+  // three separate symptoms.
+  //
+  // `createProject` states the rule this violated, a few hundred lines up: gate
+  // "BEFORE any group/project row is written … so a rejected create leaves nothing
+  // behind". It also exempts exactly this case — "the auto-derived default is
+  // deliberately NOT gated: that path must keep working on a self-hosted
+  // instance" — which the old code ignored, refusing the operator over a domain
+  // they never asked for.
+  //
+  // So an environment is now born with no endpoints, and routing arrives where it
+  // arrives for every other workload: `build.service.ts` mints
+  // `defaultFreeEndpoint(project)` on deploy and pushes it through
+  // `syncProjectRouteState`, on the path that actually carries the Cloud and quota
+  // gates. Deferring it makes the failure unreachable rather than handled.
   return environmentSummary(created);
 }
 
@@ -1861,7 +2144,14 @@ export function releaseSourceKey(p: Project): string {
   if (!isReleaseProvider(p.gitProvider)) return `self:${p.appTemplateId ?? ""}`;
   const s = (p.releaseSource as ReleaseSource | null) ?? null;
   if (!s) return "none";
-  return [s.mode, s.repo ?? "", s.versionUrl ?? "", s.pinnedVersion ?? ""].join("|");
+  return [
+    s.mode,
+    releaseArtifactKind(s),
+    s.repo ?? "",
+    s.versionUrl ?? "",
+    s.pinnedVersion ?? "",
+    s.imageTemplate ?? "",
+  ].join("|");
 }
 
 /** Image services whose upstream digest is worth resolving (image-only, enabled). */
@@ -1932,7 +2222,7 @@ export async function resolveUpstreamDrift(
     const source = (p.releaseSource as ReleaseSource | null) ?? null;
     if (!source) return { supported: false };
     const latestVersion = source.pinnedVersion
-      ? source.pinnedVersion.replace(/^v/, "")
+      ? source.pinnedVersion.replace(/^v/i, "")
       : await resolveLatestVersion(source);
     return {
       supported: true,
@@ -2030,7 +2320,11 @@ export async function resolveDeployedDrift(
  * private registry) or a project with no successful deploy reports
  * `behind:false`, so we never show an "outdated" nudge we can't substantiate.
  */
-export async function evaluateDrift(p: Project, upstream: UpstreamDrift) {
+export async function evaluateDrift(
+  p: Project,
+  upstream: UpstreamDrift,
+  ctx?: RequestContext | null,
+) {
   if (!upstream.supported) return { supported: false as const };
   // A cached upstream describes the source it was polled from. If the project has
   // since been repointed (different repo, branch, release source), it answers a
@@ -2046,13 +2340,22 @@ export async function evaluateDrift(p: Project, upstream: UpstreamDrift) {
     // supplied (an abbreviated `--commit`, a tag), so only a PROVABLE difference is
     // drift — otherwise a project deployed at `1eeaf76` is told a new commit
     // `1eeaf76` is available, forever. See compareCommitSha.
-    const behind = compareCommitSha(latestSha, deployedSha) === "different";
+    let behind = compareCommitSha(latestSha, deployedSha) === "different";
+    const root = normalizeProjectRootDirectory(p.rootDirectory ?? undefined);
+    if (behind && ctx && root) {
+      const compare = await compareCommits(ctx, p.gitOwner!, p.gitRepo!, deployedSha!, latestSha!);
+      if (compare && !compare.truncated) {
+        behind = projectMatchesChanges(root, compare.files, p.monorepoSharedPaths);
+      }
+    }
     // Is the latest commit already deploying? Then there's nothing to redeploy —
     // it's in flight, so the nudge is suppressed. Computed live, which is why
     // pressing Update quiets every surface immediately.
     const latestInProgress =
       behind && latestSha
-        ? Boolean(await repos.deployment.findInProgressByCommit(p.id, latestSha).catch(() => undefined))
+        ? Boolean(
+            await repos.deployment.findInProgressByCommit(p.id, latestSha).catch(() => undefined),
+          )
         : false;
     return {
       supported: true as const,
@@ -2164,11 +2467,67 @@ export async function getGitInfo(projectId: string, organizationId: string) {
   };
 }
 
-export async function setBranch(
-  projectId: string,
-  branch: string,
+/**
+ * The delivery state of push auto-deploy for one project, from its stored
+ * columns alone (no GitHub round trip).
+ *
+ * ONE resolver, because two surfaces answer "is auto-deploy wired up?": the
+ * Source tab (`GET /:id/git`) and the project payload the Overview reads
+ * (`GET /:id/info`). The Overview used to read the Source tab's slice, which is
+ * only fetched when that tab mounts — so a project whose pushes really did
+ * deploy rendered "auto-deploy off" on every cold load. Deriving it twice is how
+ * the two would start disagreeing again.
+ *
+ * `webhookActive` is about the DELIVERY PATH, not the flag: `autoDeploy` alone
+ * governs whether a received push deploys (webhook-push.ts filters on that
+ * column), while this answers whether GitHub has somewhere to deliver it.
+ */
+export type ProjectWebhookState = {
+  strategy: Awaited<ReturnType<typeof resolveWebhookStrategy>>;
+  webhookActive: boolean;
+  installationInstalled: boolean;
+  sharedWebhookId: number | null;
+};
+
+export async function resolveProjectWebhookState(
   organizationId: string,
-) {
+  project: {
+    gitOwner?: string | null;
+    gitRepo?: string | null;
+    webhookId?: number | null;
+    webhookDomain?: string | null;
+    autoDeploy?: boolean | null;
+    deployTarget?: string | null;
+  },
+): Promise<ProjectWebhookState> {
+  const strategy = await resolveWebhookStrategy(project, organizationId);
+
+  // A native App strategy delivers pushes for every target through this
+  // instance's App webhook. In cloud-proxy mode (non-App base strategy), only a
+  // cloud-target project receives pushes through the SaaS App.
+  let installationInstalled = false;
+  if (project.gitOwner && (strategy === "app" || project.deployTarget === "cloud")) {
+    installationInstalled = !!(await getInstallationIdByOrg(organizationId, project.gitOwner));
+  }
+
+  // A webhook belongs to (owner, repo), so a sibling project in the org may own
+  // the row that carries its id.
+  let sharedWebhookId = project.webhookId ?? null;
+  if (!sharedWebhookId && project.gitOwner && project.gitRepo) {
+    sharedWebhookId = await findSharedWebhookId(organizationId, project.gitOwner, project.gitRepo);
+  }
+
+  const webhookActive =
+    strategy === "app"
+      ? installationInstalled
+      : strategy === "none"
+        ? false
+        : !!(project.autoDeploy && sharedWebhookId);
+
+  return { strategy, webhookActive, installationInstalled, sharedWebhookId };
+}
+
+export async function setBranch(projectId: string, branch: string, organizationId: string) {
   const p = await repos.project.findById(projectId);
   assertResourceInOrg(p, "Project", organizationId, projectId);
 
@@ -2272,10 +2631,7 @@ export async function listProjectDeployments(
 
 // ─── Deployment session ──────────────────────────────────────────────────────
 
-export async function getLatestDeploymentSession(
-  projectId: string,
-  organizationId: string,
-) {
+export async function getLatestDeploymentSession(projectId: string, organizationId: string) {
   const p = await repos.project.findById(projectId);
   assertResourceInOrg(p, "Project", organizationId, projectId);
 
@@ -2295,4 +2651,3 @@ export async function getLatestDeploymentSession(
       : null,
   };
 }
-

@@ -7,6 +7,12 @@ const mocks = vi.hoisted(() => ({
   sseUpdateStatus: vi.fn(),
   notify: vi.fn(),
   finishBuildSession: vi.fn(async () => {}),
+  listByDeployment: vi.fn(async () => []),
+  listByProject: vi.fn(async () => []),
+  computeCleanupKeepSet: vi.fn(async () => ({
+    images: new Set<string>(),
+    containers: new Set<string>(),
+  })),
 }));
 
 // The lifecycle module transitively pulls in auth/notification wiring that reads
@@ -25,8 +31,14 @@ vi.mock("@repo/db", () => ({
       finishBuildSession: mocks.finishBuildSession,
     },
     project: { setActiveDeployment: mocks.setActiveDeployment },
-    service: { listByDeployment: vi.fn(async () => []) },
+    service: {
+      listByDeployment: mocks.listByDeployment,
+      listByProject: mocks.listByProject,
+    },
   },
+}));
+vi.mock("../projects/cleanup-keep-set", () => ({
+  computeCleanupKeepSet: mocks.computeCleanupKeepSet,
 }));
 // Terminal-event side channels, each of which drags in auth/github/mail wiring.
 vi.mock("../../lib/notification-dispatcher", () => ({ notification: { emit: mocks.notify } }));
@@ -43,7 +55,7 @@ vi.mock("./session-manager", () => ({
   endSession: vi.fn(),
 }));
 
-import { onFailure, onSuccess, setDeploymentStatus } from "./deployment-lifecycle";
+import { onCancelled, onFailure, onSuccess, setDeploymentStatus } from "./deployment-lifecycle";
 
 /**
  * A cancel is the user's last word, but cancellation is COOPERATIVE and the deploy
@@ -77,6 +89,12 @@ const ctx = {
 describe("a cancelled deployment is final", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.listByDeployment.mockResolvedValue([]);
+    mocks.listByProject.mockResolvedValue([]);
+    mocks.computeCleanupKeepSet.mockResolvedValue({
+      images: new Set<string>(),
+      containers: new Set<string>(),
+    });
   });
 
   it("onSuccess does not advance the active release when the row refuses the write", async () => {
@@ -149,5 +167,58 @@ describe("a cancelled deployment is final", () => {
     await setDeploymentStatus("d1", "deploying");
 
     expect(mocks.sseUpdateStatus).toHaveBeenCalledWith("d1", "deploying", undefined);
+  });
+
+  it("cancellation cleanup preserves carried containers from the live release", async () => {
+    const destroy = vi.fn(async () => {});
+    mocks.updateStatus.mockResolvedValue(true);
+    mocks.listByDeployment.mockResolvedValue([
+      { serviceId: "carried", containerId: "live-container" },
+      { serviceId: "created", containerId: "new-container" },
+    ] as never);
+    mocks.computeCleanupKeepSet.mockResolvedValue({
+      images: new Set<string>(),
+      containers: new Set(["live-container"]),
+    });
+
+    await onCancelled({ ...(ctx as object), runtime: { destroy } } as never, 10);
+
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(destroy).toHaveBeenCalledWith("new-container");
+    expect(destroy).not.toHaveBeenCalledWith("live-container");
+  });
+
+  it("cancellation cleanup fails closed when the live keep set is unavailable", async () => {
+    const destroy = vi.fn(async () => {});
+    mocks.updateStatus.mockResolvedValue(true);
+    mocks.listByDeployment.mockResolvedValue([
+      { serviceId: "unknown-owner", containerId: "possibly-live" },
+    ] as never);
+    mocks.computeCleanupKeepSet.mockRejectedValue(new Error("database unavailable"));
+
+    await onCancelled({ ...(ctx as object), runtime: { destroy } } as never, 10);
+
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
+  it("record-only cancellation performs no runtime cleanup", async () => {
+    const destroy = vi.fn(async () => {});
+    mocks.updateStatus.mockResolvedValue(true);
+    mocks.listByDeployment.mockResolvedValue([
+      { serviceId: "created", containerId: "new-container" },
+    ] as never);
+
+    await onCancelled(
+      {
+        ...(ctx as object),
+        runtime: { destroy },
+        provisioned: { imageRef: "img/new" },
+      } as never,
+      10,
+      { keepProvisioned: true },
+    );
+
+    expect(destroy).not.toHaveBeenCalled();
+    expect(mocks.computeCleanupKeepSet).not.toHaveBeenCalled();
   });
 });

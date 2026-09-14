@@ -8,8 +8,9 @@
  * `credential.helper`) opens a connection over an SSH *reverse* tunnel back to
  * this process and forwards git's credential request. This module answers with
  * `username=x-access-token` + the local `gh` token, for that one git operation.
- * The token lives only in the git process's memory on the remote; it is never
- * written to disk or env there.
+ * The helper can also derive a Basic header before Git's first request. The
+ * token is never written to disk or command text; that header lives only in the
+ * short-lived shell/git process environment on the remote.
  *
  * Control surface (the "controlled, secure" part):
  *   - desktop-only + explicit per-deploy opt-in (the deploy caller gates on both);
@@ -56,11 +57,7 @@ function log(
   meta: { serverId: string; sessionId: string; host?: string; owner?: string; repo?: string },
 ): void {
   // Never logs the token. One line per credential request.
-  const parts = [
-    `[git-relay] ${result}`,
-    `server=${meta.serverId}`,
-    `session=${meta.sessionId}`,
-  ];
+  const parts = [`[git-relay] ${result}`, `server=${meta.serverId}`, `session=${meta.sessionId}`];
   if (meta.host) parts.push(`host=${meta.host}`);
   if (meta.owner) parts.push(`repo=${meta.owner}/${meta.repo ?? ""}`);
   console.log(parts.join(" "));
@@ -90,19 +87,46 @@ function parseRequest(block: string): Record<string, string> {
  * secret beyond the per-session nonce + the loopback port; both are scoped to a
  * single live session and the file is `0700` + removed on session close. git
  * invokes it as `<script> get`; it forwards git's request to the relay and pipes
- * the answer back.
+ * the answer back. Clone commands also invoke `<script> auth-header ...` once
+ * before each network operation. That produces an Authorization header in
+ * memory so GitHub sees an authenticated FIRST request — essential when a
+ * public-repository request is throttled without the 401 challenge that would
+ * normally cause Git to call a credential helper.
  */
 export function buildHelperScript(port: number, nonce: string): string {
-  return [
-    "#!/usr/bin/env bash",
-    "# Openship git credential relay (desktop-only). No credential is stored here.",
-    'if [ "$1" != "get" ]; then exit 0; fi',
-    `exec 3<>/dev/tcp/127.0.0.1/${port} || exit 1`,
-    `printf '%s\\n' '${nonce}' >&3`,
-    "cat >&3", // forward git's request (ends with a blank line)
-    "printf '\\n' >&3", // guarantee the blank-line terminator
-    "cat <&3", // pipe the relay's answer back to git
-  ].join("\n") + "\n";
+  return (
+    [
+      "#!/usr/bin/env bash",
+      "# Openship git credential relay (desktop-only). No credential is stored here.",
+      'action="${1:-}"',
+      'if [ "$action" != "get" ] && [ "$action" != "auth-header" ]; then exit 0; fi',
+      `exec 3<>/dev/tcp/127.0.0.1/${port} || exit 1`,
+      `printf '%s\\n' '${nonce}' >&3`,
+      'if [ "$action" = "get" ]; then',
+      "  cat >&3", // forward git's request (ends with a blank line)
+      "  printf '\\n' >&3", // guarantee the blank-line terminator
+      "  cat <&3", // pipe the relay's answer back to git
+      "  exit 0",
+      "fi",
+      // Git does not consult a credential helper before the first request to a
+      // public repo. Ask the same repo-pinned relay explicitly and turn its
+      // response into a preemptive Basic header without writing the token to
+      // disk, the command line, or build output.
+      'protocol="${2:-}"',
+      'host="${3:-}"',
+      'path="${4:-}"',
+      'printf \'protocol=%s\\nhost=%s\\npath=%s\\n\\n\' "$protocol" "$host" "$path" >&3',
+      'response="$(cat <&3)"',
+      "username=\"$(printf '%s\\n' \"$response\" | sed -n 's/^username=//p' | head -n 1)\"",
+      "password=\"$(printf '%s\\n' \"$response\" | sed -n 's/^password=//p' | head -n 1)\"",
+      'if [ -z "$username" ] || [ -z "$password" ]; then',
+      "  printf '%s\\n' 'Credential relay returned no credential.' >&2",
+      "  exit 1",
+      "fi",
+      'encoded="$(printf \'%s:%s\' "$username" "$password" | base64 | tr -d \'\\r\\n\')"',
+      "printf 'Authorization: Basic %s' \"$encoded\"",
+    ].join("\n") + "\n"
+  );
 }
 
 /** Handle one reverse-tunnel connection from the remote helper script. */
@@ -122,15 +146,25 @@ function handleConnection(
   let buf = "";
   let done = false;
 
-  const finish = (response: string | null, result: string, meta?: { host?: string; owner?: string; repo?: string }) => {
+  const finish = (
+    response: string | null,
+    result: string,
+    meta?: { host?: string; owner?: string; repo?: string },
+  ) => {
     if (done) return;
     done = true;
     clearTimeout(timer);
     log(result, { serverId: ctx.serverId, sessionId: ctx.sessionId, ...meta });
     try {
       if (response) stream.write(response);
-    } catch { /* peer gone */ }
-    try { stream.end(); } catch { /* already closed */ }
+    } catch {
+      /* peer gone */
+    }
+    try {
+      stream.end();
+    } catch {
+      /* already closed */
+    }
   };
 
   const timer = setTimeout(() => finish(null, "timeout"), REQUEST_TIMEOUT_MS);
@@ -181,7 +215,11 @@ function handleConnection(
     void getLocalGhToken()
       .then((token) => {
         if (!token) return finish(null, "no-token", meta);
-        // GitHub HTTPS token auth: token as password, any non-empty username.
+        // GitHub HTTPS token auth: it reads the token from either Basic-auth
+        // slot and ignores the other value, so the username here is a label.
+        // URL-form auth picks the pair GitHub documents per token type —
+        // see gitCredentialPair (packages/adapters/src/runtime/git-clone.ts);
+        // this is the credential-helper protocol, not a URL, so it stays put.
         finish(`username=x-access-token\npassword=${token}\n\n`, "granted", meta);
       })
       .catch(() => finish(null, "token-error", meta));

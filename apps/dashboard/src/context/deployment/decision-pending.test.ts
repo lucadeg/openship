@@ -35,4 +35,9 @@ describe("every other decisionPending read is already server-driven", () => {
     // These were correct before this change; pinned so the three sites can't diverge again.
     expect((code.match(/!!data\??\.decisionPending/g) ?? []).length).toBeGreaterThanOrEqual(3);
   });
+
+  it("forwards the REST flag through finished-deployment success hydration", () => {
+    const finished = code.slice(code.indexOf('else if (status === "ready")'));
+    expect(finished).toContain("decisionPending: data.decisionPending");
+  });
 });

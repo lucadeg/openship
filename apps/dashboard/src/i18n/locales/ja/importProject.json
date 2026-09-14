@@ -414,5 +414,14 @@
     "rowServices": "サービス",
     "rowProject": "プロジェクト",
     "rowType": "タイプ"
+  },
+  "configDiagnostics": {
+    "title": "このリポジトリの openship.json の一部が適用されませんでした",
+    "description": "以下に挙げた項目はスキップされ、ファイルの残りは適用されました。デプロイはそのまま続行します。",
+    "titleWholeFile": "このリポジトリの openship.json は無視されました",
+    "descriptionWholeFile": "内容は一切適用されていません。デプロイは Openship が検出した設定で続行します。",
+    "refused": "拒否",
+    "unrecognized": "未認識",
+    "hint": "次のデプロイの前に、リポジトリで `openship config validate` を実行してファイルを確認してください。"
   }
 }

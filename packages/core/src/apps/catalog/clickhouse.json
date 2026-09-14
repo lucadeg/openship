@@ -1,6 +1,7 @@
 {
   "available": true,
   "verified": false,
+  "minEngine": "0.6.6",
   "id": "clickhouse",
   "name": "ClickHouse",
   "description": "The columnar SQL database for analytics — billions of rows scanned per second. Ships with the CH-UI console, so you get a SQL editor, schema browser and dashboards the moment it installs: sign in with the ClickHouse user and password below, no extra setup.",

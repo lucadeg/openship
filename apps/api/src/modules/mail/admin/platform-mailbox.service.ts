@@ -21,10 +21,12 @@
  *
  * Idempotency contract (per the ensure* convention in apps/api/src/lib):
  *   - Re-running with the same args is safe; fast path returns cached creds
- *     from state.platformMailbox.
- *   - The doveadm-hashed password (vmail.mailbox) and the plaintext copy
- *     (mail-state.json) are written in the SAME logical operation. Drift
- *     between the two ends is structurally impossible.
+ *     only after confirming the active mailbox + self-forwarding rows still
+ *     exist in vmail. The state file is a credential cache, not existence
+ *     truth.
+ *   - The doveadm-hashed password (vmail.mailbox) and encrypted plaintext copy
+ *     (mail-state.json) are written through the same logical operation; live
+ *     row validation repairs out-of-band deletion before cached reuse.
  *   - On rotate=true, BOTH ends are updated atomically: state-file write
  *     failure rolls the DB row back via hardDelete to keep them in lockstep.
  *
@@ -45,7 +47,7 @@ import {
   type MailServerState,
   type PlatformMailboxState,
 } from "../mail-state";
-import { execute, q, qInt, transaction } from "./psql-runner";
+import { execute, q, qInt, queryOne, transaction } from "./psql-runner";
 import { hashPassword } from "./password";
 import {
   createMaildirOnDisk,
@@ -91,8 +93,10 @@ export interface EnsureOpenshipPlatformMailboxOptions {
 /**
  * Provision (or reuse) the platform SMTP mailbox.
  *
- * Fast path: `state.platformMailbox.email` matches the target email and
- * `rotate` is not set — pure read, no side effects.
+ * Fast path: `state.platformMailbox.email` matches the target email,
+ * `rotate` is not set, and the active mailbox + self-forwarding rows still
+ * exist. This indexed lookup is deliberately small: the state file caches the
+ * credential, but vmail remains the source of truth for whether it can work.
  *
  * Slow path: mints a 24-byte base64url password, hashes via doveadm,
  * UPSERTs the mailbox row + self-forwarding row in a single SQL
@@ -114,7 +118,7 @@ export async function ensureOpenshipPlatformMailbox(
       );
     }
 
-    const rawDomain = opts?.domain?.trim().toLowerCase() ?? state.domain;
+    const rawDomain = (opts?.domain ?? state.domain).trim().toLowerCase();
     if (!DOMAIN_RE.test(rawDomain) || rawDomain.length > 255) {
       throw new PlatformMailboxError(`Invalid platform mailbox domain: ${rawDomain}`);
     }
@@ -123,13 +127,23 @@ export async function ensureOpenshipPlatformMailbox(
     const smtpHost = mailHostname(state.domain);
     const rotate = opts?.rotate === true;
 
-    // Fast path: cached creds match target identity and no rotation requested.
+    // Fast path: cached creds match target identity, no rotation was requested,
+    // and both vmail rows required by Dovecot/Postfix still exist and are active.
+    // A mailbox can be removed outside Openship (or by an older UI), so trusting
+    // only mail-state.json permanently strands outbound SMTP with a stale secret.
     // The stored password is an encrypted blob (see slow-path comment below).
     // Backward-compat: if decrypt() throws, the cached value is legacy
     // plaintext from a pre-encryption write — log once and use it raw. The
     // next rotation re-encrypts via the slow path.
     const cached = state.platformMailbox;
-    if (!rotate && cached && cached.email === email && cached.password) {
+    if (
+      !rotate &&
+      cached &&
+      cached.email &&
+      cached.email.toLowerCase() === email &&
+      cached.password &&
+      (await isManagedMailboxUsable(exec, email))
+    ) {
       let plaintext: string;
       try {
         plaintext = decrypt(cached.password);
@@ -147,6 +161,18 @@ export async function ensureOpenshipPlatformMailbox(
       });
     }
 
+    if (
+      !rotate &&
+      cached &&
+      cached.email &&
+      cached.email.toLowerCase() === email &&
+      cached.password
+    ) {
+      console.warn(
+        `[ensureOpenshipPlatformMailbox] cached mailbox ${email} is missing or inactive in vmail; recreating it and rotating the stale credential.`,
+      );
+    }
+
     // Slow path: mint + UPSERT + persist.
     return mintAndPersist({
       exec,
@@ -157,6 +183,36 @@ export async function ensureOpenshipPlatformMailbox(
       smtpHost,
     });
   });
+}
+
+/**
+ * Return whether the two live rows needed by an Openship-managed sender are
+ * present and active. Both predicates use indexed equality lookups and are
+ * intentionally shared with per-domain test mailboxes so cached-credential
+ * validation has one implementation.
+ */
+export async function isManagedMailboxUsable(
+  exec: CommandExecutor,
+  email: string,
+): Promise<boolean> {
+  const row = await queryOne<{
+    mailboxActive: boolean;
+    forwardingActive: boolean;
+  }>(
+    exec,
+    `SELECT
+       EXISTS (
+         SELECT 1 FROM mailbox
+         WHERE username = ${q(email)} AND active = 1
+       ) AS "mailboxActive",
+       EXISTS (
+         SELECT 1 FROM forwardings
+         WHERE address = ${q(email)}
+           AND forwarding = ${q(email)}
+           AND active = 1
+       ) AS "forwardingActive"`,
+  );
+  return row?.mailboxActive === true && row.forwardingActive === true;
 }
 
 interface MintArgs {

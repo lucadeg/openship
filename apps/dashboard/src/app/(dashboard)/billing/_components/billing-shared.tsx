@@ -5,6 +5,7 @@ import {
   ArrowUpRight,
   BarChart3,
   Building2,
+  Check,
   Coins,
   CreditCard,
   Crown,
@@ -127,39 +128,56 @@ function nextPlan(tier: PlanTierId): PlanTierId | undefined {
   return next && !PLANS[next].contactSales ? next : undefined;
 }
 
+/**
+ * The right column: WHAT YOUR PLAN INCLUDES.
+ *
+ * It used to restate the plan — icon, name, price, status, and an "Upgrade to X"
+ * button — directly beside a left-hand card carrying the same plan name, the same
+ * status pill, and its own upgrade button. Two panels, one fact, and the two CTAs
+ * disagreed: the left one said "Upgrade to Pro" while this one named the next tier
+ * up the ladder, so a free user was offered two different upgrades at once.
+ *
+ * The plan's identity, status and CTA now live once, on the left. This column
+ * carries the thing that was nowhere in the layout: the itemised list of what the
+ * subscription actually buys — the same catalog bullets the plans tab shows, so a
+ * customer can check their entitlements without leaving Overview.
+ */
 export function BillingSidebar({ state }: { state: BillingState }) {
   const { t } = useI18n();
   const bt = t.billing;
   const plan = PLANS[state.tier];
-  const next = nextPlan(state.tier);
   const PlanIcon = PLAN_ICON[state.tier];
+  const features = plan?.features ?? [];
 
   return (
     <div className="space-y-5">
       <div className="rounded-2xl border border-border/50 bg-card p-5">
         <div className="mb-4 flex items-center gap-3">
-          <div className={`flex size-10 items-center justify-center rounded-xl ${PLAN_COLOR[state.tier]}`}>
-            <PlanIcon className="size-5" />
+          <div className={`flex size-9 items-center justify-center rounded-xl ${PLAN_COLOR[state.tier]}`}>
+            <PlanIcon className="size-4" />
           </div>
-          <div>
-            <p className="text-sm font-semibold text-foreground">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-foreground">{bt.sidebar.includedTitle}</p>
+            <p className="text-xs text-muted-foreground">
               {interpolate(bt.sidebar.planSuffix, { name: plan.name })}
+              {" · "}
+              {formatPlanPrice(state.tier, bt)}
             </p>
-            <p className="text-xs text-muted-foreground">{formatPlanPrice(state.tier, bt)}</p>
           </div>
         </div>
 
-        <div className="mb-4 flex items-center justify-between rounded-lg bg-muted/40 px-3 py-2">
-          <span className="text-xs text-muted-foreground">{bt.sidebar.status}</span>
-          <span className="text-xs font-medium text-foreground">{formatStatusLabel(state.status, bt)}</span>
-        </div>
-
-        {next && (
-          <BillingCtaLink href="/billing/plans" className="w-full justify-center">
-            {interpolate(bt.sidebar.upgradeTo, { name: PLANS[next].name })}
-            <ArrowUpRight className="size-3.5" />
-          </BillingCtaLink>
+        {plan?.inheritedFrom && (
+          <p className="mb-2 text-xs text-muted-foreground">{plan.inheritedFrom}</p>
         )}
+
+        <ul className="space-y-2">
+          {features.map((f) => (
+            <li key={f} className="flex items-start gap-2 text-[13px] leading-snug text-foreground/80">
+              <Check className="mt-[3px] size-3.5 shrink-0 text-primary" strokeWidth={2.5} />
+              <span>{f}</span>
+            </li>
+          ))}
+        </ul>
       </div>
     </div>
   );

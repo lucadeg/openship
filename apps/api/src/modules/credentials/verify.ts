@@ -18,6 +18,8 @@
  */
 
 import { safeErrorMessage, DOCKER_HUB_REGISTRY, type CredentialProvider } from "@repo/core";
+import { env } from "../../config/env";
+import { safeFetch, type SafeFetchResponse } from "../../lib/safe-fetch";
 
 export interface VerifyResult {
   ok: boolean;
@@ -37,14 +39,21 @@ type Verifier = (args: {
 /** Bound so a hostile or misconfigured registry cannot hang a settings request. */
 const VERIFY_TIMEOUT_MS = 10_000;
 
-async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal, redirect: "follow" });
-  } finally {
-    clearTimeout(timer);
-  }
+async function fetchWithTimeout(
+  url: string,
+  headers?: Record<string, string>,
+): Promise<SafeFetchResponse> {
+  return safeFetch(url, {
+    headers,
+    timeoutMs: VERIFY_TIMEOUT_MS,
+    // A self-hosted operator may intentionally verify a LAN/loopback registry.
+    // The multi-tenant control plane must never let an org admin use this probe
+    // to reach its private network. safeFetch also pins DNS and re-validates
+    // every redirect before connecting.
+    allowHttp: !env.CLOUD_MODE,
+    allowPrivate: !env.CLOUD_MODE,
+    maxRedirects: 3,
+  });
 }
 
 /**
@@ -81,14 +90,21 @@ const verifyDockerRegistry: Verifier = async ({ selector, publicFields, secrets 
   const scheme = /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host) ? "http" : "https";
   const base = `${scheme}://${host}`;
 
-  let probe: Response;
+  let probe: SafeFetchResponse;
   try {
     probe = await fetchWithTimeout(`${base}/v2/`);
   } catch (err) {
     // The message here is ours, not the fetch layer's: a DNS/TLS error string can contain
     // the full URL, which for some registries embeds the account.
-    const why = safeErrorMessage(err).includes("aborted") ? "timed out" : "could not be reached";
-    return { ok: false, reason: `${registry} ${why}. Check the host and that this machine can reach it.` };
+    const detail = safeErrorMessage(err).toLowerCase();
+    const why =
+      detail.includes("aborted") || detail.includes("timed out")
+        ? "timed out"
+        : "could not be reached";
+    return {
+      ok: false,
+      reason: `${registry} ${why}. Check the host and that this machine can reach it.`,
+    };
   }
 
   if (probe.status === 200) {
@@ -98,7 +114,7 @@ const verifyDockerRegistry: Verifier = async ({ selector, publicFields, secrets 
     return { ok: true };
   }
 
-  const challenge = probe.headers.get("www-authenticate") ?? "";
+  const challenge = probe.headers["www-authenticate"] ?? "";
 
   if (/^bearer/i.test(challenge)) {
     const realm = /realm="([^"]+)"/i.exec(challenge)?.[1];
@@ -111,7 +127,7 @@ const verifyDockerRegistry: Verifier = async ({ selector, publicFields, secrets 
     // valid credential that simply cannot see the repository we invented.
     try {
       const token = await fetchWithTimeout(url.toString(), {
-        headers: { authorization: `Basic ${basic}` },
+        authorization: `Basic ${basic}`,
       });
       if (token.status === 200) return { ok: true };
       if (token.status === 401 || token.status === 403) {
@@ -126,7 +142,7 @@ const verifyDockerRegistry: Verifier = async ({ selector, publicFields, secrets 
   if (/^basic/i.test(challenge)) {
     try {
       const authed = await fetchWithTimeout(`${base}/v2/`, {
-        headers: { authorization: `Basic ${basic}` },
+        authorization: `Basic ${basic}`,
       });
       if (authed.status === 200) return { ok: true };
       return { ok: false, reason: `${registry} rejected these credentials.` };
@@ -153,7 +169,7 @@ const verifyCloudflare: Verifier = async ({ secrets }) => {
   if (!apiToken) return { ok: false, reason: "An API token is required." };
   try {
     const res = await fetchWithTimeout("https://api.cloudflare.com/client/v4/user/tokens/verify", {
-      headers: { authorization: `Bearer ${apiToken}` },
+      authorization: `Bearer ${apiToken}`,
     });
     if (res.status === 200) return { ok: true };
     if (res.status === 401 || res.status === 403) {
@@ -177,7 +193,11 @@ export function hasVerifier(providerId: string): boolean {
 
 export async function verifyCredentialValues(
   provider: CredentialProvider,
-  args: { selector: string | null; publicFields: Record<string, string>; secrets: CredentialSecrets },
+  args: {
+    selector: string | null;
+    publicFields: Record<string, string>;
+    secrets: CredentialSecrets;
+  },
 ): Promise<VerifyResult> {
   const verifier = VERIFIERS[provider.id];
   if (!verifier) {

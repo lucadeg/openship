@@ -28,6 +28,15 @@ export interface BuildConfigSnapshotLike {
    *  pulls natively. This is how migration hands its images to the native pipeline
    *  instead of forking a second deploy path. */
   handoverImages?: Record<string, string>;
+  /** This deployment must refresh registry-backed images even when their
+   * mutable tag already exists on the target daemon. */
+  forcePullImages?: boolean;
+  /** Services selected for this deployment. Absent means the whole project. */
+  targetServiceIds?: string[];
+  /** Selected services that reuse their current artifact for an env-only refresh. */
+  refreshServiceIds?: string[];
+  /** Treat targetServiceIds as an exact exclusion boundary. */
+  strictServiceScope?: boolean;
 }
 
 export interface BuildConfigFactoryOptions {
@@ -44,7 +53,17 @@ export interface BuildConfigFactoryOptions {
 }
 
 export function createBuildConfig(opts: BuildConfigFactoryOptions): BuildConfig {
-  const { project, dep, snapshot, sessionId, envVars, resources, gitToken, gitCredentialHelperPath, overrides } = opts;
+  const {
+    project,
+    dep,
+    snapshot,
+    sessionId,
+    envVars,
+    resources,
+    gitToken,
+    gitCredentialHelperPath,
+    overrides,
+  } = opts;
 
   return {
     sessionId,
@@ -76,9 +95,7 @@ export function createBuildConfig(opts: BuildConfigFactoryOptions): BuildConfig 
   };
 }
 
-export function createDockerfileBuildConfig(
-  opts: BuildConfigFactoryOptions,
-): BuildConfig {
+export function createDockerfileBuildConfig(opts: BuildConfigFactoryOptions): BuildConfig {
   return createBuildConfig({
     ...opts,
     overrides: {
@@ -108,9 +125,7 @@ export function createDockerfileBuildConfig(
  * start/output fields from `overrides` (or the snapshot) - those are exactly
  * what the runtime consumes to generate the Dockerfile.
  */
-export function createMonorepoSourceBuildConfig(
-  opts: BuildConfigFactoryOptions,
-): BuildConfig {
+export function createMonorepoSourceBuildConfig(opts: BuildConfigFactoryOptions): BuildConfig {
   return createBuildConfig({
     ...opts,
     overrides: {
@@ -124,6 +139,12 @@ export function createMonorepoSourceBuildConfig(
       // Dockerfile path would silently disappear and we'd fall to "no
       // Dockerfile found" errors. Pinning it last guarantees the contract.
       dockerfilePath: undefined,
+      // Same reason, same shape: a generated recipe COPYs from the SOURCE ROOT, so a
+      // narrowed docker build context can never satisfy it — the runtime refuses that
+      // combination outright. A `build` value can legally sit on a monorepo row (the
+      // services API writes it for either kind), so pin it here rather than trusting
+      // every caller to omit it.
+      buildContextDirectory: undefined,
     },
   });
 }

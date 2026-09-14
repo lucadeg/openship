@@ -26,8 +26,11 @@ function makePgFake(initial: Record<string, unknown> = {}): PgFake {
   const state: PgFake = { db: null, row: { ...initial }, rejections: [] };
   state.db = {
     update: () => ({
-      set: (values: Record<string, unknown>) => ({
-        where: async () => {
+      set: (values: Record<string, unknown>) => {
+        // Mirrors the real chain: `.where(...).returning()`. The repo reads that array to
+        // detect a transition the terminal-status guard dropped, so a fake stopping at
+        // `.where()` would be testing a shape production no longer uses.
+        const apply = () => {
           for (const [key, value] of Object.entries(values)) {
             if (typeof value === "string" && value.includes("\u0000")) {
               const reason = 'invalid byte sequence for encoding "UTF8": 0x00';
@@ -35,9 +38,15 @@ function makePgFake(initial: Record<string, unknown> = {}): PgFake {
               throw new Error(reason);
             }
           }
+          const TERMINAL = ["succeeded", "failed", "cancelled", "server_error"];
+          if (TERMINAL.includes(String(state.row.status)) && "status" in values) {
+            return [] as Array<{ id: string }>;
+          }
           Object.assign(state.row, values);
-        },
-      }),
+          return [{ id: String(state.row.id) }];
+        };
+        return { where: () => ({ returning: async () => apply() }) };
+      },
     }),
   };
   return state;
@@ -109,6 +118,9 @@ vi.mock("@repo/db", () => ({
     project: {
       findById: async () => ({ id: "prj_1", name: "shop", slug: "shop", activeDeploymentId: null }),
       listEnvVars: async () => [],
+      // serviceHandleFor reads env through the SCOPED map (project-level and
+      // service-scoped, per environment) rather than every row in the project.
+      getEnvMap: async () => ({}),
     },
     service: {
       findById: async () => ({
@@ -176,6 +188,7 @@ vi.mock("../../../src/modules/backup-destinations/hydrate-server", () => ({
 
 vi.mock("../../../src/modules/services/service-container", () => ({
   liveContainerIdForService: async () => null,
+  liveContainerForService: async () => ({ containerId: null, running: null }),
 }));
 
 import { RestoreOrchestrator } from "../../../src/modules/backups/restore.orchestrator";

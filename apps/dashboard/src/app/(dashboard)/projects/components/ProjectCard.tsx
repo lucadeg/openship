@@ -16,13 +16,8 @@ import {
 import { type Project } from "@/constants/mock";
 import { AppLogo } from "@/components/AppLogo";
 import { getFrameworkConfig } from "@/components/import-project/Frameworks";
-import {
-  getProjectStatus,
-  projectDisplayDomain,
-  projectStatusHint,
-  PROJECT_STATUS_META,
-  projectStatusLabel,
-} from "@/utils/project-status";
+import { getProjectStatus, projectDisplayDomain } from "@/utils/project-status";
+import { ProjectStatusBadge } from "@/components/shared/ProjectStatusBadge";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 import { useModal } from "@/context/ModalContext";
 import { useToast } from "@/context/ToastContext";
@@ -79,8 +74,6 @@ const ProjectCard: React.FC<Props> = ({ project, preferAppLogo, updateAvailable,
   const { showToast } = useToast();
   const [menuOpen, setMenuOpen] = useState(false);
   const status = getProjectStatus(project);
-  const statusMeta = PROJECT_STATUS_META[status];
-  const statusHint = projectStatusHint(project, t);
   const fw = getFrameworkConfig(project.framework);
   const [faviconError, setFaviconError] = useState(false);
 
@@ -114,7 +107,7 @@ const ProjectCard: React.FC<Props> = ({ project, preferAppLogo, updateAvailable,
           onClick: async () => {
             hideModal(id);
             try {
-              await projectsApi.delete(project.id, { deleteApp: true });
+              await projectsApi.delete(project.id, {});
               showToast(t.projects.delete.successProject, "success");
               onChanged?.();
             } catch (e) {
@@ -241,15 +234,10 @@ const ProjectCard: React.FC<Props> = ({ project, preferAppLogo, updateAvailable,
         </span>
 
         {/* Status pill (badge only — no dot) */}
-        <span
-          className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${statusMeta.badge}`}
-          // Amber "Action Required" without a named move is a dead end — some
-          // attention states (rolled back after a failed deploy) have no
-          // clearable pending-action, so the pill has to say what to do.
-          {...(statusHint ? { title: statusHint } : {})}
-        >
-          {projectStatusLabel(status, t)}
-        </span>
+        <ProjectStatusBadge
+          project={project}
+          className="rounded-full px-2 py-0.5 text-[10px] font-medium"
+        />
 
         {/* Draft apps get a "delete app" menu (deployed apps delete from the
             project page). Stops row navigation. */}

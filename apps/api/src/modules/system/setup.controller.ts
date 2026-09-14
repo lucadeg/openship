@@ -54,7 +54,7 @@ import { ensureLocalServer } from "../../lib/startup/self-server";
 import { provisionUser } from "../../lib/provision-user";
 import { COOKIE_PREFIX } from "../../lib/auth";
 import { mintSession } from "../../lib/cloud-auth-proxy";
-import { invalidatePlatformTransportCache } from "../../lib/mail";
+import { invalidatePlatformTransport } from "../../lib/mail";
 
 /** The canonical mode set lives with the resolver, so the env parser, this
  *  validator and getAuthMode() can't disagree about what a valid mode is. */
@@ -126,8 +126,7 @@ function validateAuthModeChange(body: Record<string, unknown>): AuthModeValidati
         ok: false,
         status: 400,
         body: {
-          error:
-            "Zero-auth toggle requires `confirm: \"I-understand-no-auth\"` in the request body.",
+          error: 'Zero-auth toggle requires `confirm: "I-understand-no-auth"` in the request body.',
         },
       };
     }
@@ -136,14 +135,14 @@ function validateAuthModeChange(body: Record<string, unknown>): AuthModeValidati
   return { ok: true, value };
 }
 
-
 /** POST /system/setup - push all instance settings from desktop app.
  *
  *  PRE-AUTH: runs under internalAuth (shared token), no RequestContext.
  *  Reads activeOrganizationId off the raw Hono context when middleware
  *  happens to have set it; otherwise treats the row as instance-global. */
 export async function setup(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
 
   const body = await c.req.json();
 
@@ -183,7 +182,7 @@ export async function setup(c: Context) {
     // by host so a new machine never destroys an existing one.
     const existing = body.serverId
       ? await repos.server.get(body.serverId)
-      : (await repos.server.list()).find((s) => s.sshHost === body.sshHost) ?? null;
+      : ((await repos.server.list()).find((s) => s.sshHost === body.sshHost) ?? null);
 
     // Encrypt SSH secrets at rest. Decrypted only inside `buildSshConfig`
     // when the ssh2 client needs them. See lib/credential-encryption.
@@ -210,8 +209,7 @@ export async function setup(c: Context) {
       // have set, otherwise leave NULL — these are instance-global servers
       // per the schema comment. Operators assign org post-onboarding.
       const ctxOrgId = c.get("activeOrganizationId");
-      const organizationId =
-        typeof ctxOrgId === "string" && ctxOrgId.length > 0 ? ctxOrgId : null;
+      const organizationId = typeof ctxOrgId === "string" && ctxOrgId.length > 0 ? ctxOrgId : null;
       const created = await repos.server.create({
         organizationId,
         name: body.serverName || null,
@@ -237,7 +235,8 @@ export async function setup(c: Context) {
 
 /** GET /system/setup - retrieve current instance settings */
 export async function getSetup(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
 
   const settings = await repos.instanceSettings.get();
   const servers = await repos.server.list();
@@ -281,7 +280,8 @@ export async function getSetup(c: Context) {
 
 /** PATCH /system/settings - partial update instance-level settings (non-SSH) */
 export async function updateSettings(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
 
   // Defense in depth behind requireInstanceAdmin() on the route, so a future
   // mount can't re-open GHSA-43hf-p5j8-8vhx by forgetting the middleware.
@@ -317,10 +317,7 @@ export async function updateSettings(c: Context) {
   if (body.invitationMailSource !== undefined) {
     const raw = body.invitationMailSource;
     if (raw !== "platform" && raw !== "cloud") {
-      return c.json(
-        { error: "invitationMailSource must be 'platform' or 'cloud'" },
-        400,
-      );
+      return c.json({ error: "invitationMailSource must be 'platform' or 'cloud'" }, 400);
     }
     patch.invitationMailSource = raw;
   }
@@ -414,7 +411,8 @@ const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
  * offer "leave blank to keep".
  */
 export async function getEmailSettings(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
   const s = await repos.instanceSettings.get();
   const configured = !!(s?.smtpHost && s?.smtpUser && s?.smtpPasswordEncrypted);
   return c.json({
@@ -439,7 +437,8 @@ export async function getEmailSettings(c: Context) {
  * next send picks up the change.
  */
 export async function updateEmailSettings(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
 
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const host = typeof body.host === "string" ? body.host.trim().toLowerCase() : "";
@@ -500,7 +499,8 @@ export async function updateEmailSettings(c: Context) {
  * the operator can fix it before relying on it for password resets.
  */
 export async function sendTestEmail(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
 
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const to = typeof body.to === "string" ? body.to.trim() : "";
@@ -519,7 +519,8 @@ export async function sendTestEmail(c: Context) {
 
 /** DELETE /system/settings - remove server configuration */
 export async function deleteSettings(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
   const ctx = getRequestContext(c);
 
   await repos.instanceSettings.delete();
@@ -566,7 +567,8 @@ export async function deleteSettings(c: Context) {
  * No auth required - used by CLI polling and first-run detection.
  */
 export async function onboardingStatus(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
 
   const servers = await repos.server.list();
   return c.json({ configured: servers.length > 0 });
@@ -590,7 +592,8 @@ export async function onboardingStatus(c: Context) {
  *   - one-shot: refuses once any real (non-auto-provisioned) admin exists.
  */
 export async function bootstrapAdmin(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
 
   const existing = await repos.user.findFoundingAdmin();
   if (existing) {
@@ -641,7 +644,9 @@ export async function bootstrapAdmin(c: Context) {
       .where(eq(schema.user.id, localUser.id));
     await tx
       .delete(schema.account)
-      .where(and(eq(schema.account.userId, localUser.id), eq(schema.account.providerId, "credential")));
+      .where(
+        and(eq(schema.account.userId, localUser.id), eq(schema.account.providerId, "credential")),
+      );
     await tx.insert(schema.account).values({
       id: generateId("acc"),
       accountId: localUser.id,
@@ -652,7 +657,10 @@ export async function bootstrapAdmin(c: Context) {
     await tx
       .insert(schema.instanceSettings)
       .values({ id: "default", authMode: "local" })
-      .onConflictDoUpdate({ target: schema.instanceSettings.id, set: { authMode: "local", updatedAt: new Date() } });
+      .onConflictDoUpdate({
+        target: schema.instanceSettings.id,
+        set: { authMode: "local", updatedAt: new Date() },
+      });
   });
 
   invalidateLocalUserCache();
@@ -689,7 +697,8 @@ export async function bootstrapAdmin(c: Context) {
  * `email`/`name` let you correct the admin's address at the same time.
  */
 export async function resetAdminPassword(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
 
   const body = (await c.req.json()) as { email?: unknown; name?: unknown; password?: unknown };
   const password = typeof body.password === "string" ? body.password : "";
@@ -739,7 +748,10 @@ export async function resetAdminPassword(c: Context) {
     await tx
       .insert(schema.instanceSettings)
       .values({ id: "default", authMode: "local" })
-      .onConflictDoUpdate({ target: schema.instanceSettings.id, set: { authMode: "local", updatedAt: new Date() } });
+      .onConflictDoUpdate({
+        target: schema.instanceSettings.id,
+        set: { authMode: "local", updatedAt: new Date() },
+      });
   });
 
   // Password recovery must mean "regain sole control": revoke every existing
@@ -772,91 +784,6 @@ export async function resetAdminPassword(c: Context) {
   return c.json({ ok: true, email });
 }
 
-/**
- * POST /api/system/invite-signup — token-bound invited signup (self-host).
- *
- * The ONLY way to create an additional account on a self-hosted instance (public
- * Better Auth signup is disabled by the sign-up route guard). Authorization is
- * the unguessable invitation id from the emailed /accept-invite/<id> link — NOT
- * the email string, and NOT proof-of-session. We validate the invitation is
- * pending + unexpired + issued by a real instance admin, then create the account
- * for the invitation's OWN email (never caller-supplied). The caller then signs
- * in and accepts the invite via Better Auth (which consumes it, so it's
- * single-use). Closes: invite-hijack (email-as-bearer), org-agnostic invite
- * minting, and expired-invite reuse.
- */
-export async function inviteSignup(c: Context) {
-  // SaaS uses open public signup; this endpoint is self-host only.
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
-
-  const body = (await c.req.json().catch(() => ({}))) as {
-    invitationId?: unknown;
-    name?: unknown;
-    password?: unknown;
-  };
-  const invitationId = typeof body.invitationId === "string" ? body.invitationId.trim() : "";
-  const name = typeof body.name === "string" ? body.name.trim() : "";
-  const password = typeof body.password === "string" ? body.password : "";
-  if (!invitationId) return c.json({ error: "invitationId is required" }, 400);
-  if (!name || name.length > 100) return c.json({ error: "name must be 1-100 characters" }, 400);
-  if (password.length < 8 || password.length > 128) {
-    return c.json({ error: "password must be 8-128 characters" }, 400);
-  }
-
-  // The invitation TOKEN is the authorization: it must exist, still be pending,
-  // and be unexpired. (An expired invite keeps status="pending", so check both.)
-  const [invite] = await db
-    .select({
-      email: schema.invitation.email,
-      status: schema.invitation.status,
-      expiresAt: schema.invitation.expiresAt,
-      inviterId: schema.invitation.inviterId,
-    })
-    .from(schema.invitation)
-    .where(eq(schema.invitation.id, invitationId))
-    .limit(1);
-  if (!invite || invite.status !== "pending" || invite.expiresAt.getTime() <= Date.now()) {
-    return c.json({ error: "This invitation is invalid or has expired." }, 403);
-  }
-
-  // The inviter must be a real INSTANCE admin (user.role === "admin"). A regular
-  // member is role "user" even though they own their personal org, so a bare
-  // member's self-issued invite can NEVER mint an instance account. (Every admin
-  // path — CLI bootstrap, zero-auth upgrade, cloud mirror — provisions role
-  // "admin"; only an explicit admin-plugin promotion adds more.)
-  const [inviter] = await db
-    .select({ role: schema.user.role })
-    .from(schema.user)
-    .where(eq(schema.user.id, invite.inviterId))
-    .limit(1);
-  if (!inviter || inviter.role !== "admin") {
-    return c.json({ error: "This invitation is invalid." }, 403);
-  }
-
-  // Email comes from the invitation, NEVER caller input — the attacker can't bind
-  // a different mailbox to the token.
-  const email = invite.email.trim().toLowerCase();
-  const existing = await repos.user.findByEmail(email);
-  if (existing) {
-    return c.json({ error: "An account with this email already exists — sign in and accept the invite." }, 409);
-  }
-
-  // Create the account (raw, like bootstrap-admin — bypasses the disabled public
-  // signUp). The caller signs in + accepts the invite via Better Auth next.
-  const userId = generateId("usr");
-  const hashed = await hashPassword(password);
-  await provisionUser({ id: userId, name, email, emailVerified: true });
-  await db.insert(schema.account).values({
-    id: generateId("acc"),
-    accountId: userId,
-    providerId: "credential",
-    userId,
-    password: hashed,
-  });
-
-  return c.json({ ok: true, email });
-}
-
 // ── Auth upgrade (zero-auth → local-auth) ────────────────────────────────────
 
 /**
@@ -882,7 +809,8 @@ export async function inviteSignup(c: Context) {
  * the instance in zero-auth mode and the operator can retry.
  */
 export async function upgradeToAuth(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
 
   // PUBLIC route (no session exists yet) → it MUST enforce the same zero-auth
   // guardrails authMiddleware does. Using the shared guard (canonical authMode
@@ -951,10 +879,7 @@ export async function upgradeToAuth(c: Context) {
     await tx
       .delete(schema.account)
       .where(
-        and(
-          eq(schema.account.userId, localUser.id),
-          eq(schema.account.providerId, "credential"),
-        ),
+        and(eq(schema.account.userId, localUser.id), eq(schema.account.providerId, "credential")),
       );
 
     await tx.insert(schema.account).values({
@@ -986,11 +911,10 @@ export async function upgradeToAuth(c: Context) {
       const mailServers = await repos.mailServer.list();
       const installed = mailServers.find((m) => m.installedAt != null);
       if (installed) {
-        const { ensureOpenshipPlatformMailbox } = await import(
-          "../mail/admin/platform-mailbox.service"
-        );
+        const { ensureOpenshipPlatformMailbox } =
+          await import("../mail/admin/platform-mailbox.service");
         await ensureOpenshipPlatformMailbox(installed.serverId);
-        invalidatePlatformTransportCache();
+        invalidatePlatformTransport();
       }
     } catch (err) {
       console.warn("[upgradeToAuth] platform mailbox warm-up failed:", err);
@@ -998,16 +922,13 @@ export async function upgradeToAuth(c: Context) {
   }
 
   // Audit the mode flip.
-  audit.recordAsync(
-    auditContextFrom(c, "instance", localUser.id),
-    {
-      eventType: "auth-mode-changed",
-      resourceType: "instance-settings",
-      resourceId: "instance",
-      before: { authMode: "none" },
-      after: { authMode: "local", upgradedUserId: localUser.id, email },
-    },
-  );
+  audit.recordAsync(auditContextFrom(c, "instance", localUser.id), {
+    eventType: "auth-mode-changed",
+    resourceType: "instance-settings",
+    resourceId: "instance",
+    before: { authMode: "none" },
+    after: { authMode: "local", upgradedUserId: localUser.id, email },
+  });
 
   // 6. Mint a fresh session so the browser stays signed in.
   const ipAddress = c.req.header("x-forwarded-for") ?? "127.0.0.1";
@@ -1049,7 +970,8 @@ export async function upgradeToAuth(c: Context) {
  * After the first server is created this endpoint returns 403.
  */
 export async function onboardingSetup(c: Context) {
-  const cloudGuard = assertNotCloud(c); if (cloudGuard) return cloudGuard;
+  const cloudGuard = assertNotCloud(c);
+  if (cloudGuard) return cloudGuard;
 
   const servers = await repos.server.list();
   if (servers.length > 0) {

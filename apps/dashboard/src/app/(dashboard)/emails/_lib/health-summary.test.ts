@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import en from "@/i18n/locales/en/emailsAdmin.json";
-import type { DnsCheck, MailComponentHealth, MailDeliveryHealth } from "@/lib/api";
+import type {
+  DnsCheck,
+  MailComponentHealth,
+  MailDeliveryHealth,
+  MailPortReachability,
+} from "@/lib/api";
 
 import { summarizeHealth } from "./health-summary";
 
@@ -55,6 +60,17 @@ function delivery(overrides: Partial<MailDeliveryHealth> = {}): MailDeliveryHeal
     queued: 0,
     sampled: false,
     deferrals: [],
+    ...overrides,
+  };
+}
+
+function reachability(overrides: Partial<MailPortReachability> = {}): MailPortReachability {
+  return {
+    hostname: "mail.example.com",
+    address: "203.0.113.10",
+    checkedAt: 0,
+    status: "ok",
+    ports: [],
     ...overrides,
   };
 }
@@ -172,6 +188,59 @@ describe("summarizeHealth", () => {
 
     expect(s?.banner).toContain("danger");
     expect(s?.sub).toBe(h.summary.partDelivery);
+  });
+
+  it("goes red when the daemons listen but a public mail port is blocked", () => {
+    const s = summarizeHealth(
+      NINE_UP,
+      [dns("pass")],
+      delivery(),
+      h,
+      reachability({ status: "fail" }),
+    );
+
+    expect(s?.banner).toContain("danger");
+    expect(s?.sub).toContain(h.summary.partReachability);
+  });
+
+  it("does not grade an unavailable external probe as an outage", () => {
+    const s = summarizeHealth(
+      NINE_UP,
+      [dns("pass")],
+      delivery(),
+      h,
+      reachability({ status: "unknown", detail: "No public DNS result" }),
+    );
+
+    expect(s?.label).toBe(h.summary.allGoodLabel);
+  });
+
+  it("warns instead of declaring mail healthy when inbound SMTP is unverified", () => {
+    const s = summarizeHealth(
+      NINE_UP,
+      [dns("pass")],
+      delivery(),
+      h,
+      reachability({
+        status: "unknown",
+        ports: [
+          {
+            key: "smtp",
+            port: 25,
+            label: "SMTP inbound",
+            status: "blocked",
+            listening: true,
+            exposed: true,
+            reachable: false,
+            failure: "timeout",
+          },
+        ],
+      }),
+    );
+
+    expect(s?.banner).toContain("warning");
+    expect(s?.label).toBe(h.summary.almostLabel);
+    expect(s?.sub).toBe(h.reachability.unknownHint);
   });
 
   /**

@@ -200,6 +200,22 @@ describe("SystemManager.checkFeature — cached fast path", () => {
   });
 });
 
+describe("SystemManager component dependencies", () => {
+  it("requires Docker for bare-mode setup because Edge is a container", () => {
+    const manager = new SystemManager("bare", { executor: box() });
+    expect(manager.getRequired()).toEqual(["docker", "git", "edge"]);
+  });
+
+  it("reports Docker as a routing prerequisite instead of checking Edge alone", async () => {
+    const manager = new SystemManager("bare", { executor: box() });
+
+    const readiness = await manager.checkFeature("routing");
+
+    expect(readiness.ready).toBe(false);
+    expect(readiness.missing.map((component) => component.name)).toEqual(["docker", "edge"]);
+  });
+});
+
 describe("SystemManager state freshness stamp", () => {
   /**
    * The trap: `lastVerifiedAt` is global. A partial check that stamped it would

@@ -76,3 +76,35 @@ describe("updateStatus — a cancelled row is final", () => {
     expect(await repo.updateStatus("nope", "ready")).toBe(false);
   });
 });
+
+describe("cancelInFlight — cancellation admission is atomic", () => {
+  it("cancels an in-flight deployment and pins that outcome", async () => {
+    const { db, repo } = await freshRepo();
+
+    expect(await repo.cancelInFlight("d1")).toBe(true);
+    expect(await repo.updateStatus("d1", "ready")).toBe(false);
+    expect(await statusOf(db)).toBe("cancelled");
+  });
+
+  it("does not cancel a deployment that became ready first", async () => {
+    const { db, repo } = await freshRepo();
+    expect(await repo.updateStatus("d1", "ready")).toBe(true);
+
+    expect(await repo.cancelInFlight("d1")).toBe(false);
+    expect(await statusOf(db)).toBe("ready");
+  });
+
+  it("persists the record-only policy in the same atomic transition", async () => {
+    const { db, repo } = await freshRepo();
+
+    expect(
+      await repo.cancelInFlight("d1", {
+        meta: { cancellation: { keepProvisioned: true } },
+      }),
+    ).toBe(true);
+
+    const row = await db.query.deployment.findFirst({ where: eq(deployment.id, "d1") });
+    expect(row?.status).toBe("cancelled");
+    expect(row?.meta).toEqual({ cancellation: { keepProvisioned: true } });
+  });
+});

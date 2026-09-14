@@ -58,6 +58,9 @@ export interface ApiPlan {
   limits: PlanLimits;
   /** Finished localized strings, numbers already interpolated by the catalog. */
   features: string[];
+  /** "Everything in X, plus:" — a lead-in, NOT a bullet, so it renders above the
+   *  ticked list without a checkmark of its own. */
+  inheritedFrom?: string;
   support: string;
   contactSales?: string | null;
 }
@@ -156,6 +159,25 @@ function resolveCardPrice(plan: ApiPlan): {
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Widest-breakpoint column count, keyed by how many cards there actually are.
+ *
+ * The count was pinned at `xl:grid-cols-5` while the catalog happened to publish
+ * five cards. The moment the $0 tier stopped being rendered, the row kept five
+ * tracks for four cards and left a column of empty space on the right — the grid
+ * was describing the catalog as it was, not as it is.
+ *
+ * Written out as static class strings because Tailwind scans source text: a
+ * computed `xl:grid-cols-${n}` compiles to nothing at all.
+ */
+const WIDEST_COLUMNS: Record<number, string> = {
+  1: "xl:grid-cols-1",
+  2: "xl:grid-cols-2",
+  3: "xl:grid-cols-3",
+  4: "xl:grid-cols-4",
+  5: "xl:grid-cols-5",
+};
+
 export const PricingCards: React.FC<PricingCardsProps> = ({
   plans,
   ui,
@@ -173,7 +195,7 @@ export const PricingCards: React.FC<PricingCardsProps> = ({
   );
 
   return (
-    <div className="grid gap-5 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+    <div className={`grid gap-5 md:grid-cols-2 lg:grid-cols-3 ${WIDEST_COLUMNS[plans.length] ?? "xl:grid-cols-4"}`}>
       {plans.map((plan) => {
         const { listCents, chargedCents, discounted } = resolveCardPrice(plan);
         // Headline = what the customer pays today; the list price moves beside it.
@@ -315,7 +337,14 @@ export const PricingCards: React.FC<PricingCardsProps> = ({
             </div>
 
             {/* Features */}
-            <ul className="space-y-2.5 border-t border-border/30 pt-5">
+            {plan.inheritedFrom ? (
+              <p className="border-t border-border/30 pt-5 text-[12px] font-medium text-muted-foreground">
+                {plan.inheritedFrom}
+              </p>
+            ) : null}
+            <ul
+              className={`space-y-2.5 ${plan.inheritedFrom ? "pt-2.5" : "border-t border-border/30 pt-5"}`}
+            >
               {plan.features.map((feature) => (
                 <li
                   key={feature}

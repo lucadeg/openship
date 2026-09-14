@@ -4,6 +4,70 @@
     "save": "保存",
     "cancel": "キャンセル"
   },
+  "releaseImageSource": {
+    "validationInvalid": "リリースイメージのソースが無効です。",
+    "toast": {
+      "saved": "コンテナリリースのソースを保存しました。",
+      "saveFailed": "コンテナリリースのソースを保存できませんでした。"
+    },
+    "status": {
+      "notDeployed": "未デプロイ",
+      "checking": "確認中…",
+      "unavailable": "利用できません"
+    },
+    "switchToImage": {
+      "title": "ビルド済みイメージのソースに切り替える",
+      "description": "保存すると、すべての環境で現在の Git またはローカルソースが置き換えられます。既存のデプロイとロールバック履歴は引き続き利用できます。",
+      "keep": "現在のソースを維持"
+    },
+    "switchToGit": {
+      "title": "Git ソースに切り替える",
+      "description": "リポジトリをリンクするまで何も変更されません。リンクすると、すべての環境で追跡中のイメージソースが置き換えられます。",
+      "back": "イメージソースに戻る"
+    },
+    "entry": {
+      "shortButton": "ビルド済みイメージを使用",
+      "button": "ビルド済みコンテナイメージを追跡",
+      "description": "リポジトリをクローンまたはビルドせずに、バージョン付きレジストリイメージを直接デプロイします。"
+    },
+    "summary": {
+      "title": "追跡中のコンテナイメージ",
+      "badge": "ビルド済み",
+      "description": "公開済みイメージを直接デプロイします。リポジトリのクローンもビルドコマンドの実行も行いません。",
+      "linkGit": "Git リポジトリをリンク",
+      "image": "イメージ",
+      "versionSource": "バージョンソース",
+      "githubReleases": "GitHub リリース",
+      "pinnedVersion": "固定バージョン",
+      "currentVersion": "現在のバージョン",
+      "targetVersion": "対象バージョン",
+      "latestVersion": "最新バージョン",
+      "updateAvailable": "更新があります"
+    },
+    "editor": {
+      "trackingTitle": "リリース追跡",
+      "configureTitle": "ビルド済みイメージを設定",
+      "templateHint": "{tag} を使うと発行元の正確なタグを保持し、{version} を使うと正規化されたバージョンを使用します。",
+      "provider": "バージョンプロバイダー",
+      "githubTitle": "GitHub リリース",
+      "githubDescription": "最新の公開リリースタグを追跡します。",
+      "urlTitle": "バージョン URL または固定",
+      "urlDescription": "バージョンエンドポイントを読み取るか、固定バージョンをデプロイします。",
+      "imageTemplate": "イメージテンプレート",
+      "imagePlaceholder": "ghcr.io/acme/api:{tag}",
+      "githubRepository": "GitHub リポジトリ",
+      "repoPlaceholder": "owner/repository",
+      "versionUrl": "バージョン URL",
+      "versionUrlPlaceholder": "https://example.com/latest-version",
+      "versionUrlHint": "version/tag_name を含むテキストまたは JSON を返す HTTPS エンドポイントです。",
+      "pinnedVersion": "固定バージョン",
+      "pinnedPlaceholder": "任意。例: v2.4.1",
+      "pinnedHint": "検出された最新バージョンより優先されます。更新を追跡する場合は空欄にします。",
+      "appliesAll": "変更はこのプロジェクトのすべての環境に適用されます。",
+      "saving": "保存中…",
+      "save": "ソースを保存"
+    }
+  },
   "appSettings": {
     "modeApp": "アプリ設定",
     "modeDeployment": "デプロイ",
@@ -108,12 +172,15 @@
       "runningStatus": "実行中 — {status}"
     },
     "cache": {
-      "title": "キャッシュ",
-      "description": "キャッシュされたビルド成果物と依存関係のインストールを消去します",
+      "title": "Docker ビルドキャッシュ",
+      "description": "未使用のビルドキャッシュはサーバーごとに自動で 5 GB に制限されます",
       "clearInstall": "インストールキャッシュを消去",
       "clearInstallDesc": "キャッシュされた node_modules を削除します",
       "clearBuild": "ビルドキャッシュを消去",
-      "clearBuildDesc": "キャッシュされたビルド出力を削除します"
+      "clearBuildDesc": "このプロジェクトの Docker サーバー全体から未使用キャッシュを削除します",
+      "clearBuildConfirm": "このサーバー上の未使用 Docker ビルドキャッシュをすべて消去しますか？他のプロジェクトは次回のデプロイ時に依存関係を再ビルドする場合があります。",
+      "clearBuildSuccess": "ビルドキャッシュを {size} 解放しました",
+      "clearBuildEmpty": "消去できる未使用のビルドキャッシュはありません"
     },
     "transfer": {
       "title": "移行とクローン",
@@ -337,28 +404,7 @@
     "close": "閉じる"
   },
   "gitInfo": {
-    "repository": "リポジトリ",
-    "autoDeploy": "自動デプロイ",
-    "deploysOnPush": "プッシュのたびにデプロイします",
-    "manualOnly": "手動デプロイのみ",
-    "branchToDeploy": "デプロイするブランチ",
-    "chooseBranch": "リポジトリのどのブランチからデプロイするかを選択します",
-    "save": "保存",
-    "cancel": "キャンセル",
-    "viewOnGithub": "GitHub で表示",
-    "recentCommits": "最近のコミット",
-    "totalCommits": "合計 {count} 件",
-    "noCommits": "まだコミットがありません",
-    "toast": {
-      "fetchBranchesFailed": "ブランチの取得に失敗しました",
-      "errorTitle": "エラー",
-      "branchUpdated": "ブランチを更新しました",
-      "updatedTitle": "更新しました",
-      "branchUpdateFailed": "ブランチの更新に失敗しました",
-      "autoDeployEnabled": "自動デプロイを有効にしました",
-      "autoDeployDisabled": "自動デプロイを無効にしました",
-      "autoDeployFailed": "自動デプロイの更新に失敗しました"
-    }
+    "autoDeploy": "自動デプロイ"
   },
   "git": {
     "connectFirst": {
@@ -508,6 +554,9 @@
     "title": "マシンパワー",
     "description": "このプロジェクトのコンテナに適用する CPU とメモリの上限。",
     "loading": "対象マシンを読み取っています…",
+    "unavailable": "マシンパワーを利用できません",
+    "loadFailed": "マシンパワーの読み込みに失敗しました",
+    "retry": "再試行",
     "machineCapacity": "マシン: {cpu} vCPU · {memory}",
     "exceedsMachine": "このマシンの容量を超えています",
     "appliesOnNextDeploy": "上限はコンテナの再作成時に適用されます。変更を反映するには再デプロイしてください。",
@@ -590,10 +639,6 @@
     "cannotUndo": "この操作は取り消せません。",
     "aboutToPrefix": "削除しようとしています: ",
     "aboutToSuffix": "。",
-    "deleteAllAria": "すべての環境を削除",
-    "deleteAll": "すべての環境を削除",
-    "deleteAllOn": "プロジェクトアプリとその配下のすべてのブランチ環境を削除します。",
-    "deleteAllOff": "この環境のみを削除します。他のブランチは残ります。",
     "scanning": "接続されたサービスとボリュームをスキャン中…",
     "wipeAria": "サービスデータも消去",
     "wipeLabelOne": "サービスデータも消去（{count} ボリューム）",
@@ -608,9 +653,7 @@
     "typePrefix": "確認のために ",
     "typeSuffix": " と入力してください。",
     "cancel": "キャンセル",
-    "confirmDeleteWipe": "削除してデータを消去",
     "confirmDeleteEnvWipe": "環境を削除してデータを消去",
-    "confirmDelete": "プロジェクトを削除",
     "confirmDeleteEnv": "環境を削除",
     "linkedTitleOne": "{count} 件のプロジェクトがこのアプリに接続しています",
     "linkedTitleOther": "{count} 件のプロジェクトがこのアプリに接続しています",
@@ -687,6 +730,9 @@
       "defaultAppName": "my-app",
       "mapsToPort": "マッピング先ポート",
       "includeWww": "www を含める",
+      "dnsChallenge": "DNS-01 チャレンジを使用",
+      "dnsChallengeDesc": "接続済みの DNS プロバイダーで証明書を発行・更新します。ポート 80 に到達できない場合に使用してください。",
+      "dnsChallengeWildcardDesc": "ワイルドカード証明書には DNS-01 と接続済みの DNS プロバイダーが必要です。",
       "includeWwwDesc": "www.{domain} 用のレコードも生成します",
       "includeWwwFallback": "yourdomain.com",
       "adding": "追加中...",
@@ -802,6 +848,11 @@
     "records": {
       "failed": "このドメインの DNS レコードを読み込めませんでした。",
       "retry": "再試行"
+    },
+    "outputHint": {
+      "body": "{path} にビルド出力が見つかりません — 出力ディレクトリを確認して再デプロイしてください。",
+      "noIndex": "{path} に出力はありますが index ファイルがありません — リクエストは 404 になります。出力ディレクトリを確認してください。",
+      "notServed": "エッジが {path} に対して HTTP {status} を返しました — このパスは配信されていません。出力ディレクトリとルートを確認してください。"
     }
   }
 }

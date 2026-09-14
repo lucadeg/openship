@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { SshDisconnectedError } from "./errors";
+import { SshDisconnectedError, SshExecRequestError } from "./errors";
 import { probeExec, tryExec, withReason } from "./probe-exec";
 import type { ExecOnly } from "../types";
 
@@ -68,6 +68,23 @@ describe("probeExec", () => {
     await expect(probeExec(throwing(new SshDisconnectedError()), "git --version", "test")).rejects.toThrow(
       SshDisconnectedError,
     );
+  });
+
+  it("re-throws 'Unable to exec' channel failure instead of reporting component as missing", async () => {
+    const failure = new SshExecRequestError(new Error("Unable to exec"));
+    await expect(probeExec(throwing(failure), "git --version", "test")).rejects.toThrow(SshExecRequestError);
+  });
+
+  it("keeps lookalike command stderr as an ordinary probe failure", async () => {
+    const outcome = await probeExec(
+      throwing(new Error("sudo: unable to execute helper: Permission denied")),
+      "git --version",
+      "test",
+    );
+    expect(outcome).toEqual({
+      output: "",
+      error: "sudo: unable to execute helper: Permission denied",
+    });
   });
 
   it("trims the output it reports", async () => {

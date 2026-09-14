@@ -452,6 +452,14 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
                   cd.stopDeployment
                 )}
               </button>
+            ) : state.cancellationPending ? (
+              <button
+                disabled
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl transition-all font-medium text-sm bg-muted text-muted-foreground cursor-not-allowed"
+              >
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {cd.stopping}
+              </button>
             ) : (
               <>
                 {(deploymentStatus === "failed" || deploymentStatus === "cancelled") && (

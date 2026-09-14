@@ -102,7 +102,7 @@ r.post("/teardown-project", { tag: "cloud:admin" }, saas.teardownProjectHandler)
 // directly from github.com / from a popup with no SaaS session cookie.
 // Auth is a single-use random token in the URL. Register these BEFORE
 // the cloudSessionAuth middleware so it isn't gated.
-r.public("get", "/github/install-callback", { reason: "GitHub App install callback - validated by state token in URL" }, saas.githubInstallCallback);
+r.public("get", "/github/install-callback", { reason: "GitHub App install callback - durable state plus GitHub user/App verification" }, saas.githubInstallCallback);
 r.public("get", "/github/oauth-bridge", { reason: "GitHub OAuth bridge redirect - validated by state token, no session" }, saas.githubOauthBridge);
 r.public("get", "/github/oauth-success", { reason: "GitHub OAuth success page - validated by single-use token in URL" }, saas.githubOauthSuccess);
 
@@ -114,4 +114,3 @@ r.post("/github/installation-token", { tag: "cloud:write" }, saas.githubInstalla
 r.get("/github/user-status", { tag: "cloud:read" }, saas.githubUserStatus);
 
 export const cloudSaasRoutes = r.hono;
-

@@ -21,7 +21,11 @@
 
 import { repos } from "@repo/db";
 import { safeErrorMessage } from "@repo/core";
-import { DockerRuntime, type DockerContainerSummary } from "@repo/adapters";
+import {
+  DockerRuntime,
+  containerInfoFromDockerSummary,
+  type DockerContainerSummary,
+} from "@repo/adapters";
 
 /** The stack's own services, in the order they should read in the UI. `edge` is
  *  included — it's the thing holding 80/443, and an operator debugging a routing
@@ -32,12 +36,6 @@ const SERVICE_ORDER = ["api", "dashboard", "edge", "postgres", "redis"];
  *  exist so the UI can show state/logs, but nothing should offer to rebuild them
  *  from source. */
 const INTERNAL_SERVICES = new Set(["postgres", "redis", "edge"]);
-
-/** First published host port, if any (`0.0.0.0:3001->3001/tcp` → 3001). */
-function publishedPort(c: DockerContainerSummary): number | null {
-  for (const p of c.ports ?? []) if (p.publicPort) return p.publicPort;
-  return null;
-}
 
 /** Compose spec strings for a container's published ports (`3001:3001`). */
 export function portSpecs(c: DockerContainerSummary): string[] {
@@ -125,6 +123,7 @@ export async function linkSelfAppServices(
       // per service. `status` is deploy-time bookkeeping only — liveness is read
       // from the host on every request.
       if (deploymentId) {
+        const live = containerInfoFromDockerSummary(container);
         await repos.service
           .upsertServiceDeployment({
             deploymentId,
@@ -133,8 +132,9 @@ export async function linkSelfAppServices(
             containerId: container.id,
             status: container.state === "running" ? "success" : "failure",
             imageRef: container.image ?? null,
-            hostPort: publishedPort(container),
-            ip: container.ip ?? null,
+            hostPort: live.hostPort ?? null,
+            hostPorts: live.hostPortByContainerPort ?? null,
+            ip: live.ip ?? null,
           })
           .catch(() => {});
       }

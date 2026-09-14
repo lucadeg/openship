@@ -32,7 +32,14 @@ import { isLocalHostRow } from "./box-org";
 import { isConnectionLoss } from "./remote-state";
 import { resolveAcmeProviderOptions } from "./acme-config";
 import { findLocalServer } from "./startup/self-server";
+import { requireOrgServer } from "./server-target";
 import { registryAuthResolver } from "../modules/credentials/registry-auth";
+import {
+  LOCAL_HOST_PORT_TARGET,
+  resolveHostPortTargetIdentity,
+  type HostPortConnectionLocator,
+  type HostPortTargetIdentity,
+} from "./host-port-target";
 
 /**
  * The shape of `deployment.meta` JSONB. Snapshotted per-deploy —
@@ -61,6 +68,10 @@ export interface DeploymentMeta {
    * drift banner's `current` anchor.
    */
   releaseVersion?: string;
+  /** Raw upstream release tag and the concrete prebuilt image frozen for a
+   * container-release deployment. */
+  releaseTag?: string;
+  releaseImageRef?: string;
   /**
    * "local" | "server" — where the build runs. A local build targeting cloud
    * keeps the project LOCAL-canonical and uploads the output to a cloud
@@ -137,13 +148,20 @@ export interface DeploymentMeta {
  */
 export function resolveDeploymentStaticRoot(
   deployment: Pick<Deployment, "containerId" | "meta">,
-  project: { hasServer?: boolean | null; workloadType?: string | null; outputDirectory?: string | null },
+  project: {
+    hasServer?: boolean | null;
+    workloadType?: string | null;
+    outputDirectory?: string | null;
+  },
 ): string | null {
   // Only a STATIC workload serves a release directory. A worker also has
   // `hasServer=false` but its containerId is a real container, not a doc-root, so
   // classify by workload — not the legacy boolean — or a worker's stop/start would
   // dial a bogus static path (#538-B).
-  if (resolveWorkload(project.workloadType, project.hasServer) !== "static" || !deployment.containerId) {
+  if (
+    resolveWorkload(project.workloadType, project.hasServer) !== "static" ||
+    !deployment.containerId
+  ) {
     return null;
   }
   const meta = (deployment.meta ?? {}) as DeploymentMeta;
@@ -182,6 +200,22 @@ export interface OutputCheckResult {
   hasIndex: boolean;
   /** False = probe inconclusive (runtime can't exec / errored) — no advisory. */
   checked: boolean;
+  /**
+   * Status the EDGE answered for a real request to this route. Absent = no HTTP
+   * signal (nothing to ask as, no curl, nothing accepted the connection).
+   *
+   * The filesystem fields say the bytes are reachable from where the edge looks;
+   * this says the edge actually serves them — the one check that catches
+   * unreadable file modes and a vhost that was never written.
+   */
+  status?: number;
+  /**
+   * The edge answered and it was not a failure (2xx/3xx, or 401/403 where a policy
+   * answered a route that DID resolve). ABSENT = no signal — readers must test
+   * `served === false`, never `!served`, or every pre-existing record with no HTTP
+   * half reads as broken.
+   */
+  served?: boolean;
   skippedReason?: "no-exec" | "no-output-dir";
 }
 
@@ -192,9 +226,12 @@ export interface ResolvedDeploymentPlatform {
   usesManagedRouting: boolean;
   /** The server ID used for SSH targets (null for local/cloud). */
   serverId: string | null;
+  /** Physical TCP bind namespace used by durable claims and allocation locks. */
+  hostPortTarget: HostPortTargetIdentity | null;
 }
 
 type OrgServer = NonNullable<Awaited<ReturnType<typeof repos.server.getInOrganization>>>;
+type ResolvedServerTarget = Awaited<ReturnType<typeof resolveServerExecutor>>;
 
 /**
  * Resolve the org's deploy-target server and RETURN THE ROW (not just the
@@ -211,30 +248,11 @@ async function resolveOrgServer(
   organizationId: string | undefined,
 ): Promise<OrgServer> {
   if (!organizationId) {
-    throw new Error(
-      "Cannot resolve a server deployment target without an organization ID",
-    );
+    throw new Error("Cannot resolve a server deployment target without an organization ID");
   }
 
   if (serverId) {
-    const server = await repos.server.getInOrganization(serverId, organizationId);
-    if (!server) {
-      // Actionable, but deliberately org-AGNOSTIC in wording: never look the id
-      // up outside this org. The strict org scope here IS the layer-1 host-root
-      // gate (an isLocal row resolved cross-org would escalate any org to a
-      // host-root executor), and the serverId comes from the client-supplied
-      // deploy snapshot — probing it unscoped would also be a cross-tenant
-      // existence/name oracle. So we explain the likely cause + recovery without
-      // revealing whether the id exists elsewhere.
-      throw new Error(
-        "This project's deploy target is no longer available. That server may have been " +
-          "removed from Openship (deleting one unbinds its projects), or this is a stale " +
-          "session after re-deploying Openship at the same URL, or your active organization " +
-          "differs from the project's. Re-open the deploy target picker and reselect a " +
-          "server, or switch your active organization to match, then redeploy.",
-      );
-    }
-    return server;
+    return requireOrgServer(serverId, organizationId);
   }
 
   const servers = await repos.server.listByOrganization(organizationId);
@@ -246,7 +264,39 @@ async function resolveOrgServer(
     throw new Error("No server configured. Add your SSH server in Settings.");
   }
 
-  throw new Error("Deployment target is a server, but this deployment has no server ID. Redeploy and select a server explicitly.");
+  throw new Error(
+    "Deployment target is a server, but this deployment has no server ID. Redeploy and select a server explicitly.",
+  );
+}
+
+async function resolveServerTargetTopology(
+  serverId: string | undefined,
+  organizationId: string | undefined,
+): Promise<{ server: OrgServer; isLocal: boolean }> {
+  const server = await resolveOrgServer(serverId, organizationId);
+  return { server, isLocal: await isLocalHostRow(server) };
+}
+
+/**
+ * Read-only transport topology for preflight. It uses the same org-scoped
+ * server selection and local-host predicate as runtime construction, without
+ * acquiring an SSH/host executor merely to answer where Docker source can run.
+ */
+export async function resolvePlannedTargetTopology(
+  target: DeployTarget,
+  serverId: string | undefined,
+  organizationId: string | undefined,
+): Promise<{
+  serverId: string | null;
+  dockerTransport: "socket" | "ssh" | undefined;
+}> {
+  if (target === "local") return { serverId: null, dockerTransport: "socket" };
+  if (target !== "server") return { serverId: null, dockerTransport: undefined };
+  const { server, isLocal } = await resolveServerTargetTopology(serverId, organizationId);
+  return {
+    serverId: server.id,
+    dockerTransport: isLocal ? "socket" : "ssh",
+  };
 }
 
 /**
@@ -256,7 +306,10 @@ async function resolveOrgServer(
  * and the build pipeline both route through this so their notion of the target
  * can never drift (a drift caused the self-hosted→cloud-preflight 403).
  */
-export function resolveEffectiveTarget(base: Platform["target"], snapshot: DeploymentMeta): DeployTarget {
+export function resolveEffectiveTarget(
+  base: Platform["target"],
+  snapshot: DeploymentMeta,
+): DeployTarget {
   // AUTO-DETECT, don't hardcode per host platform: a deployment PINNED to a
   // specific server always routes over SSH to that server — whether the host is
   // a self-hosted box OR the DESKTOP app operating a remote server. Only the SaaS
@@ -279,7 +332,10 @@ export function resolveEffectiveTarget(base: Platform["target"], snapshot: Deplo
   return "cloud";
 }
 
-export function usesManagedRouting(base: Platform["target"], effectiveTarget: DeployTarget): boolean {
+export function usesManagedRouting(
+  base: Platform["target"],
+  effectiveTarget: DeployTarget,
+): boolean {
   // Managed (local OpenResty) routing applies only to on-box targets. A cloud
   // target — including the local-orchestrated cloud deploy — routes via cloud
   // pages/edge, not the local proxy.
@@ -328,28 +384,70 @@ async function resolveCloudPlatformForOrg(organizationId?: string): Promise<Plat
   });
 }
 
+/**
+ * Derive the physical bind namespace from the exact server resolution that also
+ * built the platform. Reusing that object is load-bearing: a legacy implicit
+ * single-server snapshot must not perform a second mutable server selection for
+ * its host-port identity.
+ */
+function resolveServerHostPortTarget(
+  target: ResolvedServerTarget,
+): Promise<HostPortTargetIdentity> {
+  return resolveHostPortTargetIdentity({
+    localHost: target.isLocal,
+    serverId: target.id,
+    executor: target.executor,
+    connection: target.hostPortConnection,
+  });
+}
+
+/**
+ * Resolve one local/server deployment target once and derive every consumer
+ * from it: platform, concrete server id, and physical host-port identity.
+ */
+async function resolveSelfHostedDeploymentTarget(
+  target: "local" | "server",
+  runtimeMode: RuntimeMode,
+  serverId: string | undefined,
+  organizationId: string | undefined,
+): Promise<Pick<ResolvedDeploymentPlatform, "platform" | "serverId" | "hostPortTarget">> {
+  if (target === "local") {
+    return {
+      platform: await resolveTargetPlatform("local", runtimeMode, undefined, organizationId),
+      serverId: null,
+      hostPortTarget: LOCAL_HOST_PORT_TARGET,
+    };
+  }
+
+  const resolvedServer = await resolveServerExecutor(serverId, organizationId);
+  return {
+    platform: await createPlatformForResolvedServer(resolvedServer, runtimeMode, organizationId),
+    serverId: resolvedServer.id,
+    hostPortTarget: await resolveServerHostPortTarget(resolvedServer),
+  };
+}
+
 export async function resolveDeploymentPlatform(
   snapshot: DeploymentMeta,
   opts?: { organizationId?: string; basePlatform?: Platform },
 ): Promise<ResolvedDeploymentPlatform> {
   const basePlatform = opts?.basePlatform ?? platform();
   const effectiveTarget = resolveEffectiveTarget(basePlatform.target, snapshot);
-  const runtimeMode = snapshot.runtimeMode ?? (basePlatform.runtime.name === "docker" ? "docker" : "bare");
+  const runtimeMode =
+    snapshot.runtimeMode ?? (basePlatform.runtime.name === "docker" ? "docker" : "bare");
 
   if (effectiveTarget === "local" || effectiveTarget === "server") {
-    const resolvedServerId = effectiveTarget === "server" ? (snapshot.serverId ?? null) : null;
-    const targetPlatform = await resolveTargetPlatform(
+    const resolvedTarget = await resolveSelfHostedDeploymentTarget(
       effectiveTarget,
       runtimeMode,
       snapshot.serverId,
       opts?.organizationId,
     );
     return {
-      platform: targetPlatform,
+      ...resolvedTarget,
       effectiveTarget,
       runtimeMode,
       usesManagedRouting: usesManagedRouting(basePlatform.target, effectiveTarget),
-      serverId: resolvedServerId,
     };
   }
 
@@ -375,6 +473,7 @@ export async function resolveDeploymentPlatform(
     runtimeMode,
     usesManagedRouting: usesManagedRouting(basePlatform.target, effectiveTarget),
     serverId: null,
+    hostPortTarget: null,
   };
 }
 
@@ -396,6 +495,48 @@ export async function resolveDeploymentPlatform(
  * For server targets, the executor is acquired from `sshManager` (pooled,
  * idle-TTL, auto-retry) instead of creating a fresh SSH connection.
  */
+async function createPlatformForResolvedServer(
+  resolved: ResolvedServerTarget,
+  runtimeMode: RuntimeMode,
+  organizationId?: string,
+): Promise<Platform> {
+  const resolveRegistryAuth = organizationId ? registryAuthResolver(organizationId) : undefined;
+  const { id, executor, isLocal, ssh } = resolved;
+
+  // The auto-registered "This Server" row IS the OpenShip host (VPS /
+  // server-host mode): local host executor, host docker socket (DooD),
+  // everything on-box.
+  if (isLocal) {
+    return createPlatform({
+      target: "selfhosted",
+      runtime: runtimeMode,
+      executor,
+      localHost: true,
+      docker:
+        runtimeMode === "docker"
+          ? { transport: "socket" as const, resolveRegistryAuth }
+          : undefined,
+      nginx: resolveAcmeProviderOptions(),
+      provisionLock: createProvisionLock("provision:local"),
+    });
+  }
+
+  return createPlatform({
+    target: "selfhosted",
+    runtime: runtimeMode,
+    executor,
+    ssh: ssh!,
+    docker:
+      runtimeMode === "docker"
+        ? { ...toDockerSshTransport(ssh!, executor), resolveRegistryAuth }
+        : undefined,
+    nginx: resolveAcmeProviderOptions(),
+    // Serialize provisioning per target server, so concurrent deploys (across
+    // projects / single-app + compose) never race apt/openresty/networks/state.
+    provisionLock: createProvisionLock(`provision:server:${id}`),
+  });
+}
+
 export async function resolveTargetPlatform(
   target: "local" | "server",
   runtimeMode: RuntimeMode = "bare",
@@ -407,38 +548,14 @@ export async function resolveTargetPlatform(
     // ONE resolution for the server's executor + transport (isLocal → host
     // executor + socket docker; else → pooled SSH). Shared with
     // createServerDockerRuntime / createServerCommandExecutor — no drift.
-    const { id, executor, isLocal, ssh } = await resolveServerExecutor(
-      serverId,
-      organizationId,
-    );
-
-    // The auto-registered "This Server" row IS the OpenShip host (VPS /
-    // server-host mode): local host executor, host docker socket (DooD),
-    // everything on-box.
-    if (isLocal) {
-      return createPlatform({
-        target: "selfhosted",
-        runtime: runtimeMode,
-        executor,
-        localHost: true,
-        docker: runtimeMode === "docker" ? { transport: "socket" as const } : undefined,
-        nginx: resolveAcmeProviderOptions(),
-        provisionLock: createProvisionLock("provision:local"),
-      });
-    }
-
-    return createPlatform({
-      target: "selfhosted",
-      runtime: runtimeMode,
-      executor, // ← managed executor from pool
-      ssh: ssh!,
-      docker: runtimeMode === "docker" ? toDockerSshTransport(ssh!, executor) : undefined,
-      nginx: resolveAcmeProviderOptions(),
-      // Serialize provisioning per target server, so concurrent deploys (across
-      // projects / single-app + compose) never race apt/openresty/networks/state.
-      provisionLock: createProvisionLock(`provision:server:${id}`),
-    });
+    const resolved = await resolveServerExecutor(serverId, organizationId);
+    return createPlatformForResolvedServer(resolved, runtimeMode, organizationId);
   }
+
+  // Bind registry credential lookup to the deployment's organization at the
+  // platform factory. Every local Docker pull then uses the same tenant-safe
+  // resolver as the server helper above.
+  const resolveRegistryAuth = organizationId ? registryAuthResolver(organizationId) : undefined;
 
   // "local" is not a destination anyone picks — it is the ABSENCE of a binding
   // (no cloud workspace, no serverId), so it always means "this box". Nothing
@@ -474,9 +591,8 @@ export async function resolveTargetPlatform(
     // would otherwise read as REMOTE — turning off the containerized edge provider
     // and the same-path-mount rule (`sharedMountExecutor`) for the local box.
     localHost: true,
-    docker: runtimeMode === "docker"
-      ? { transport: "socket" as const }
-      : undefined,
+    docker:
+      runtimeMode === "docker" ? { transport: "socket" as const, resolveRegistryAuth } : undefined,
     nginx: resolveAcmeProviderOptions(),
     // Still serialize provisioning: two local deploys share the same host's
     // openresty/docker/state. Same lock name as the isLocal row's branch, because
@@ -502,7 +618,15 @@ export async function createServerDockerRuntime(
   serverId: string | undefined,
   organizationId: string,
 ): Promise<DockerRuntime> {
-  const { executor, isLocal, ssh } = await resolveServerExecutor(serverId, organizationId);
+  const resolved = await resolveServerExecutor(serverId, organizationId);
+  return createDockerRuntimeForResolvedServer(resolved, organizationId);
+}
+
+async function createDockerRuntimeForResolvedServer(
+  resolved: Pick<Awaited<ReturnType<typeof resolveServerExecutor>>, "executor" | "isLocal" | "ssh">,
+  organizationId: string,
+): Promise<DockerRuntime> {
+  const { executor, isLocal, ssh } = resolved;
   // Registry credentials for every pull this runtime makes, bound to THIS org. Injected
   // rather than read from the host's docker config: it is the only source that works on
   // every install shape, and binding the org here means no later call site can resolve
@@ -654,12 +778,19 @@ export async function resolveServerExecutor(
   conn: { host: string; port: number; user: string };
   isLocal: boolean;
   ssh: SshConfig | null;
+  hostPortConnection: HostPortConnectionLocator;
 }> {
-  const server = await resolveOrgServer(serverId, organizationId);
+  const { server, isLocal } = await resolveServerTargetTopology(serverId, organizationId);
   const conn = {
     host: server.sshHost || "127.0.0.1",
     port: server.sshPort ?? 22,
     user: server.sshUser || "root",
+  };
+  const hostPortConnection: HostPortConnectionLocator = {
+    sshHost: server.sshHost,
+    sshPort: server.sshPort,
+    sshJumpHost: server.sshJumpHost,
+    sshArgs: server.sshArgs,
   };
   // isLocal "This Server" OR a row that actually points at THIS host (a plain SSH
   // row for the local box — loopback / SERVER_IP — in the box-owning org). Both
@@ -667,7 +798,7 @@ export async function resolveServerExecutor(
   // to them hits the API's own loopback (no sshd) — the "Can't reach 127.0.0.1"
   // failure. Org-gated (isLocalHostRow) so a teammate's org can't mint a host-root
   // target from a loopback row.
-  if (await isLocalHostRow(server)) {
+  if (isLocal) {
     // Self-heal the persisted flag so EVERY `server.isLocal` consumer (edge,
     // domains, tunnels, the servers list) agrees — not just this resolver.
     // One-time, idempotent, best-effort; never blocks or fails the deploy.
@@ -684,6 +815,7 @@ export async function resolveServerExecutor(
       conn,
       isLocal: true,
       ssh: null,
+      hostPortConnection,
     };
   }
   const executor = await sshManager.acquire(server.id);
@@ -691,7 +823,7 @@ export async function resolveServerExecutor(
   if (!ssh) {
     throw new Error("Invalid SSH configuration. Check host, auth method, and credentials.");
   }
-  return { id: server.id, executor, conn, isLocal: false, ssh };
+  return { id: server.id, executor, conn, isLocal: false, ssh, hostPortConnection };
 }
 
 /**
@@ -701,7 +833,11 @@ export async function resolveServerExecutor(
 export async function createServerCommandExecutor(
   serverId: string,
   organizationId: string,
-): Promise<{ executor: CommandExecutor; conn: { host: string; port: number; user: string }; isLocal: boolean }> {
+): Promise<{
+  executor: CommandExecutor;
+  conn: { host: string; port: number; user: string };
+  isLocal: boolean;
+}> {
   const { executor, conn, isLocal } = await resolveServerExecutor(serverId, organizationId);
   return { executor, conn, isLocal };
 }
@@ -747,6 +883,10 @@ export async function resolveDeploymentRuntime(
   routing: Platform["routing"];
   effectiveTarget: DeployTarget;
   serverId: string | null;
+  /** Physical bind namespace used by durable host-port ownership. */
+  hostPortTarget: HostPortTargetIdentity | null;
+  /** Executor that reaches the same host as `routing` (null on cloud). */
+  executor: Platform["executor"];
 }> {
   const snapshot = (dep.meta ?? {}) as DeploymentMeta;
   const resolved = await resolveDeploymentPlatform(snapshot, {
@@ -757,6 +897,8 @@ export async function resolveDeploymentRuntime(
     routing: resolved.platform.routing,
     effectiveTarget: resolved.effectiveTarget,
     serverId: resolved.serverId,
+    hostPortTarget: resolved.hostPortTarget,
+    executor: resolved.platform.executor,
   };
 }
 
@@ -799,7 +941,9 @@ export async function deploymentContainerIds(
   // know how many containers this deployment has, and falling back to the single
   // `containerId` would quietly act on one of them.
   const rows = await repos.service.listByDeployment(dep.id);
-  const serviceIds = [...new Set(rows.map((r) => r.containerId).filter((id): id is string => !!id))];
+  const serviceIds = [
+    ...new Set(rows.map((r) => r.containerId).filter((id): id is string => !!id)),
+  ];
   if (serviceIds.length > 0) return serviceIds;
   // The compose sentinel is a marker, not a container: returning it made a pause
   // report success having stopped nothing (docker 404 → `isAbsent` → swallowed).
@@ -965,8 +1109,11 @@ export async function withDeploymentPlatform<T>(
     runtime: RuntimeAdapter;
     routing: Platform["routing"];
     ssl: Platform["ssl"];
+    executor: Platform["executor"];
     effectiveTarget: DeployTarget;
     serverId: string | null;
+    /** Physical TCP bind namespace matching this exact routing/executor target. */
+    hostPortTarget: HostPortTargetIdentity | null;
   }) => Promise<T>,
 ): Promise<T> {
   const resolved = await resolveDeploymentPlatform((dep.meta ?? {}) as DeploymentMeta, {
@@ -977,8 +1124,10 @@ export async function withDeploymentPlatform<T>(
       runtime: resolved.platform.runtime,
       routing: resolved.platform.routing,
       ssl: resolved.platform.ssl,
+      executor: resolved.platform.executor,
       effectiveTarget: resolved.effectiveTarget,
       serverId: resolved.serverId,
+      hostPortTarget: resolved.hostPortTarget,
     });
   } catch (err) {
     throw asHostUnreachable(err);
@@ -1008,7 +1157,11 @@ function asHostUnreachable(err: unknown): unknown {
 
 export async function resolveDeploymentRuntimeForRead(
   dep: Pick<Deployment, "meta" | "organizationId">,
-): Promise<{ runtime: RuntimeAdapter; serverId: string | null }> {
+): Promise<{
+  runtime: RuntimeAdapter;
+  serverId: string | null;
+  hostPortTarget: HostPortTargetIdentity | null;
+}> {
   // Services are containers even when the app itself deploys "bare" — pin docker
   // so a bare project's sidecars still resolve a docker runtime (matches
   // resolveServicePlatform's long-standing behaviour).
@@ -1016,18 +1169,29 @@ export async function resolveDeploymentRuntimeForRead(
   const effectiveTarget = resolveEffectiveTarget(platform().target, snapshot);
 
   if (effectiveTarget === "server") {
+    const target = await resolveServerExecutor(snapshot.serverId, dep.organizationId);
     return {
-      runtime: await createServerDockerRuntime(snapshot.serverId, dep.organizationId),
-      // Same value resolveDeploymentPlatform reports: the RECORDED id, which
-      // streaming callers use to retain/release the pooled SSH connection.
-      serverId: snapshot.serverId ?? null,
+      runtime: await createDockerRuntimeForResolvedServer(target, dep.organizationId),
+      // The concrete id selected by the same org-scoped resolution that built
+      // the transport; legacy implicit-single-server snapshots must not report
+      // null or resolve a different row on a second lookup.
+      serverId: target.id,
+      hostPortTarget: await resolveServerHostPortTarget(target),
     };
   }
   if (effectiveTarget === "local") {
-    return { runtime: await DockerRuntime.create({ transport: "socket" }), serverId: null };
+    return {
+      runtime: await DockerRuntime.create({ transport: "socket" }),
+      serverId: null,
+      hostPortTarget: LOCAL_HOST_PORT_TARGET,
+    };
   }
   const resolved = await resolveDeploymentPlatform(snapshot, {
     organizationId: dep.organizationId,
   });
-  return { runtime: resolved.platform.runtime, serverId: resolved.serverId };
+  return {
+    runtime: resolved.platform.runtime,
+    serverId: resolved.serverId,
+    hostPortTarget: resolved.hostPortTarget,
+  };
 }

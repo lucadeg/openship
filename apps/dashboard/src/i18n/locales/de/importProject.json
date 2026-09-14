@@ -414,5 +414,14 @@
     "rowServices": "Services",
     "rowProject": "Projekt",
     "rowType": "Typ"
+  },
+  "configDiagnostics": {
+    "title": "Teile der openship.json dieses Repos wurden nicht angewendet",
+    "description": "Die unten aufgeführten Felder wurden übersprungen; der Rest der Datei wurde angewendet. Das Deployment läuft weiter.",
+    "titleWholeFile": "Die openship.json dieses Repos wurde ignoriert",
+    "descriptionWholeFile": "Nichts davon wurde angewendet. Das Deployment läuft weiter, mit den von Openship erkannten Einstellungen.",
+    "refused": "Abgelehnt",
+    "unrecognized": "Nicht erkannt",
+    "hint": "Führe `openship config validate` im Repo aus, um die Datei vor dem nächsten Deployment zu prüfen."
   }
 }

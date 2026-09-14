@@ -199,7 +199,7 @@ export async function records(c: Context) {
   const ctx = getRequestContext(c);
   const id = param(c, "id");
   await permission.assert(getRequestContext(c), { resourceType: "domain", resourceId: id, action: "read" });
-  const result = await domainService.getDomainRecords(ctx, id);
+  const result = await domainService.getDomainRecords(ctx, id, dnsTargetServerId(c));
   return c.json({ data: result });
 }
 
@@ -208,7 +208,7 @@ export async function dnsPlan(c: Context) {
   const ctx = getRequestContext(c);
   const id = param(c, "id");
   await permission.assert(getRequestContext(c), { resourceType: "domain", resourceId: id, action: "read" });
-  const result = await domainService.planDomainDns(ctx, id);
+  const result = await domainService.planDomainDns(ctx, id, dnsTargetServerId(c));
   return c.json({ data: result });
 }
 
@@ -217,7 +217,7 @@ export async function dnsApply(c: Context) {
   const ctx = getRequestContext(c);
   const id = param(c, "id");
   await permission.assert(getRequestContext(c), { resourceType: "domain", resourceId: id, action: "write" });
-  const result = await domainService.applyDomainDns(ctx, id);
+  const result = await domainService.applyDomainDns(ctx, id, dnsTargetServerId(c));
   audit.recordAsync(auditContextFrom(c, ctx.organizationId, ctx.userId), {
     eventType: "domain.dns_provisioned",
     resourceType: "domain",
@@ -229,6 +229,11 @@ export async function dnsApply(c: Context) {
     },
   });
   return c.json({ data: result });
+}
+
+/** An explicit wizard target overrides a project's prior deployment for DNS guidance. */
+function dnsTargetServerId(c: Context): string | undefined {
+  return c.req.query("serverId")?.trim() || undefined;
 }
 
 /** POST /domains/:id/primary - make this domain the project's primary */
@@ -249,7 +254,7 @@ export async function setPrimary(c: Context) {
 /** POST /domains/preview - get DNS records for a hostname (no DB write) */
 export async function preview(c: Context) {
   const ctx = getRequestContext(c);
-  const body = await c.req.json<{ hostname: string; includeWww?: boolean }>();
+  const body = await c.req.json<{ hostname: string; includeWww?: boolean; serverId?: string }>();
   if (!body.hostname?.trim()) {
     return c.json({ error: "hostname is required" }, 400);
   }
@@ -257,6 +262,7 @@ export async function preview(c: Context) {
     body.hostname.trim().toLowerCase(),
     ctx.organizationId,
     body.includeWww === true,
+    body.serverId,
   );
   return c.json({ data: result });
 }

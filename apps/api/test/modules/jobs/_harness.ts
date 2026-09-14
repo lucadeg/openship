@@ -72,7 +72,7 @@ export interface SeededOwner {
 
 /** Seed a user + org + owner membership + unscoped PAT. Returns a ready auth
  *  header. Owner role clears job:read/job:write without any grant rows. */
-export async function seedOwner(): Promise<SeededOwner> {
+export async function seedOwner(opts: { instanceAdmin?: boolean } = {}): Promise<SeededOwner> {
   const userId = uid("user");
   const orgId = `org_${userId}`;
   const now = new Date();
@@ -81,7 +81,7 @@ export async function seedOwner(): Promise<SeededOwner> {
     name: "Owner",
     email: `${userId}@test.local`,
     emailVerified: true,
-    role: "user",
+    role: opts.instanceAdmin ? "admin" : "user",
     autoProvisioned: false,
     createdAt: now,
     updatedAt: now,

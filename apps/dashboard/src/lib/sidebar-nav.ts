@@ -89,7 +89,7 @@ const MAIN_ITEMS: NavItem[] = [
   // infrastructure section is `if (selfHosted)` — putting Issues in it would delete the
   // page from cloud. No count badge: the nav's single getHome() fetch carries no issue
   // total, and a badge here would be the only notification-style one in the rail.
-  { key: "issues", href: "/issues", icon: ShieldAlert },
+  { key: "issues", href: "/monitoring", icon: HeartPulse },
 ];
 
 /** Build nav sections dynamically */
@@ -314,7 +314,7 @@ export function getMailNavSections(i: MailNavInput): NavSection[] {
     {
       section: "system",
       items: [
-        { key: "issues", href: "/issues", icon: ShieldAlert },
+        { key: "issues", href: "/monitoring", icon: HeartPulse },
         { key: "settings", href: "/settings", icon: Settings },
       ],
     },

@@ -45,7 +45,11 @@ import { runConnectivityCheck } from "../../lib/connectivity";
 import "../../lib/connectivity-checks"; // registers the S3 probe used below
 import { getAppConnectionView } from "../apps/app-settings.service";
 import { mergeEnvVars } from "./project-env.service";
-import { createConnection, deleteConnection } from "./project-connection.service";
+import {
+  createConnection,
+  deleteConnection,
+  internalModeAvailable,
+} from "./project-connection.service";
 
 const ENVIRONMENT = "production";
 
@@ -344,18 +348,18 @@ async function writeBinding(
   }
 
   // Nothing chosen → prefer internal: upload traffic between two containers on
-  // the same box has no reason to leave through the edge. Internal isn't always
-  // available (a cloud-hosted source has no attachable shared network) and the
-  // connection layer is the authority on that, so try it and fall back instead of
-  // re-deriving the rule here. Its internal check runs before it writes anything,
-  // so a rejected attempt leaves nothing behind — and only THAT rejection is
-  // retried; any other failure is the caller's to see.
-  try {
-    await link("internal");
-  } catch (err) {
-    if (!/internal mode isn't available/i.test(safeErrorMessage(err))) throw err;
-    await link("public");
-  }
+  // the same box has no reason to leave through the edge. The connection layer
+  // stays the authority on whether internal is available, but ASK it about the
+  // ENDPOINT — the only one of these outputs that carries a host. Inferring the
+  // answer from a failed `link("internal")` made the mode depend on whichever
+  // output threw first, which was always a credential: once credentials stopped
+  // being rejected for not parsing as URLs, every bind silently flipped to
+  // internal, endpoint rewrite and cross-server reachability unchecked.
+  const internal = await internalModeAvailable(ctx, projectId, {
+    sourceProjectId,
+    outputId: SOURCE_OUTPUT_IDS.endpoint,
+  });
+  await link(internal ? "internal" : "public");
 }
 
 /**

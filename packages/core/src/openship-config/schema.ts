@@ -90,6 +90,12 @@ export interface OpenshipService {
   image?: string;
   build?: string;
   dockerfile?: string;
+  /**
+   * Dockerfile build arguments for this service. A null value inherits the
+   * same-named value from the project's `env`; a string is an explicit
+   * service-local override. Runtime variables continue to live in `env`.
+   */
+  buildArgs?: Record<string, string | null>;
   ports?: string[];
   volumes?: string[];
   dependsOn?: string[];

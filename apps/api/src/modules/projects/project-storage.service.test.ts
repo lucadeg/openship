@@ -19,7 +19,9 @@ const h = vi.hoisted(() => ({
   projects: {} as Record<string, Record<string, unknown> | null>,
   updates: [] as Array<{ id: string; patch: Record<string, unknown> }>,
   merges: [] as Array<{ projectId: string; upserts: { key: string; value: string; isSecret?: boolean }[]; deletes: string[] }>,
-  connections: [] as Array<{ projectId: string; sourceProjectId: string; outputId: string; envKey: string }>,
+  connections: [] as Array<{ projectId: string; sourceProjectId: string; outputId: string; envKey: string; mode?: string }>,
+  internalAvailable: true,
+  internalAsks: [] as Array<{ projectId: string; sourceProjectId: string; outputId: string }>,
   links: [] as Array<{ id: string; envKey: string; sourceProjectId: string }>,
   deletedLinks: [] as string[],
   probe: vi.fn(async () => ({ ok: true }) as { ok: boolean; message?: string }),
@@ -56,9 +58,13 @@ vi.mock("./project-env.service", () => ({
   }),
 }));
 vi.mock("./project-connection.service", () => ({
-  createConnection: vi.fn(async (_ctx: unknown, projectId: string, input: { sourceProjectId: string; outputId: string; envKey: string }) => {
+  createConnection: vi.fn(async (_ctx: unknown, projectId: string, input: { sourceProjectId: string; outputId: string; envKey: string; mode?: string }) => {
     h.connections.push({ projectId, ...input });
     h.links.push({ id: `link_${input.envKey}`, envKey: input.envKey, sourceProjectId: input.sourceProjectId });
+  }),
+  internalModeAvailable: vi.fn(async (_ctx: unknown, projectId: string, input: { sourceProjectId: string; outputId: string }) => {
+    h.internalAsks.push({ projectId, ...input });
+    return h.internalAvailable;
   }),
   deleteConnection: vi.fn(async (_ctx: unknown, _projectId: string, linkId: string) => {
     h.deletedLinks.push(linkId);
@@ -83,6 +89,8 @@ beforeEach(() => {
   h.links = [];
   h.deletedLinks = [];
   h.redeploys = [];
+  h.internalAsks = [];
+  h.internalAvailable = true;
   h.probe.mockResolvedValue({ ok: true });
   h.outputs = [
     { id: "endpoint", value: "https://minio.example.com" },
@@ -189,6 +197,46 @@ describe("bindObjectStorage — an installed storage app", () => {
   it("says so when the source app hasn't published its endpoint yet", async () => {
     h.outputs = [];
     await expect(bindObjectStorage(ctx, "app", input)).rejects.toThrow(/deploy it first/i);
+  });
+});
+
+/**
+ * GH-631/#632 follow-up. The dashboard sends NO mode, so this is the default
+ * path. It used to pick internal-vs-public by catching the "internal mode isn't
+ * available" ValidationError — which the FIRST linked output always threw, and
+ * that output is a credential (AWS_ACCESS_KEY_ID is pushed first). Once
+ * credentials stopped being rejected for not parsing as URLs, every bind flipped
+ * to internal with nothing checking that the ENDPOINT was internally reachable.
+ * The mode must come from asking about the endpoint, and from nothing else.
+ */
+describe("bindObjectStorage — choosing internal vs public with no mode given", () => {
+  const input = { sourceProjectId: "store", bucket: "uploads" };
+
+  it("asks the connection layer about the ENDPOINT output, not a credential", async () => {
+    await bindObjectStorage(ctx, "app", input);
+    expect(h.internalAsks).toEqual([
+      { projectId: "app", sourceProjectId: "store", outputId: "endpoint" },
+    ]);
+  });
+
+  it("wires every output internal when the endpoint resolves internally", async () => {
+    await bindObjectStorage(ctx, "app", input);
+    expect(h.connections.map((c) => c.mode)).toEqual(["internal", "internal", "internal"]);
+  });
+
+  it("wires public — not internal — when the endpoint has no internal address", async () => {
+    // e.g. the storage app runs on another server, or on Oblien cloud: the
+    // per-host `openship-<slug>` network isn't joinable, so an alias would
+    // resolve nowhere while the bind still reported success.
+    h.internalAvailable = false;
+    await bindObjectStorage(ctx, "app", input);
+    expect(h.connections.map((c) => c.mode)).toEqual(["public", "public", "public"]);
+  });
+
+  it("an EXPLICIT mode is still obeyed without asking", async () => {
+    await bindObjectStorage(ctx, "app", { ...input, mode: "public" as const });
+    expect(h.internalAsks).toEqual([]);
+    expect(h.connections.map((c) => c.mode)).toEqual(["public", "public", "public"]);
   });
 });
 

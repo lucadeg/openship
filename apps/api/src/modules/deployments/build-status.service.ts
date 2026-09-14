@@ -128,6 +128,15 @@ export async function getBuildSessionStatus(deploymentId: string) {
     repos.service.listByDeployment(deploymentId).catch(() => []),
     repos.service.listByProject(project.id).catch(() => []),
   ]);
+  // A cancelled row is not necessarily safe to replace immediately: the
+  // asynchronous worker keeps its durable build-session lease until its outer
+  // finally has finished unwinding. Surface that distinction to the dashboard
+  // so it can show "finishing cancellation" instead of offering a redeploy that
+  // the concurrency guard will (correctly) reject.
+  const cancellationPending =
+    dep.status === "cancelled"
+      ? await repos.deployment.hasLiveBuildExecution(dep.id, project.id).catch(() => true)
+      : false;
   const isServiceDeployment =
     snapshot?.serviceDeploymentMode === "services" ||
     (
@@ -243,6 +252,7 @@ export async function getBuildSessionStatus(deploymentId: string) {
     // the server-backed keep/reject decision so the "Action Required" banner +
     // modal reappear after a refresh, until the user keeps or rejects.
     deploymentStatus: dep.status,
+    cancellationPending,
     decisionPending: snapshot?.composeDeployment?.decision === "pending",
     partial: snapshot?.composeDeployment
       ? {

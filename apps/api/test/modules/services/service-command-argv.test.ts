@@ -17,6 +17,8 @@ vi.mock("@repo/db", async (importOriginal) => {
 });
 
 import { syncComposeServices, updateService } from "../../../src/modules/services/service.service";
+import { toComposeSpec } from "@repo/db";
+import { mergeServiceDeployEnv } from "../../../src/modules/deployments/compose/service-env-layers";
 
 /**
  * #332 left the EDITORS behind: the compose parser produced `commandArgv`, but
@@ -153,5 +155,88 @@ describe("syncComposeServices — hands the command to the repo untouched", () =
 
     expect(synced()[0]?.environment).toEqual({ SECRET: "real-value" });
     expect(synced()[0]).not.toHaveProperty("commandArgv");
+  });
+
+  it("preserves Compose env expressions and resolves them from project env at deploy (#751)", async () => {
+    await syncComposeServices(ctx, project.id, [
+      {
+        name: "web",
+        image: "ghcr.io/acme/app:1",
+        environment: {
+          APP_KEY: "${APP_KEY}",
+          APP_URL: "https://${APP_HOST}/api",
+          ESCAPED_LITERAL: "$${APP_HOST}",
+          NODE_ENV: "production",
+        },
+      },
+    ]);
+
+    const imported = synced()[0]!;
+    expect(imported.environmentTemplates).toEqual({
+      APP_KEY: "${APP_KEY}",
+      APP_URL: "https://${APP_HOST}/api",
+      ESCAPED_LITERAL: "$${APP_HOST}",
+    });
+
+    // Exercise the same DB normalization + deploy env merge used by a real
+    // service row, rather than only asserting the API's intermediate object.
+    const spec = toComposeSpec(imported);
+    expect(spec.advanced?.environmentTemplateKeys).toEqual([
+      "APP_KEY",
+      "APP_URL",
+      "ESCAPED_LITERAL",
+    ]);
+    const deployed = mergeServiceDeployEnv(
+      {
+        project: { APP_KEY: "secret-value", APP_HOST: "app.example.com" },
+        frozen: {},
+        inline: spec.environment,
+        templateKeys: spec.advanced?.environmentTemplateKeys,
+        service: {},
+      },
+      false,
+    );
+    expect(deployed.env).toMatchObject({
+      APP_KEY: "secret-value",
+      APP_URL: "https://app.example.com/api",
+      ESCAPED_LITERAL: "${APP_HOST}",
+      NODE_ENV: "production",
+    });
+    expect(deployed.missingRequired).toEqual([]);
+  });
+
+  it("honors an explicit normalized marker instead of expanding a dollar twice", async () => {
+    await syncComposeServices(ctx, project.id, [
+      {
+        name: "web",
+        environment: { ESCAPED_LITERAL: "${APP_HOST}" },
+        advanced: { environmentTemplateKeys: [] },
+      },
+    ]);
+
+    expect(synced()[0]?.environment).toEqual({ ESCAPED_LITERAL: "${APP_HOST}" });
+    expect(synced()[0]).not.toHaveProperty("environmentTemplates");
+    expect(synced()[0]?.advanced).toMatchObject({ environmentTemplateKeys: [] });
+  });
+
+  it("records empty provenance so an authored blank can clear a project value", async () => {
+    await syncComposeServices(ctx, project.id, [
+      { name: "web", environment: { HTTP_PROXY: "" } },
+    ]);
+
+    const spec = toComposeSpec(synced()[0]!);
+    expect(spec.advanced?.environmentTemplateKeys).toEqual([]);
+    const deployed = mergeServiceDeployEnv(
+      {
+        project: { HTTP_PROXY: "http://corp:3128" },
+        frozen: {},
+        inline: spec.environment,
+        templateKeys: spec.advanced?.environmentTemplateKeys,
+        service: {},
+      },
+      false,
+    );
+    expect(deployed.env.HTTP_PROXY).toBe("");
+    expect(deployed.deferredEmpty).toEqual([]);
   });
 });

@@ -103,18 +103,44 @@ export async function liveContainerIdWithRuntime(
   runtime: HostContainerLister | null | undefined,
   args: { service: { id: string; name: string }; projectId: string; slug: string; tracked: string | null },
 ): Promise<string | null> {
-  if (!runtime?.supports("hostContainerQuery") || !runtime.listAllContainers) return args.tracked;
+  return (await liveContainerStateWithRuntime(runtime, args)).containerId;
+}
+
+/**
+ * The same resolution, keeping the RUNNING fact instead of discarding it.
+ *
+ * `resolveLiveServiceState` already computes a status for the container it matched;
+ * every caller above threw it away, so consumers that need "can I exec in here"
+ * — a logical database dump, above all — had only an id, and an id is also what a
+ * stopped container has.
+ *
+ * `running: null` means we could not ask (no host query, unreachable host, failed
+ * enumeration). Never conflate that with `false`: unknown must let a caller proceed,
+ * or the cloud and bare sources lose their dumps.
+ *
+ * Only `stopped` reports `false`. That status is docker's
+ * created/exited/paused/removing set — exactly the states where `docker exec`
+ * refuses — while an unhealthy-but-running container stays `true`, because a dump
+ * against it works.
+ */
+export async function liveContainerStateWithRuntime(
+  runtime: HostContainerLister | null | undefined,
+  args: { service: { id: string; name: string }; projectId: string; slug: string; tracked: string | null },
+): Promise<{ containerId: string | null; running: boolean | null }> {
+  if (!runtime?.supports("hostContainerQuery") || !runtime.listAllContainers) {
+    return { containerId: args.tracked, running: null };
+  }
   const containers = await runtime.listAllContainers().catch(() => null);
-  if (!containers) return args.tracked;
-  return (
-    resolveLiveServiceState({
-      services: [args.service],
-      live: containers,
-      projectId: args.projectId,
-      slug: args.slug,
-      trackedIds: { [args.service.id]: args.tracked },
-    }).get(args.service.id)?.containerId ?? null
-  );
+  if (!containers) return { containerId: args.tracked, running: null };
+  const match = resolveLiveServiceState({
+    services: [args.service],
+    live: containers,
+    projectId: args.projectId,
+    slug: args.slug,
+    trackedIds: { [args.service.id]: args.tracked },
+  }).get(args.service.id);
+  if (!match?.containerId) return { containerId: null, running: null };
+  return { containerId: match.containerId, running: match.status !== "stopped" };
 }
 
 /**
@@ -201,13 +227,27 @@ export async function liveContainerIdForService(
   service: { id: string; name: string },
   opts?: { projectId?: string },
 ): Promise<string | null> {
+  return (await liveContainerForService(project, dep, service, opts)).containerId;
+}
+
+/**
+ * `liveContainerIdForService` plus the running fact — see
+ * `liveContainerStateWithRuntime` for why the two travel together and why
+ * `running: null` (unknown) is not `false`.
+ */
+export async function liveContainerForService(
+  project: { slug: string; organizationId: string },
+  dep: { id: string; meta?: unknown },
+  service: { id: string; name: string },
+  opts?: { projectId?: string },
+): Promise<{ containerId: string | null; running: boolean | null }> {
   const tracked = await containerIdForService(dep, service);
   const projectId = opts?.projectId;
 
   const runtime = await resolveServiceRuntimeForRead(project, { meta: dep.meta });
-  if (!runtime) return tracked;
+  if (!runtime) return { containerId: tracked, running: null };
   try {
-    return await liveContainerIdWithRuntime(runtime, {
+    return await liveContainerStateWithRuntime(runtime, {
       service: { id: service.id, name: service.name },
       projectId: projectId ?? "",
       slug: project.slug,

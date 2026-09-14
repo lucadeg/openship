@@ -16,6 +16,7 @@
 import { randomBytes } from "node:crypto";
 // Type-only — keeps this module runtime-dependency-free (see the note above).
 import type { DeployableService } from "../../../lib/deployable-service";
+import type { OpenshipEnv } from "@repo/core";
 
 export type FolderUploadMode = "oblien-direct" | "api-relay";
 
@@ -36,13 +37,16 @@ export interface FolderSession {
   /** Detected/typed name hint for the project. */
   name?: string;
   /**
-   * Compose services the SCAN parsed out of the uploaded source. Written by
-   * `scanFolderSession`, read by the deploy step (`requestBuildAccess`) when the
-   * caller didn't forward `services` itself — the uploaded compose file is the
-   * only description a folder deploy has of its service set, and nothing else
-   * survives the scan → ensure → deploy hop.
+   * Compose services from the client-visible scan of the uploaded source. This
+   * remains the immutable edit baseline for the session: deploy-time refreshes
+   * use the final project env but do not replace it, so retries cannot mistake a
+   * stale wizard payload for an intentional image override.
    */
   services?: DeployableService[];
+  /** Trusted, pre-mask source env retained for the eventual build request. */
+  rootEnv?: Record<string, string>;
+  /** The subset explicitly declared by openship.json (automatic defaults). */
+  openshipEnv?: OpenshipEnv;
 }
 
 const sessions = new Map<string, FolderSession>();

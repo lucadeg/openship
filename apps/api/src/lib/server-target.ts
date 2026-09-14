@@ -1,8 +1,28 @@
 import { repos, type Project } from "@repo/db";
+import { AppError, isLoopbackHost as isCoreLoopbackHost } from "@repo/core";
 import { env } from "../config/env";
 
 interface DeploymentSnapshotLike {
   serverId?: string;
+}
+
+/**
+ * Resolve an explicit registered-server capability inside one organization.
+ * This is the shared write-path guard for project creation and deployment
+ * requests; callers must run it before they persist or reconcile anything.
+ */
+export async function requireOrgServer(serverId: string, organizationId: string) {
+  const server = await repos.server.getInOrganization(serverId, organizationId);
+  if (!server) {
+    // Deliberately org-agnostic: do not reveal whether the submitted id exists
+    // for another tenant.
+    throw new AppError(
+      "This deploy target is not available in the active organization. Reselect the server or switch organizations and retry.",
+      404,
+      "SERVER_TARGET_UNAVAILABLE",
+    );
+  }
+  return server;
 }
 
 /**
@@ -24,10 +44,7 @@ async function resolveSnapshotServerHost(
   snapshot?: DeploymentSnapshotLike | null,
 ): Promise<string | null> {
   if (snapshot?.serverId) {
-    const server = await repos.server.getInOrganization(
-      snapshot.serverId,
-      organizationId,
-    );
+    const server = await repos.server.getInOrganization(snapshot.serverId, organizationId);
     if (server?.sshHost) return server.sshHost;
     return null;
   }
@@ -39,10 +56,7 @@ export async function resolveServerHost(
   organizationId: string,
   serverId?: string,
 ): Promise<string | null> {
-  return resolveSnapshotServerHost(
-    organizationId,
-    serverId ? { serverId } : null,
-  );
+  return resolveSnapshotServerHost(organizationId, serverId ? { serverId } : null);
 }
 
 export async function resolveProjectServerHost(project?: Project): Promise<string | null> {
@@ -81,9 +95,7 @@ export function isIpLiteral(value: string): boolean {
  * must treat that as "unknown", not a real address.
  */
 export function isLoopbackHost(host: string | null | undefined): boolean {
-  if (!host) return false;
-  const h = host.trim().toLowerCase();
-  return h === "127.0.0.1" || h === "::1" || h === "localhost" || h === "0.0.0.0" || h.startsWith("127.");
+  return isCoreLoopbackHost(host);
 }
 
 /**

@@ -38,6 +38,7 @@ import {
   edgeProxy,
   edgeProxyFor,
   collectProxyCerts,
+  isOurEdgeContainer,
   unreachableStaticRoots,
   copyStaticRootIntoEdge,
   type CommandExecutor,
@@ -477,7 +478,10 @@ export async function diagnoseEdge(): Promise<EdgeDiagnosis> {
   // Occupants that are NOT our edge container: a host process (systemd unit or a
   // bare pid) or some other container. If our container is meant to own these
   // ports, anything else here is what's blocking it.
-  const foreignOccupants = status.occupants.filter((o) => o.containerName !== "openship-edge");
+  // `isOurEdgeContainer`, not a name comparison: the container name is configurable via
+  // OPENSHIP_EDGE_CONTAINER, so a renamed edge running our image compared unequal here and
+  // read as a foreign proxy blocking itself.
+  const foreignOccupants = status.occupants.filter((o) => !isOurEdgeContainer(o.containerName));
   const hostProxySquatting =
     !running && foreignOccupants.some((o) => !o.containerName);
 

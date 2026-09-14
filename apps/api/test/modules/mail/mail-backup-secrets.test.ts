@@ -58,16 +58,36 @@ describe("mail backup cannot silently omit the secrets it was asked for", () => 
   });
 
   it("tars as root, so it can read back what it staged as root", () => {
-    // Not cosmetic: `sudo -n cp -a` stages root-owned 0600 files. An unprivileged tar would
-    // fail to read them — and `zstd` masks tar's exit status in this pipeline, so the run
-    // would still exit 0 with a truncated artifact. Same reason /var/vmail needs it.
+    // Not cosmetic: `sudo -n cp -a` stages root-owned 0600 files, and an unprivileged tar
+    // would fail to read them. Same reason /var/vmail needs it.
+    //
+    // Asserted as "EVERY `tar -c` is privileged" rather than "the tar line starts with
+    // sudo": the pipeline is now built by the shared `safePipelineFragment`, so the
+    // invocation sits inside an `if` and no longer begins the line. The property is the
+    // privilege, not the column it appears in — and the old prefix match would also have
+    // gone green if a second, unprivileged tar were added below it.
     for (const messageData of [false, true]) {
       const script = buildMailBackupPayload("example.com", { messageData, keys: true })
         .payloadConfig.produceCommand;
-      const tar = script.split("\n").find((l) => l.includes("tar -c"));
-      expect(tar, `no tar line (messageData: ${messageData})`).toBeDefined();
-      expect(tar).toMatch(/^sudo -n tar -c/);
+      const invocations = [...script.matchAll(/(\S*\s*\S*\s*)?tar -c/g)].map((m) => m[0]);
+      expect(invocations.length, `no tar -c (messageData: ${messageData})`).toBeGreaterThan(0);
+      for (const found of invocations) {
+        expect(found, `unprivileged tar -c (messageData: ${messageData})`).toContain("sudo -n");
+      }
     }
+  });
+
+  it("no longer lets zstd mask tar's exit status", () => {
+    // The masking this file's comments described for as long as they existed: a shell
+    // pipeline reports its LAST command's status, so an unprivileged tar that dropped every
+    // root-owned secret still exited 0 behind zstd. This was the last pipeline in the
+    // backup module still carrying it.
+    const script = buildMailBackupPayload("example.com", { messageData: true, keys: true })
+      .payloadConfig.produceCommand;
+    expect(script).toContain("openship: tar (staging the mail archive) failed with status");
+    expect(script).toContain("openship: the compressor 'zstd' failed with status");
+    // And the raw masking shape is gone.
+    expect(script).not.toMatch(/tar -c[^\n]*\| zstd -c -3\s*$/m);
   });
 
   it("stages nothing privileged when keys were not requested", () => {

@@ -64,6 +64,7 @@ import {
 } from "./mail.service";
 import { checkMailDelivery } from "./mail-delivery.service";
 import { checkMailHealth, mailIsServing, MAIL_COMPONENTS } from "./mail-health.service";
+import { checkMailPortReachability } from "./mail-port-reachability.service";
 import { resolveMailEngine, resolveMailFlavor } from "./mail-engine";
 import { updatePostmasterPassword } from "./mail-credentials.service";
 import { reserveMailSetup } from "./mail-setup-lease";
@@ -104,6 +105,22 @@ interface ActiveSession {
 
 let active: ActiveSession | null = null;
 
+/**
+ * `finishedAt` is the durable terminal-success marker written by the setup
+ * version that performed the install. New validation steps must not demote an
+ * already-finished legacy server to "Incomplete" merely because that old state
+ * file cannot contain their step ids. Starting setup again clears `finishedAt`,
+ * so the current run still has to execute every current step before completion.
+ */
+function setupStateIsComplete(state: MailServerState): boolean {
+  return Boolean(state.finishedAt) || (
+    MAIL_SETUP_STEPS.length > 0 &&
+    MAIL_SETUP_STEPS.every(
+      (step) => state.completedSteps[String(step.id)]?.success === true,
+    )
+  );
+}
+
 // ─── Status rendering ────────────────────────────────────────────────────────
 
 /**
@@ -132,8 +149,9 @@ function statusFromState(
 
   const stepStatuses = MAIL_SETUP_STEPS.map((step) => {
     const result = state.completedSteps[String(step.id)];
+    const completedByEarlierVersion = !result && Boolean(state.finishedAt);
     let status: "pending" | "running" | "completed" | "failed" | "skipped" = "pending";
-    if (result?.success) status = "completed";
+    if (result?.success || completedByEarlierVersion) status = "completed";
     else if (result && !result.success) status = "failed";
     else if (runningStep === step.id) status = "running";
 
@@ -141,7 +159,11 @@ function statusFromState(
       ...step,
       status,
       message: result?.message,
-      warning: result?.warning,
+      warning:
+        result?.warning ??
+        (completedByEarlierVersion && step.key === "verify_reachability"
+          ? "This server was installed before public-port verification was recorded. The Health tab checks it live."
+          : undefined),
       data: result?.data,
     };
   });
@@ -218,6 +240,7 @@ function buildPtrPayload(
 
 /** Step ID we'd resume from on retry - first step missing or failed. */
 function deriveCurrentStep(state: MailServerState): number {
+  if (state.finishedAt) return TOTAL_STEPS;
   for (const step of MAIL_SETUP_STEPS) {
     const r = state.completedSteps[String(step.id)];
     if (!r || !r.success) return step.id;
@@ -352,11 +375,7 @@ export async function listMailServers(c: Context) {
         try {
           const state = await sshManager.withExecutor(s.id, (exec) => readState(exec));
           if (!state?.domain) return null;
-          const completed =
-            MAIL_SETUP_STEPS.length > 0 &&
-            MAIL_SETUP_STEPS.every(
-              (step) => state.completedSteps[String(step.id)]?.success === true,
-            );
+          const completed = setupStateIsComplete(state);
           return { serverId: s.id, domain: state.domain, completed };
         } catch {
           return null;
@@ -446,12 +465,7 @@ export async function scanMailInstall(c: Context) {
         state: await readState(exec),
       }),
     );
-    const installComplete =
-      !!state &&
-      MAIL_SETUP_STEPS.length > 0 &&
-      MAIL_SETUP_STEPS.every(
-        (step) => state.completedSteps[String(step.id)]?.success === true,
-      );
+    const installComplete = !!state && setupStateIsComplete(state);
     // Informational: does openship already manage a webmail for this server?
     // Read from the DB, since the webmail is a project — a re-adopted box whose
     // openship DB was rebuilt correctly reads "not deployed": the container may
@@ -519,11 +533,7 @@ export async function adoptMailServer(c: Context) {
         404,
       );
     }
-    const installComplete =
-      MAIL_SETUP_STEPS.length > 0 &&
-      MAIL_SETUP_STEPS.every(
-        (step) => state.completedSteps[String(step.id)]?.success === true,
-      );
+    const installComplete = setupStateIsComplete(state);
     // Mark it installed when the stack is actually LIVE, not only when every
     // current step id is recorded success. An adopted server set up by an
     // older openship (or with step-id drift) has a running iRedMail stack but
@@ -1596,6 +1606,9 @@ export async function getHealth(c: Context) {
 
   const serverId = c.req.param("serverId");
   if (!serverId) return c.json({ error: "serverId is required" }, 400);
+  const refreshReachability = ["1", "true"].includes(
+    c.req.query("refreshReachability") ?? "",
+  );
 
   // Primary gate: live daemon status is a read.
   await permission.assert(getRequestContext(c), {
@@ -1609,18 +1622,28 @@ export async function getHealth(c: Context) {
   }
 
   try {
-    const { components, delivery } = await sshManager.withExecutor(serverId, async (executor) => {
+    const { components, delivery, reachability } = await sshManager.withExecutor(serverId, async (executor) => {
       // Both sweeps share the engine probe (memoized per executor), so running them
       // together costs one extra exec, not a second topology detection.
-      const [components, delivery] = await Promise.all([
+      const [components, delivery, state] = await Promise.all([
         checkMailHealth(executor),
         // `delivery` reports its own failures as `status: "unknown"` rather than
         // throwing, so a box whose queue we can't read still renders its daemons.
         checkMailDelivery(executor),
+        readState(executor),
       ]);
-      return { components, delivery };
+      const reachability = state?.domain
+        ? await checkMailPortReachability(executor, mailHostname(state.domain), {
+            // The dashboard polls every 10s, but public reachability changes far
+            // less often. One cached/coalesced sweep per minute avoids turning the
+            // Health tab into a port watcher while keeping remediation responsive.
+            cacheKey: `mail-health:${serverId}`,
+            force: refreshReachability,
+          })
+        : null;
+      return { components, delivery, reachability };
     });
-    return c.json({ serverId, components, definitions: MAIL_COMPONENTS, delivery });
+    return c.json({ serverId, components, definitions: MAIL_COMPONENTS, delivery, reachability });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Health check failed";
     // Same reason as the mail-admin funnel: this 500 is answered here, so `app.onError`

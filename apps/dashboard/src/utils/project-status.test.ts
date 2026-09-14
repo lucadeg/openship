@@ -5,8 +5,10 @@ import {
   getProjectAttentionReason,
   getProjectStatus,
   migrationNeedsOperator,
+  projectActionHref,
   projectDisplayDomain,
   projectStatusHint,
+  projectStatusHref,
   projectStatusLabel,
 } from "./project-status";
 import { baseDictionary as en } from "@/i18n";
@@ -99,23 +101,23 @@ describe("getProjectStatus — a failed latest deploy is never Live", () => {
     ).toBe("failed");
   });
 
-  it("reports attention — not live — when an older release serves and the newest deploy failed", () => {
-    // The site IS up, so "failed" would be a lie; the newest deploy died, so
-    // "live" hides it. Same signal the other operator-needed states use.
+  it("reports deploy failed — not action required — when an older release still serves", () => {
+    // There is nothing pending for the operator to answer. The new attempt died,
+    // while the narrower label also preserves the fact that the site is still up.
     expect(
       getProjectStatus({
         activeDeploymentId: "d1",
         latestDeploymentId: "d2",
         latestDeploymentStatus: "failed",
       }),
-    ).toBe("attention");
+    ).toBe("deploy_failed");
   });
 
-  it("reports attention for a failed latest even when the caller omits latestDeploymentId", () => {
+  it("reports deploy failed when the caller omits latestDeploymentId", () => {
     // Environment summaries pass activeDeploymentId + status only. A failure
     // never advances the pointer, so a set pointer means an older release.
     expect(getProjectStatus({ activeDeploymentId: "d1", latestDeploymentStatus: "failed" })).toBe(
-      "attention",
+      "deploy_failed",
     );
   });
 
@@ -130,6 +132,72 @@ describe("getProjectStatus — a failed latest deploy is never Live", () => {
       "live",
     );
   });
+
+  it("reports reconciliation as progress, not as an action", () => {
+    const project = {
+      id: "p1",
+      activeDeploymentId: "d1",
+      latestDeploymentId: "d2",
+      latestDeploymentStatus: "reconciling",
+    };
+    expect(getProjectStatus(project)).toBe("reconciling");
+    expect(getProjectAttentionReason(project)).toBeNull();
+    expect(projectActionHref(project)).toBeNull();
+  });
+
+  it("does not resurrect an action after the operator rejected a partial release", () => {
+    expect(
+      getProjectStatus({
+        activeDeploymentId: "d1",
+        latestDeploymentId: "d2",
+        latestDeploymentStatus: "rejected",
+      }),
+    ).toBe("live");
+  });
+});
+
+describe("projectActionHref — every action badge has an owner", () => {
+  it.each([
+    [
+      "partial-release decision",
+      { id: "p1", activeDeploymentId: "live", awaitingDecision: true },
+      "/build/live",
+    ],
+    [
+      "routing repair",
+      { id: "p1", activeDeploymentId: "live", routingUnsynced: true },
+      "/projects/p1/domains",
+    ],
+    [
+      "blocked deployment",
+      { id: "p1", latestDeploymentId: "d2", latestDeploymentStatus: "action_required" },
+      "/projects/p1/deployments",
+    ],
+    [
+      "migration cutover",
+      {
+        id: "p1",
+        activeMigration: { id: "m1", status: "awaiting_cutover", mode: "project_move" },
+      },
+      "/projects/p1/advanced",
+    ],
+  ])("routes %s to its resolution surface", (_name, project, href) => {
+    expect(getProjectStatus(project)).toBe("attention");
+    expect(projectActionHref(project)).toBe(href);
+  });
+
+  it("returns no action link for an ordinary failed deployment", () => {
+    const project = {
+      id: "p1",
+      activeDeploymentId: "d1",
+      latestDeploymentId: "d2",
+      latestDeploymentStatus: "failed",
+    };
+    expect(getProjectStatus(project)).toBe("deploy_failed");
+    expect(getProjectAttentionReason(project)).toBeNull();
+    expect(projectActionHref(project)).toBeNull();
+    expect(projectStatusHref(project)).toBe("/build/d2");
+  });
 });
 
 describe("projectDisplayDomain — only a persisted route", () => {
@@ -142,7 +210,9 @@ describe("projectDisplayDomain — only a persisted route", () => {
   });
 
   it("returns the persisted primary route", () => {
-    expect(projectDisplayDomain({ primaryDomain: "convex.example.com" })).toBe("convex.example.com");
+    expect(projectDisplayDomain({ primaryDomain: "convex.example.com" })).toBe(
+      "convex.example.com",
+    );
   });
 });
 
@@ -198,7 +268,11 @@ describe("getProjectStatus — paused", () => {
       "live",
     );
     expect(
-      getProjectStatus({ enabled: true, activeDeploymentId: "d1", latestDeploymentStatus: "ready" }),
+      getProjectStatus({
+        enabled: true,
+        activeDeploymentId: "d1",
+        latestDeploymentStatus: "ready",
+      }),
     ).toBe("live");
   });
 
@@ -243,7 +317,14 @@ describe("a project with a live migration", () => {
   const live = { enabled: true, activeDeploymentId: "d1", latestDeploymentStatus: "ready" };
 
   it("reads Migrating through every phase that is making progress", () => {
-    for (const status of ["queued", "adopting", "moving_data", "deploying", "verifying", "cutover"]) {
+    for (const status of [
+      "queued",
+      "adopting",
+      "moving_data",
+      "deploying",
+      "verifying",
+      "cutover",
+    ]) {
       expect(getProjectStatus({ ...live, ...migrating(status) }), status).toBe("migrating");
     }
   });
@@ -252,7 +333,11 @@ describe("a project with a live migration", () => {
     // The run deploys onto the target, so the project's newest deployment row genuinely reads
     // `deploying`. "Deploying" is true of that deploy and misleading about the project.
     expect(
-      getProjectStatus({ ...live, latestDeploymentStatus: "deploying", ...migrating("moving_data") }),
+      getProjectStatus({
+        ...live,
+        latestDeploymentStatus: "deploying",
+        ...migrating("moving_data"),
+      }),
     ).toBe("migrating");
   });
 
@@ -267,9 +352,9 @@ describe("a project with a live migration", () => {
   });
 
   it("yields to teardown, the only thing more final than a move", () => {
-    expect(getProjectStatus({ ...live, deletionInProgress: true, ...migrating("moving_data") })).toBe(
-      "deleting",
-    );
+    expect(
+      getProjectStatus({ ...live, deletionInProgress: true, ...migrating("moving_data") }),
+    ).toBe("deleting");
   });
 
   it("reads Action Required — not Migrating — once the run PARKS for the operator", () => {
@@ -281,10 +366,24 @@ describe("a project with a live migration", () => {
     expect(getProjectStatus({ ...live, ...migrating("partial") })).toBe("attention");
   });
 
+  it("reads Action Required when a destructive cutover failed and can only be retried", () => {
+    const activeMigration = {
+      id: "r",
+      status: "cutover",
+      mode: "project_move",
+      needsAction: true,
+    };
+
+    expect(getProjectStatus({ ...live, activeMigration })).toBe("attention");
+    expect(getProjectAttentionReason({ ...live, activeMigration })).toBe("migrationCutover");
+  });
+
   it("names the action in the pill's hint, so the amber is not a dead end", () => {
     const hint = projectStatusHint({ ...live, ...migrating("awaiting_cutover") }, en as never);
     expect(hint).toBe(en.projects.migrationAwaitingHint);
-    expect(getProjectAttentionReason({ ...live, ...migrating("partial") })).toBe("migrationCutover");
+    expect(getProjectAttentionReason({ ...live, ...migrating("partial") })).toBe(
+      "migrationCutover",
+    );
   });
 
   it("stops overriding anything the moment the run is terminal (payload drops the field)", () => {
@@ -301,9 +400,13 @@ describe("a project with a live migration", () => {
   it("exposes the parked question, so a panel need not re-list the phases", () => {
     // Two copies of "which phases are parked" would drift, and the symptom would be a card
     // calling a run "in progress" beside a pill saying it needs attention.
-    expect(migrationNeedsOperator({ id: "r", status: "awaiting_cutover", mode: "project_move" })).toBe(true);
+    expect(
+      migrationNeedsOperator({ id: "r", status: "awaiting_cutover", mode: "project_move" }),
+    ).toBe(true);
     expect(migrationNeedsOperator({ id: "r", status: "partial", mode: "project_move" })).toBe(true);
-    expect(migrationNeedsOperator({ id: "r", status: "moving_data", mode: "project_move" })).toBe(false);
+    expect(migrationNeedsOperator({ id: "r", status: "moving_data", mode: "project_move" })).toBe(
+      false,
+    );
     expect(migrationNeedsOperator(null)).toBe(false);
     expect(migrationNeedsOperator(undefined)).toBe(false);
   });

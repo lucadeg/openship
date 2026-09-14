@@ -14,7 +14,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2, Mail, Trash2, UserPlus, Building2, LogOut, Settings2, MoreVertical } from "lucide-react";
+import { Loader2, Mail, Trash2, UserPlus, Building2, LogOut, Settings2, MoreVertical, Copy } from "lucide-react";
 import { grantableTypesForMode } from "@repo/core";
 import { authClient, useSession } from "@/lib/auth-client";
 import { useToast } from "@/context/ToastContext";
@@ -39,6 +39,7 @@ import { TeamWorkspaceCard } from "./TeamWorkspaceCard";
 import { TeamReachabilityCard, type TeamReachability } from "./TeamReachabilityCard";
 import { WorkspaceManageModal } from "./WorkspaceManageModal";
 import { useI18n, interpolate } from "@/components/i18n-provider";
+import { invitationClaimPath } from "@/lib/invitation-flow";
 
 type MemberRole = "owner" | "admin" | "member" | "restricted";
 
@@ -258,6 +259,24 @@ export function TeamTab() {
       return;
     }
     await refresh();
+  };
+
+  const handleCopyInvite = async (invitationId: string) => {
+    try {
+      const url = `${window.location.origin}${invitationClaimPath(invitationId)}`;
+      await navigator.clipboard.writeText(url);
+      showToast(
+        t.settings.common.copied,
+        "success",
+        t.settings.common.toast.invitations,
+      );
+    } catch {
+      showToast(
+        t.settings.team.toast.copyInviteFailed,
+        "error",
+        t.settings.common.toast.invitations,
+      );
+    }
   };
 
   // Delete/leave switch back to the personal workspace first — you can't sit on
@@ -597,13 +616,24 @@ export function TeamTab() {
                         </p>
                       </div>
                       {isAdminOrOwner && (
-                        <button
-                          type="button"
-                          onClick={() => handleCancelInvite(inv.id)}
-                          className="text-xs font-medium text-muted-foreground hover:text-destructive transition-colors"
-                        >
-                          {t.settings.common.cancel}
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyInvite(inv.id)}
+                            className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                            title={t.settings.team.copyInviteLink}
+                          >
+                            <Copy className="size-3.5" />
+                            {t.settings.common.copy}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleCancelInvite(inv.id)}
+                            className="text-xs font-medium text-muted-foreground hover:text-destructive transition-colors"
+                          >
+                            {t.settings.common.cancel}
+                          </button>
+                        </div>
                       )}
                     </div>
                   ))}
@@ -707,4 +737,3 @@ export function TeamTab() {
     </div>
   );
 }
-

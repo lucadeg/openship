@@ -30,17 +30,54 @@ import { createHash, randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 import { posix as edgePath } from "node:path";
 
-import type { CommandExecutor, ManualCert, RouteConfig, RouteHeaderRule, RouteRedirect, SslResult } from "../types";
-import type { RoutingProvider, SslProvider } from "./types";
+import type {
+  CommandExecutor,
+  ManualCert,
+  RouteConfig,
+  RouteHeaderRule,
+  RouteRedirect,
+  SslResult,
+} from "../types";
+import type { RoutingProvider, SslProvider, ProvisionCertOptions } from "./types";
 import { probeListeningPort } from "../runtime/port-conflict";
-import { LUA_LOGGER_PATH, RULES_GUARD_PATH, luaSourceAvailable, buildReloadCommand, detectOpenRestyPaths, ACME_HTTP01_PORT, ACME_CHALLENGE_LOCATION, EDGE_CHALLENGE_DIR, EDGE_CHALLENGE_LOCATION, EDGE_CHALLENGE_URL_PREFIX, EDGE_SAME_PATH_MOUNTS, OPENRESTY_DEFAULT_PATHS, edgeChallengeVhostConf, type OpenRestyPaths } from "./openresty-lua";
-import { safeErrorMessage, sanitizeProxySettings, resolveRedirectStatus, PROXY_DIRECTIVES, parseProxyValue, resolveProxyDirectives, type NginxVersion, type ProxySettings } from "@repo/core";
+import {
+  LUA_LOGGER_PATH,
+  RULES_GUARD_PATH,
+  luaSourceAvailable,
+  buildReloadCommand,
+  detectOpenRestyPaths,
+  ACME_HTTP01_PORT,
+  ACME_CHALLENGE_LOCATION,
+  EDGE_CHALLENGE_DIR,
+  EDGE_CHALLENGE_LOCATION,
+  EDGE_CHALLENGE_URL_PREFIX,
+  EDGE_SAME_PATH_MOUNTS,
+  OPENRESTY_DEFAULT_PATHS,
+  edgeChallengeVhostConf,
+  type OpenRestyPaths,
+} from "./openresty-lua";
+import { reloadBareOpenResty } from "./openresty-reload";
+import {
+  safeErrorMessage,
+  sanitizeProxySettings,
+  resolveRedirectStatus,
+  PROXY_DIRECTIVES,
+  parseProxyValue,
+  resolveProxyDirectives,
+  type NginxVersion,
+  type ProxySettings,
+} from "@repo/core";
 import { cloudEdgeRealIpConf, isCloudFrontedHost } from "./edge-real-ip";
 import { sq } from "../system/local-shell";
 import type { RootChecked } from "../system/privilege";
 import { edgeDownExplanation } from "../system/edge-exec-error";
 import { BOOTSTRAP_CERT_SEGMENT, validateCertFor } from "../system/proxy/cert-material";
-import { probeStaticOutput, type OutputProbeResult } from "../system/output-exists";
+import {
+  probeStaticOutput,
+  type OutputProbeResult,
+  type StaticProbeOptions,
+} from "../system/output-exists";
+import { probeHostedHttp } from "../system/reachability";
 
 /**
  * POSIX joining, deliberately shadowing node:path's platform default.
@@ -236,8 +273,9 @@ const WEBHOOK_LOCATION_PREFIX = "/_openship/hooks/";
  * rewrites. `httpsUpgrade` adds {@link HTTPS_UPGRADE} ahead of that chain, for the one
  * block that must bounce plain HTTP.
  *
- * The emitted set is unique BY NAME, built through `claimed`: nginx's duplicate check
- * compares location names and `^~` only sets `noregex`, so a `pathPrefix: "/"` — which a
+ * The emitted set is unique BY MATCH TYPE + NAME, built through `claimed`: nginx permits
+ * an exact and inclusive location for the same path, but compares inclusive location
+ * names without regard to `^~`. Thus a prefix `pathPrefix: "/"` — which a
  * capture-free `vercel.json` rewrite produces, one of Vercel's own documented shapes —
  * sat next to `location /` as `[emerg] duplicate location "/"`. The whole vhost is then
  * refused, and since a routing failure never fails a deploy the domain went dark behind
@@ -251,7 +289,13 @@ const WEBHOOK_LOCATION_PREFIX = "/_openship/hooks/";
 function renderProxyLocations(route: RouteConfig, opts: { httpsUpgrade: boolean }): string {
   if (!route.proxyLocations || route.proxyLocations.length === 0) return "";
   const head = `${opts.httpsUpgrade ? HTTPS_UPGRADE : ""}${renderRedirectRules(route, "        ")}`;
-  const claimed = new Set<string>(["/", WEBHOOK_LOCATION_PREFIX]);
+  const claimed = new Set<string>([
+    "prefix:/",
+    `prefix:${WEBHOOK_LOCATION_PREFIX}`,
+    // An exact webhook match would not be a duplicate, but it would outrank and
+    // hijack the edge-owned delivery endpoint just as surely as a prefix would.
+    `exact:${WEBHOOK_LOCATION_PREFIX}`,
+  ]);
   const blocks: string[] = [];
   for (const loc of route.proxyLocations) {
     assertValidUpstream(loc.targetUrl);
@@ -259,10 +303,12 @@ function renderProxyLocations(route: RouteConfig, opts: { httpsUpgrade: boolean 
     const headers = loc.external ? externalProxyHeaders(loc.targetUrl) : PROXY_HEADERS;
     if (!loc.pattern || !loc.upstreamPath) {
       assertValidLiteralPath(loc.pathPrefix, "proxy location prefix");
-      if (claimed.has(loc.pathPrefix)) continue;
-      claimed.add(loc.pathPrefix);
+      const kind = loc.exact ? "exact" : "prefix";
+      const key = `${kind}:${loc.pathPrefix}`;
+      if (claimed.has(key)) continue;
+      claimed.add(key);
       blocks.push(`
-    location ^~ ${loc.pathPrefix} {
+    location ${loc.exact ? "=" : "^~"} ${loc.pathPrefix} {
         ${head}proxy_pass ${loc.targetUrl};
         ${headers}
     }`);
@@ -275,8 +321,8 @@ function renderProxyLocations(route: RouteConfig, opts: { httpsUpgrade: boolean 
     // only the pattern's own captures may be `$…` there.
     assertNoRuntimeVariable(loc.upstreamPath, "rewrite upstream path", true);
     const match = `^${toNginxPattern(loc.pattern)}$`;
-    if (claimed.has(`~ ${match}`)) continue;
-    claimed.add(`~ ${match}`);
+    if (claimed.has(`regex:${match}`)) continue;
+    claimed.add(`regex:${match}`);
     blocks.push(`
     location ~ ${match} {
         ${head}rewrite ${match} ${loc.upstreamPath} break;
@@ -382,8 +428,8 @@ function renderRedirectRules(route: RouteConfig, indent: string): string {
     const match = r.pattern
       ? `^${toNginxPattern(r.pattern, "?")}(?:[?].*)?$`
       : r.exact
-      ? `^${escapeLiteralPath(r.path)}(?:[?].*)?$`
-      : `^${escapeLiteralPath(r.path)}`;
+        ? `^${escapeLiteralPath(r.path)}(?:[?].*)?$`
+        : `^${escapeLiteralPath(r.path)}`;
     // A destination that already carries its own query owns it; otherwise forward the
     // request's, which Vercel preserves and the old `return` form dropped.
     const query = r.destination.includes("?") ? "" : "$is_args$args";
@@ -460,7 +506,11 @@ function renderServerHeaders(route: RouteConfig, slug: string): string {
 function headerEntries(
   route: RouteConfig,
   slug: string,
-): Array<{ rule: RouteHeaderRule; header: { key: string; value: string }; variable: string | null }> {
+): Array<{
+  rule: RouteHeaderRule;
+  header: { key: string; value: string };
+  variable: string | null;
+}> {
   const prefix = `osh_hdr_${slug.replace(/[^A-Za-z0-9]+/g, "_")}`;
   let n = 0;
   return (route.headerRules ?? []).flatMap((rule) =>
@@ -787,7 +837,10 @@ function assertValidAcmeOptions(opts: NginxProviderOptions): void {
       throw new Error("ACME directory must use http or https");
     }
   }
-  if (opts.acmeEabKid && (!/^[\x20-\x7E]+$/.test(opts.acmeEabKid) || opts.acmeEabKid.length > 512)) {
+  if (
+    opts.acmeEabKid &&
+    (!/^[\x20-\x7E]+$/.test(opts.acmeEabKid) || opts.acmeEabKid.length > 512)
+  ) {
     throw new Error("ACME EAB key identifier must be printable ASCII (maximum 512 characters)");
   }
   if (opts.acmeEabHmacKey && !/^[A-Za-z0-9_-]+={0,2}$/.test(opts.acmeEabHmacKey)) {
@@ -800,17 +853,21 @@ function assertValidAcmeOptions(opts: NginxProviderOptions): void {
 
 export function acmeKeyArgs(keyType?: AcmeKeyType): string[] {
   switch (keyType) {
-    case "ec256": return ["--key-type", "ecdsa", "--elliptic-curve", "secp256r1"];
-    case "ec384": return ["--key-type", "ecdsa", "--elliptic-curve", "secp384r1"];
-    case "rsa2048": return ["--key-type", "rsa", "--rsa-key-size", "2048"];
-    case "rsa4096": return ["--key-type", "rsa", "--rsa-key-size", "4096"];
-    default: return [];
+    case "ec256":
+      return ["--key-type", "ecdsa", "--elliptic-curve", "secp256r1"];
+    case "ec384":
+      return ["--key-type", "ecdsa", "--elliptic-curve", "secp384r1"];
+    case "rsa2048":
+      return ["--key-type", "rsa", "--rsa-key-size", "2048"];
+    case "rsa4096":
+      return ["--key-type", "rsa", "--rsa-key-size", "4096"];
+    default:
+      return [];
   }
 }
 
-/** Only allow valid domain characters - prevents shell injection. */
-const DOMAIN_RE = /^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
-
+/** Only allow valid domain characters - prevents shell injection. Allows wildcards. */
+const DOMAIN_RE = /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
 function assertValidDomain(domain: string): void {
   if (!DOMAIN_RE.test(domain) || domain.length > 253) {
     throw new Error(`Invalid domain: ${domain}`);
@@ -834,7 +891,9 @@ function assertNoNginxInjection(value: string, what: string): void {
   // producer can reach it (the compiler rejects them first), which is exactly why the
   // backstop should not have a hole in it.
   if (/[\s;{}#\\'"]/.test(value)) {
-    throw new Error(`Invalid ${what} (contains characters that could inject nginx config): ${value}`);
+    throw new Error(
+      `Invalid ${what} (contains characters that could inject nginx config): ${value}`,
+    );
   }
 }
 
@@ -879,8 +938,7 @@ function assertValidUpstream(targetUrl: string): void {
  * rule from the thing it is guarding would approve whatever that thing emitted. The
  * cost is drift, which the "accepts every capture pattern" round-trip test catches.
  */
-const REDIRECT_PATTERN_RE =
-  /^\/(?:[A-Za-z0-9_~\-/]|\\\.|\(\.\*\)|\(\.\+\)|\(\[\^\/\][*+]\))*$/;
+const REDIRECT_PATTERN_RE = /^\/(?:[A-Za-z0-9_~\-/]|\\\.|\(\.\*\)|\(\.\+\)|\(\[\^\/\][*+]\))*$/;
 
 function assertValidRedirectPattern(pattern: string): void {
   if (!REDIRECT_PATTERN_RE.test(pattern)) {
@@ -1047,7 +1105,10 @@ export function summarizeCertbotFailure(output: string, domain: string): string 
   // Only sound when certbot ACTUALLY failed: on a zero-exit run the tail is the
   // donation footer, which reads as an error message. Callers that haven't seen a
   // non-zero exit must use {@link certbotDiagnosis} instead.
-  const lines = (output || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const lines = (output || "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
   return lines.slice(-3).join(" · ") || `certbot failed to issue a certificate for ${domain}`;
 }
 
@@ -1100,7 +1161,11 @@ function certbotDiagnosis(output: string, domain: string): string | undefined {
     diagnosis =
       `Port 80 for ${domain} isn't reachable from the internet — a firewall / cloud security group ` +
       `is blocking it, the domain doesn't point at this server, or another proxy is still bound to :80.`;
-  } else if (/NXDOMAIN|no\s+(A|AAAA)\s+record|DNS problem|could not be resolved|no records? found/i.test(text)) {
+  } else if (
+    /NXDOMAIN|no\s+(A|AAAA)\s+record|DNS problem|could not be resolved|no records? found/i.test(
+      text,
+    )
+  ) {
     diagnosis =
       `${domain} doesn't resolve to this server yet — the DNS A record is missing or hasn't propagated. ` +
       `Wait for propagation, then retry from the Domains tab.`;
@@ -1157,7 +1222,6 @@ interface FileSnapshot {
   content?: string;
 }
 
-
 // ─── Implementation ──────────────────────────────────────────────────────────
 
 export class NginxProvider implements RoutingProvider, SslProvider {
@@ -1171,6 +1235,7 @@ export class NginxProvider implements RoutingProvider, SslProvider {
   private readonly acmeTosAgreed: boolean;
   private readonly certDir: string;
   private readonly executor: CommandExecutor | null;
+  private paths: OpenRestyPaths;
   private reloadCommand: string;
   private readonly pinPaths: boolean;
   private readonly containerEdge: boolean;
@@ -1195,8 +1260,9 @@ export class NginxProvider implements RoutingProvider, SslProvider {
     this.acmeTosAgreed = opts.acmeTosAgreed ?? true;
     this.certDir = opts.certDir ?? DEFAULT_CERT_DIR;
     this.executor = opts.executor ?? null;
+    this.paths = opts.paths;
     this.containerEdge = opts.containerEdge ?? false;
-    this.reloadCommand = buildReloadCommand(opts.paths, { containerEdge: this.containerEdge });
+    this.reloadCommand = buildReloadCommand(opts.paths);
     this.pinPaths = opts.pinPaths ?? false;
     this.challengeDir = opts.challengeDir ?? EDGE_CHALLENGE_DIR;
   }
@@ -1465,12 +1531,21 @@ export class NginxProvider implements RoutingProvider, SslProvider {
       // while an EXPIRED placeholder would put the domain back to refusing
       // handshakes, which is the bug this exists to prevent.
       await this._exec("openssl", [
-        "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-keyout", join(staging, "privkey.pem"),
-        "-out", join(staging, "fullchain.pem"),
-        "-days", "3650",
-        "-subj", `/CN=${domain}`,
-        "-addext", `subjectAltName=DNS:${domain}`,
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        join(staging, "privkey.pem"),
+        "-out",
+        join(staging, "fullchain.pem"),
+        "-days",
+        "3650",
+        "-subj",
+        `/CN=${domain}`,
+        "-addext",
+        `subjectAltName=DNS:${domain}`,
       ]);
       // Stated rather than inherited from openssl's own file mode — busybox and
       // LibreSSL are not obliged to match OpenSSL's 0600. On the STAGED path, because
@@ -1535,8 +1610,25 @@ export class NginxProvider implements RoutingProvider, SslProvider {
    *
    * Advisory: never throws.
    */
-  async probeStaticRoot(servedPath: string): Promise<OutputProbeResult> {
-    if (this.executor) return probeStaticOutput(this.executor, servedPath);
+  async probeStaticRoot(servedPath: string, opts?: StaticProbeOptions): Promise<OutputProbeResult> {
+    if (this.executor) return probeStaticOutput(this.executor, servedPath, opts);
+
+    const fs = await this.probeStaticRootViaFs(servedPath);
+    // Bare-local edge: this process's filesystem IS the edge's, and its loopback is
+    // the edge's loopback. The port lives here rather than at the caller because
+    // it is the port `registerRoute` renders `listen` for — one provider, one
+    // answer, so an alt-port edge is a single change.
+    if (!opts?.hostname) return fs;
+    const http = await probeHostedHttp({
+      hostname: opts.hostname,
+      path: opts.requestPath ?? "/",
+      port: opts.edgePort ?? 80,
+      timeoutMs: (opts.timeoutSeconds ?? 3) * 1000,
+    });
+    return http ? { ...fs, status: http.status, served: http.served } : fs;
+  }
+
+  private async probeStaticRootViaFs(servedPath: string): Promise<OutputProbeResult> {
     const found = await this._exists(servedPath);
     if (!found) return { found: false, hasIndex: false, checked: true };
     // A file IS its own index; a directory needs index.html to serve at that path.
@@ -1587,9 +1679,7 @@ export class NginxProvider implements RoutingProvider, SslProvider {
   }
 
   private redactAcmeSecrets(value: string): string {
-    return this.acmeEabHmacKey
-      ? value.split(this.acmeEabHmacKey).join("[REDACTED]")
-      : value;
+    return this.acmeEabHmacKey ? value.split(this.acmeEabHmacKey).join("[REDACTED]") : value;
   }
 
   /**
@@ -1624,6 +1714,34 @@ export class NginxProvider implements RoutingProvider, SslProvider {
       throw err;
     }
     return path;
+  }
+
+  /** Materialize generated DNS hooks on the same target where Certbot runs. */
+  private async createEphemeralDnsHooks(
+    opts?: ProvisionCertOptions,
+  ): Promise<{ dir: string; authCommand: string; cleanupCommand?: string } | null> {
+    if (!opts?.dnsAuthHookScript) return null;
+    const dir = join(dirname(this.certDir), `.openship-dns-${randomBytes(12).toString("hex")}`);
+    const authPath = join(dir, "auth.sh");
+    const cleanupPath = join(dir, "cleanup.sh");
+    const recordPath = join(dir, "record-id.txt");
+    await this._mkdir(dir);
+    try {
+      await this._chmod(dir, 0o700);
+      await this._writeFile(authPath, opts.dnsAuthHookScript, 0o700);
+      if (opts.dnsCleanupHookScript) {
+        await this._writeFile(cleanupPath, opts.dnsCleanupHookScript, 0o700);
+      }
+    } catch (err) {
+      await this._rm(dir).catch(() => undefined);
+      throw err;
+    }
+    const recordEnv = `OPENSHIP_DNS_RECORD_FILE=${sq(recordPath)}`;
+    return {
+      dir,
+      authCommand: `${recordEnv} ${sq(authPath)}`,
+      cleanupCommand: opts.dnsCleanupHookScript ? `${recordEnv} ${sq(cleanupPath)}` : undefined,
+    };
   }
 
   private async _captureFile(path: string): Promise<FileSnapshot> {
@@ -1674,10 +1792,10 @@ export class NginxProvider implements RoutingProvider, SslProvider {
     const locationBody = hostRedirect
       ? hostRedirect
       : "staticRoot" in route && route.staticRoot
-      ? `root ${route.staticRoot};
+        ? `root ${route.staticRoot};
         index index.html;
         ${renderStaticTryFiles(route)}`
-      : `proxy_pass ${(route as { targetUrl: string }).targetUrl};
+        : `proxy_pass ${(route as { targetUrl: string }).targetUrl};
         ${PROXY_HEADERS}`;
 
     // `cleanUrls` / `trailingSlash` redirects. They live INSIDE `location /` so they
@@ -1736,8 +1854,9 @@ export class NginxProvider implements RoutingProvider, SslProvider {
     // measured swallowing this one — either 308-ing the delivery away (losing the POST
     // body, so push→redeploy silently stops) or proxying the payload AND its
     // `X-Hub-Signature` to the third-party origin the repo named.
-    const webhookLocation = route.webhookProxy && !hostRedirect
-      ? `
+    const webhookLocation =
+      route.webhookProxy && !hostRedirect
+        ? `
     location ^~ ${WEBHOOK_LOCATION_PREFIX} {
         proxy_pass ${route.webhookProxy};
         proxy_set_header Host $host;
@@ -1746,7 +1865,7 @@ export class NginxProvider implements RoutingProvider, SslProvider {
         proxy_set_header X-Forwarded-Proto $openship_fwd_proto;
     }
 `
-      : "";
+        : "";
 
     // Fail-safe: only emit the Lua directives when the scripts are actually
     // installable. On a build that dropped the Lua from its bundle, referencing
@@ -2036,7 +2155,9 @@ ${serveLocation}
    */
   private async _lsSites(): Promise<string[]> {
     if (!this.executor) return fsReaddir(this.sitesDir);
-    const out = await this.executor.exec(`ls -1 ${sq(this._commandSitesDir())} 2>/dev/null || true`);
+    const out = await this.executor.exec(
+      `ls -1 ${sq(this._commandSitesDir())} 2>/dev/null || true`,
+    );
     return out
       .split("\n")
       .map((l) => l.trim())
@@ -2106,8 +2227,11 @@ ${serveLocation}
    * from the old in-memory config (an inconsistent half-state that would silently
    * vanish on the next unrelated reload). The error is re-thrown for retry.
    */
-  async removeRoute(domain: string): Promise<void> {
+  async removeRoute(domain: string, opts?: { signal?: AbortSignal }): Promise<void> {
     assertValidDomain(domain);
+    if (opts?.signal?.aborted) {
+      throw new Error(`Route removal aborted before it started: ${domain}`);
+    }
     const slug = await this.resolveSlug(domain);
     const configPath = join(this.sitesDir, `${slug}.conf`);
     const statePath = this.routeStatePath(slug);
@@ -2116,11 +2240,25 @@ ${serveLocation}
     await this._rm(configPath);
     await this._rm(statePath).catch(() => undefined);
     try {
-      await this.reload();
+      await this.reload({ allowStopped: true });
     } catch (err) {
-      await this._restoreFile(configPath, confSnapshot);
-      await this._restoreFile(statePath, stateSnapshot);
-      await this.reload().catch(() => undefined);
+      // A timed-out caller may already be retaining the project and refusing a
+      // second cleanup. Never let this late failure restore the vhost after that
+      // caller has abandoned the attempt. File/executor operations are not
+      // reliably abortable, so re-check between each rollback step and remove
+      // anything restored if the signal arrives while one is in progress.
+      try {
+        if (!opts?.signal?.aborted) await this._restoreFile(configPath, confSnapshot);
+        if (!opts?.signal?.aborted) await this._restoreFile(statePath, stateSnapshot);
+        if (!opts?.signal?.aborted) {
+          await this.reload({ allowStopped: true }).catch(() => undefined);
+        }
+      } finally {
+        if (opts?.signal?.aborted) {
+          await this._rm(configPath).catch(() => undefined);
+          await this._rm(statePath).catch(() => undefined);
+        }
+      }
       throw err;
     }
 
@@ -2164,10 +2302,12 @@ ${serveLocation}
    * are served; none is ever removed — Oblien re-probes the SAME token near its
    * 90-day expiry, so dropping one silently kills that route ~83 days later.
    */
-  async serveEdgeChallenge(input: {
-    host: string;
-    tokens?: readonly string[];
-  }): Promise<{ served: boolean; via: "existing-vhost" | "challenge-vhost" | null; claimedBy?: string; reason?: string }> {
+  async serveEdgeChallenge(input: { host: string; tokens?: readonly string[] }): Promise<{
+    served: boolean;
+    via: "existing-vhost" | "challenge-vhost" | null;
+    claimedBy?: string;
+    reason?: string;
+  }> {
     const host = input.host.trim().toLowerCase().replace(/\.$/, "");
     assertValidDomain(host);
     const tokens = input.tokens ?? [];
@@ -2271,10 +2411,7 @@ ${serveLocation}
    * The caller (route-registration.ts) wraps this in try/catch, so a failure becomes a "deploy
    * continues on HTTP, retry from the Domains tab" warning rather than a deploy abort.
    */
-  async provisionCert(
-    domain: string,
-    opts?: { onLog?: (line: string) => void; force?: boolean },
-  ): Promise<SslResult> {
+  async provisionCert(domain: string, opts?: ProvisionCertOptions): Promise<SslResult> {
     assertValidDomain(domain);
 
     // Reuse an existing cert unless the caller forces a reissue. `force` is set
@@ -2295,34 +2432,47 @@ ${serveLocation}
 
     let certonlyOut = "";
     const eabConfig = await this.createEphemeralEabConfig();
+    let generatedDnsHooks: { dir: string; authCommand: string; cleanupCommand?: string } | null =
+      null;
     try {
-      // ACME via certbot's STANDALONE authenticator on a loopback alt-port; the
-      // edge proxies /.well-known/acme-challenge/ → 127.0.0.1:<port> (see
-      // ACME_CHALLENGE_LOCATION). Zero downtime — no port-80 fight with the edge,
-      // no webroot dependency, no DNS-01. Works bare (host netns) and docker-edge
-      // (container netns) alike, since certbot runs on the same executor as the
-      // edge it's proxied through.
-      //
-      // `--cert-name <domain>` PINS the lineage to the bare domain name. Without
-      // it, certbot appends `-0001`/`-0002` when a stale renewal config for the
-      // domain lingers (a prior teardown/migration removed the live symlink but
-      // left /etc/letsencrypt/renewal), so the cert lands at `<domain>-0001` while
-      // certsExist/readCertInfo only ever look at `<domain>` → an eternal
-      // "missing", and a re-run just prints "not due for renewal" (exit 0). Pinning
-      // the name makes the on-disk path deterministic and self-heals that state.
-      certonlyOut = await this._execCertbot([
-        ...(eabConfig ? ["--config", eabConfig] : []),
-        "certonly", "--standalone", "--http-01-port", String(ACME_HTTP01_PORT),
-        "--cert-name", domain, "-d", domain,
-        ...(this.acmeDirectoryUrl ? ["--server", this.acmeDirectoryUrl] : []),
-        ...acmeKeyArgs(this.acmeKeyType),
-        ...emailArgs,
-        ...(this.acmeTosAgreed ? ["--agree-tos"] : []),
-        "--non-interactive",
-        // Forced reissue: certbot would otherwise print "not due for renewal"
-        // (exit 0) when a lineage exists, leaving the stale cert in place.
-        ...(opts?.force ? ["--force-renewal"] : []),
-      ], opts?.onLog);
+      generatedDnsHooks = await this.createEphemeralDnsHooks(opts);
+      const isDnsChallenge = opts?.challenge === "dns-01" || domain.startsWith("*.");
+      const challengeArgs = isDnsChallenge
+        ? [
+            "certonly",
+            "--manual",
+            "--preferred-challenges",
+            "dns",
+            ...(generatedDnsHooks?.authCommand || opts?.dnsAuthHook
+              ? ["--manual-auth-hook", generatedDnsHooks?.authCommand ?? opts!.dnsAuthHook!]
+              : []),
+            ...(generatedDnsHooks?.cleanupCommand || opts?.dnsCleanupHook
+              ? [
+                  "--manual-cleanup-hook",
+                  generatedDnsHooks?.cleanupCommand ?? opts!.dnsCleanupHook!,
+                ]
+              : []),
+          ]
+        : ["certonly", "--standalone", "--http-01-port", String(ACME_HTTP01_PORT)];
+      certonlyOut = await this._execCertbot(
+        [
+          ...(eabConfig ? ["--config", eabConfig] : []),
+          ...challengeArgs,
+          "--cert-name",
+          domain,
+          "-d",
+          domain,
+          ...(this.acmeDirectoryUrl ? ["--server", this.acmeDirectoryUrl] : []),
+          ...acmeKeyArgs(this.acmeKeyType),
+          ...emailArgs,
+          ...(this.acmeTosAgreed ? ["--agree-tos"] : []),
+          "--non-interactive",
+          // Forced reissue: certbot would otherwise print "not due for renewal"
+          // (exit 0) when a lineage exists, leaving the stale cert in place.
+          ...(opts?.force ? ["--force-renewal"] : []),
+        ],
+        opts?.onLog,
+      );
     } catch (err) {
       // Replace certbot's opaque opener with the real, actionable cause.
       const raw = this.redactAcmeSecrets(safeErrorMessage(err));
@@ -2341,7 +2491,9 @@ ${serveLocation}
       // `this.executor` is nullable (a provider constructed for local/no-exec use), and a probe
       // is an optional embellishment — no executor simply means no name to add.
       if (isAcmePortBindFailure(raw) && this.executor) {
-        const occupant = await probeListeningPort(this.executor, ACME_HTTP01_PORT).catch(() => null);
+        const occupant = await probeListeningPort(this.executor, ACME_HTTP01_PORT).catch(
+          () => null,
+        );
         if (occupant) {
           summary +=
             ` Currently held by ${occupant.command}` +
@@ -2355,6 +2507,7 @@ ${serveLocation}
       // Remove the whole 0700 directory, not just the ini — one unit, like
       // git-ssh-material's cleanup.
       if (eabConfig) await this._rm(dirname(eabConfig)).catch(() => undefined);
+      if (generatedDnsHooks) await this._rm(generatedDnsHooks.dir).catch(() => undefined);
     }
 
     // Rewrite the config with SSL now that certs exist
@@ -2428,8 +2581,8 @@ ${serveLocation}
       result.reason === "read_error"
         ? `a certificate is at ${dir} but couldn't be read (permissions, or a partial write)`
         : result.reason === "invalid"
-        ? `the certificate at ${dir} isn't usable for ${domain} (expired, wrong hostname, or the key doesn't match)`
-        : `no certificate is at ${dir}`;
+          ? `the certificate at ${dir} isn't usable for ${domain} (expired, wrong hostname, or the key doesn't match)`
+          : `no certificate is at ${dir}`;
 
     const diagnosis = certbotDiagnosis(certbotOutput, domain);
     const tail = certbotOutput.trim().slice(-1200);
@@ -2443,9 +2596,13 @@ ${serveLocation}
   /**
    * Renew a TLS certificate using certbot.
    */
-  async renewCert(domain: string): Promise<SslResult> {
+  async renewCert(domain: string, opts?: ProvisionCertOptions): Promise<SslResult> {
     assertValidDomain(domain);
-
+    // Manual DNS lineages persist hook paths in renewal/*.conf. Generated hooks
+    // are ephemeral, so reissue with freshly materialized hooks instead.
+    if (opts?.challenge === "dns-01" || domain.startsWith("*.")) {
+      return this.provisionCert(domain, { ...opts, challenge: "dns-01", force: true });
+    }
     // `certbot renew` only acts on certs that ALREADY exist. A domain that
     // never got its first cert (initial provision failed, or was skipped)
     // has nothing to renew — certbot exits 0 doing nothing, so the caller
@@ -2455,7 +2612,7 @@ ${serveLocation}
     // 443/ssl block and reloads. This is what makes the Renew button able to
     // bootstrap a domain that has only an HTTP vhost.
     if (!(await this.certsExist(domain))) {
-      return this.provisionCert(domain);
+      return this.provisionCert(domain, opts);
     }
 
     // A cert can be on disk WITHOUT being a certbot lineage — an ACME cert adopted
@@ -2465,7 +2622,7 @@ ${serveLocation}
     // IS ours to reissue (public ACME CA, this box owns the domain), so renewing it
     // means obtaining a first lineage — `certonly` with force, not `renew`.
     if (!(await this.hasCertbotLineage(domain))) {
-      return this.provisionCert(domain, { force: true });
+      return this.provisionCert(domain, { ...opts, force: true });
     }
 
     // A lineage issued by a DIFFERENT directory than the one now configured can't
@@ -2473,16 +2630,15 @@ ${serveLocation}
     // server requires (or carry EAB). Reissue instead: certonly registers under
     // the configured CA and rewrites the lineage, so this heals itself once.
     if (!(await this.lineageServerMatches(domain))) {
-      return this.provisionCert(domain, { force: true });
+      return this.provisionCert(domain, { ...opts, force: true });
     }
 
     // No `--server` here: the matched lineage's conf already records it, and the
     // mismatch case above never reaches this call.
-    await this._execCertbot([
-      "renew", "--cert-name", domain,
-      ...acmeKeyArgs(this.acmeKeyType),
-      "--non-interactive",
-    ]);
+    await this._execCertbot(
+      ["renew", "--cert-name", domain, ...acmeKeyArgs(this.acmeKeyType), "--non-interactive"],
+      opts?.onLog,
+    );
     await this.reload();
 
     return this.readCertInfo(domain);
@@ -2674,28 +2830,48 @@ ${serveLocation}
    * config may move). Re-detecting on every reload keeps the provider
    * in sync without requiring an API restart.
    */
-  private async reload(): Promise<void> {
+  private async reload(opts: { allowStopped?: boolean } = {}): Promise<void> {
     if (this.executor) {
       if (!this.pinPaths) {
         try {
           const freshPaths = await detectOpenRestyPaths(this.executor);
+          this.paths = freshPaths;
           this.sitesDir = freshPaths.sitesDir;
           // Keep the last known version if this probe couldn't read one — an
           // upgrade moves the version forward, so forgetting it can only ever
           // re-gate a directive the box already supports.
           this.nginxVersion = freshPaths.nginxVersion ?? this.nginxVersion;
-          this.reloadCommand = buildReloadCommand(freshPaths, {
-            containerEdge: this.containerEdge,
-          });
+          this.reloadCommand = buildReloadCommand(freshPaths);
         } catch {
           // Detection failed - fall through with current cached paths
         }
       }
-      await this.executor.exec(this.reloadCommand);
+      if (this.containerEdge) {
+        await this.executor.exec(this.reloadCommand, { timeout: 15_000 });
+      } else {
+        await reloadBareOpenResty(this.executor, this.paths, {
+          allowStopped: opts.allowStopped ?? false,
+        });
+      }
       return;
     }
 
-    await execFileAsync("sh", ["-lc", this.reloadCommand]);
+    if (this.containerEdge) {
+      await execFileAsync("sh", ["-lc", this.reloadCommand], { timeout: 15_000 });
+      return;
+    }
+
+    const localExecutor = {
+      exec: async (command: string, execOpts?: { timeout?: number }) => {
+        const { stdout } = await execFileAsync("sh", ["-lc", command], {
+          timeout: execOpts?.timeout,
+        });
+        return String(stdout);
+      },
+    } as CommandExecutor;
+    await reloadBareOpenResty(localExecutor, this.paths, {
+      allowStopped: opts.allowStopped ?? false,
+    });
   }
 
   private async certsExist(domain: string): Promise<boolean> {
@@ -2920,7 +3096,9 @@ ${geoEntries.join("\n")}
     if (!foundDesiredInclude) {
       const httpIndex = nextLines.findIndex((line) => /^\s*http\s*\{\s*$/.test(line));
       if (httpIndex === -1) {
-        throw new Error(`Failed to ensure rate-limit include: ${confPath} is missing an http block`);
+        throw new Error(
+          `Failed to ensure rate-limit include: ${confPath} is missing an http block`,
+        );
       }
 
       const indent = nextLines[httpIndex].match(/^\s*/)?.[0] ?? "";

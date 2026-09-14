@@ -8,7 +8,12 @@ import { getApiErrorMessage } from "@/lib/api/client";
 import { useToast } from "@/context/ToastContext";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 import { useProjectSettings } from "@/context/ProjectSettingsContext";
-import { computeEnvDiff } from "./env-diff";
+import type { EnvironmentVariable } from "@/components/import-project/types";
+import {
+  computeProjectEnvDiff,
+  createProjectEnvEditState,
+  type PersistedProjectEnv,
+} from "@/lib/project-env-diff";
 
 /**
  * Per-variable production env editor (modal). Safe by design:
@@ -20,17 +25,10 @@ import { computeEnvDiff } from "./env-diff";
 
 const ENVIRONMENT = "production";
 
-interface Row {
+interface Row extends EnvironmentVariable {
   /** Stable local id for React keys. */
   uid: string;
-  key: string;
-  /** Current input value. For an untouched secret this stays "" (we never hold the real value). */
-  value: string;
   isSecret: boolean;
-  /** The persisted key when this row was loaded (null for a freshly-added row). */
-  originalKey: string | null;
-  /** Was this loaded as a secret whose real value we don't have until re-entered? */
-  loadedSecret: boolean;
 }
 
 let uidCounter = 0;
@@ -50,9 +48,7 @@ export function EnvVarsEditor({
   const { projectData } = useProjectSettings();
   const hasActiveDeployment = Boolean(projectData?.activeDeploymentId);
   const [rows, setRows] = useState<Row[]>([]);
-  // Keys that existed when the editor loaded — needed to detect deletions
-  // (a removed row is gone from `rows`, so its key must be remembered here).
-  const [originalKeys, setOriginalKeys] = useState<string[]>([]);
+  const [baseline, setBaseline] = useState<PersistedProjectEnv[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [reveal, setReveal] = useState<Record<string, boolean>>({});
@@ -69,20 +65,19 @@ export function EnvVarsEditor({
 
   const load = useCallback(async () => {
     setLoading(true);
+    setRows([]);
+    setBaseline(null);
+    setLinked({});
     try {
       const res = await projectsApi.getEnv(projectId);
-      const loaded: Row[] = (res?.data ?? [])
-        .filter((v) => v.environment === ENVIRONMENT)
-        .map((v) => ({
-          uid: nextUid(),
-          key: v.key,
-          value: v.isSecret ? "" : v.value, // never seed the input with the mask
-          isSecret: v.isSecret,
-          originalKey: v.key,
-          loadedSecret: v.isSecret,
-        }));
+      const envState = createProjectEnvEditState(res?.data ?? [], ENVIRONMENT);
+      const loaded: Row[] = envState.rows.map((row) => ({
+        ...row,
+        uid: nextUid(),
+        isSecret: row.isSecret ?? false,
+      }));
       setRows(loaded);
-      setOriginalKeys(loaded.map((r) => r.key));
+      setBaseline(envState.baseline);
       // Best-effort: which of these keys are managed by a service connection?
       const conns = await connectionsApi.list(projectId).catch(() => ({ data: [] }));
       const map: Record<string, ProjectConnection> = {};
@@ -109,13 +104,14 @@ export function EnvVarsEditor({
   const addRow = () =>
     setRows((prev) => [
       ...prev,
-      { uid: nextUid(), key: "", value: "", isSecret: false, originalKey: null, loadedSecret: false },
+      { uid: nextUid(), key: "", value: "", visible: true, isSecret: false },
     ]);
 
   const removeRow = (uid: string) => setRows((prev) => prev.filter((r) => r.uid !== uid));
 
   const handleSave = async () => {
-    const result = computeEnvDiff(rows.map((r) => ({ ...r, key: r.key.trim() })), originalKeys);
+    if (baseline === null) return;
+    const result = computeProjectEnvDiff(rows, baseline);
     if (!result.ok) {
       showToast(result.error, "error", t.projectSettings.envVars.toast.validationTitle);
       return;
@@ -222,7 +218,7 @@ export function EnvVarsEditor({
             <button
               type="button"
               onClick={handleSave}
-              disabled={saving || loading}
+              disabled={saving || loading || baseline === null}
               className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3.5 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90 disabled:opacity-50"
             >
               {saving ? <Loader2 className="size-3.5 animate-spin" /> : null}
@@ -294,7 +290,7 @@ export function EnvVarsEditor({
                     </button>
                   );
                 }
-                const showValue = reveal[r.uid] || (!r.isSecret && !r.loadedSecret);
+                const showValue = reveal[r.uid] || (!r.isSecret && !r.preserveValue);
                 return (
                   <div key={r.uid} className="flex items-center gap-2">
                     <input
@@ -308,8 +304,8 @@ export function EnvVarsEditor({
                       <input
                         type={showValue ? "text" : "password"}
                         value={r.value}
-                        onChange={(e) => update(r.uid, { value: e.target.value })}
-                        placeholder={r.loadedSecret ? t.projectSettings.envVars.secretPlaceholder : t.projectSettings.envVars.valuePlaceholder}
+                        onChange={(e) => update(r.uid, { value: e.target.value, preserveValue: false })}
+                        placeholder={r.preserveValue ? t.projectSettings.envVars.secretPlaceholder : t.projectSettings.envVars.valuePlaceholder}
                         spellCheck={false}
                         className="h-9 w-full rounded-lg border border-border/50 bg-muted/20 px-3 pe-9 font-mono text-[13px] text-foreground outline-none transition-colors focus:border-primary/40"
                       />

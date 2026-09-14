@@ -118,11 +118,16 @@ export async function registerImportedSites(
     for (const domain of domains) {
       try {
         if (site.target.kind === "proxy") {
-          // Non-root locations become path-prefix proxy locations ahead of `/`
-          // so a fan-out vhost (`/ → A`, `/v3 → B`) is kept, not collapsed.
+          // Non-root locations, plus an exact `/`, become proxy locations ahead
+          // of the inclusive primary `/` so both fan-out and nginx exact matching
+          // survive the takeover.
           const proxyLocations = (site.routes ?? [])
-            .filter((r) => r.path !== "/")
-            .map((r) => ({ pathPrefix: r.path, targetUrl: r.url }));
+            .filter((r) => r.path !== "/" || r.exact)
+            .map((r) => ({
+              pathPrefix: r.path,
+              targetUrl: r.url,
+              ...(r.exact ? { exact: true } : {}),
+            }));
           await routing.registerRoute({
             domain,
             tls: site.ssl,

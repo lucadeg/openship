@@ -4,10 +4,12 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
  * `projectCount` is one field with one meaning, and BOTH server reads must carry it.
  *
  * The detail view spends it on two decisions the list already makes: whether an
- * absent edge is an issue or merely an offer, and how many projects "Remove server"
- * unbinds. Neither can be made from `deleteServer`'s `unboundProjects`, which is
- * only known once the response arrives — after the row is gone. So what's pinned
- * here is that `GET /servers/:id` reports the SAME number under the SAME key as
+ * absent edge is an issue or merely an offer, and how many workloads "Remove server"
+ * is about to take with it. The second one is why `deleteServer` no longer reports an
+ * `unboundProjects` count: every bound workload is now torn down before the row goes,
+ * so nothing is left unbound, and the number the confirm needs has to come from a read
+ * — this field, and the itemised `GET /servers/:id/deletion-preview` beside it. So what
+ * is pinned here is that `GET /servers/:id` reports the SAME number under the SAME key as
  * `GET /servers`, since a detail page reading a second name (or a silent absence
  * that a `?? 0` fallback turns into "no projects here") would quietly disagree with
  * the fleet view about whether this box hosts anything.

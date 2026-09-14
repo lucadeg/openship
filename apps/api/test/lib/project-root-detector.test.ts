@@ -753,6 +753,72 @@ describe("selectPreferredSingleAppRoot - services-with-app dual mode", () => {
   });
 });
 
+/**
+ * applyWorkspaceContext re-derives build/start OUTSIDE detectStack, so it needs the
+ * same manifest recovery: a sub-app whose parsed package.json came back empty
+ * (readJson swallows every failure) otherwise gets the registry's bare
+ * `next build` / `next start` even though its scripts are in fileContents — the
+ * monorepo flavour of openship#623.
+ */
+describe("applyWorkspaceContext - recovers a sub-app manifest from its text (#623)", () => {
+  const SUB_APP_PACKAGE_JSON = JSON.stringify({
+    name: "web",
+    dependencies: { next: "^16.0.0" },
+    scripts: { build: "next build", start: "next start" },
+  });
+
+  const rootInput = {
+    rootDirectory: "",
+    files: [
+      { name: "package.json", type: "file" as const },
+      { name: "bun.lock", type: "file" as const },
+    ],
+    // Parsed root manifest lost as well — the workspace gate reads fileContents.
+    fileContents: {
+      "package.json": JSON.stringify({ workspaces: ["apps/*"] }),
+    },
+  };
+
+  const subApp = (packageJson?: Record<string, unknown>) => ({
+    rootDirectory: "apps/web",
+    source: "workspace" as const,
+    files: [
+      { name: "package.json", type: "file" as const },
+      { name: "next.config.ts", type: "file" as const },
+    ],
+    ...(packageJson ? { packageJson } : {}),
+    fileContents: { "package.json": SUB_APP_PACKAGE_JSON },
+  });
+
+  it("runs the sub-app's scripts through the package manager, not as bare binaries", () => {
+    const adjusted = applyWorkspaceContext(
+      rootInput,
+      selectPreferredProjectRoot(rootInput, [subApp()]),
+    );
+
+    expect(adjusted.stack.packageManager).toBe("bun");
+    expect(adjusted.stack.installCommand).toBe("cd ../.. && bun install");
+    // Was "next build" / "next start" before the recovery.
+    expect(adjusted.stack.buildCommand).toBe("bun run build");
+    expect(adjusted.stack.startCommand).toBe("bun run start");
+  });
+
+  it("matches the result of passing the same manifest already parsed", () => {
+    const fromText = applyWorkspaceContext(
+      rootInput,
+      selectPreferredProjectRoot(rootInput, [subApp()]),
+    );
+    const parsed = JSON.parse(SUB_APP_PACKAGE_JSON);
+    const fromParsed = applyWorkspaceContext(
+      rootInput,
+      selectPreferredProjectRoot(rootInput, [subApp(parsed)]),
+    );
+
+    expect(fromText.stack.buildCommand).toBe(fromParsed.stack.buildCommand);
+    expect(fromText.stack.startCommand).toBe(fromParsed.stack.startCommand);
+  });
+});
+
 describe("applyWorkspaceContext - install command rewriting", () => {
   it("rewrites pnpm install with the right depth (apps/web → ../..)", () => {
     const adjusted = applyWorkspaceContext(

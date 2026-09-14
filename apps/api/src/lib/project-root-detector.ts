@@ -15,6 +15,7 @@ import {
   getBuildCommand,
   getInstallCommand,
   getStartCommand,
+  resolvePackageJson,
   type RepoFile,
   type StackResult,
 } from "./stack-detector";
@@ -581,9 +582,16 @@ export function applyWorkspaceContext(
     return selectedProject;
   }
 
+  // Recover both manifests from their raw text when the parsed read came back
+  // empty — this function re-derives build/start OUTSIDE detectStack, so without
+  // it a sub-app whose package.json failed to parse gets the registry's bare
+  // `next build` even though its `build` script is sitting in fileContents (#623).
+  const rootPackageJson = resolvePackageJson(rootInput.packageJson, rootInput.fileContents);
+  const appPackageJson = resolvePackageJson(selectedProject.packageJson, selectedProject.fileContents);
+
   const packageManager = detectPackageManager(
     rootInput.files,
-    rootInput.packageJson as Record<string, unknown> & {
+    rootPackageJson as Record<string, unknown> & {
       packageManager?: string;
       scripts?: Record<string, string>;
       engines?: Record<string, string>;
@@ -604,8 +612,8 @@ export function applyWorkspaceContext(
       installCommand: installCommand
         ? buildRepoRootCommand(installCommand, selectedProject.rootDirectory)
         : selectedProject.stack.installCommand,
-      buildCommand: getBuildCommand(packageManager, selectedProject.stack.stack, selectedProject.packageJson),
-      startCommand: getStartCommand(packageManager, selectedProject.stack.stack, selectedProject.packageJson),
+      buildCommand: getBuildCommand(packageManager, selectedProject.stack.stack, appPackageJson),
+      startCommand: getStartCommand(packageManager, selectedProject.stack.stack, appPackageJson),
       buildImage: getBuildImage(selectedProject.stack.stack, packageManager),
     },
   };

@@ -17,7 +17,12 @@
  */
 
 import { app, net, shell } from "electron";
-import { resolveDesktopUpdate, type GithubReleasePayload } from "@repo/core";
+import {
+  changelogMarkdownUrl,
+  extractChangelogSection,
+  resolveDesktopUpdate,
+  type GithubReleasePayload,
+} from "@repo/core";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -56,9 +61,10 @@ export interface UpdateInfo {
 export type UpdateCheck = UpdateInfo | { available: false };
 
 /**
- * Ask GitHub for the latest release + the advisory manifest pinned to its tag,
- * and hand both to `resolveDesktopUpdate`. Never throws — a failed check
- * (offline, rate-limited) resolves to "no update".
+ * Ask GitHub for the latest release, then read the changelog and advisory
+ * manifest pinned to its tag before handing the result to
+ * `resolveDesktopUpdate`. Never throws — a failed release check (offline,
+ * rate-limited) resolves to "no update".
  *
  * This function is I/O only. The whole decision — which asset this platform
  * pulls, whether the release is newer, and whether an advisory authorizes
@@ -76,15 +82,38 @@ export async function checkForUpdate(): Promise<UpdateCheck> {
     });
     if (!res.ok) return { available: false };
     const data = (await res.json()) as GithubReleasePayload;
+    const tag = (data?.tag_name ?? "").trim();
+    // These are independent, fail-soft reads. A missing changelog must never
+    // suppress a critical advisory (or the reverse).
+    const [manifest, changelogNotes] = await Promise.all([
+      fetchManifest(tag),
+      fetchChangelog(tag),
+    ]);
     return resolveDesktopUpdate({
       releasePayload: data,
       platform: process.platform,
       arch: process.arch,
       currentVersion: app.getVersion(),
-      manifest: await fetchManifest((data?.tag_name ?? "").trim()),
+      manifest,
+      changelogNotes,
     });
   } catch {
     return { available: false };
+  }
+}
+
+/** Exact release section from the immutable changelog at this release tag. */
+async function fetchChangelog(tag: string): Promise<string | null> {
+  if (!tag) return null;
+  try {
+    const res = await net.fetch(changelogMarkdownUrl(tag), {
+      headers: { Accept: "text/markdown", "User-Agent": "Openship-Desktop" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return null;
+    return extractChangelogSection(await res.text(), tag);
+  } catch {
+    return null;
   }
 }
 

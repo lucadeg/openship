@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { join } from "node:path";
 import {
+  dockerBuildContextDirectory,
   normalizeDockerRelativePath,
   normalizeDockerRootDirectory,
+  resolveContextDockerfileCandidates,
   resolveDockerfileCandidates,
   resolveWithinDirectory,
 } from "./docker-paths";
@@ -144,5 +146,69 @@ describe("resolveWithinDirectory", () => {
   // the host's /etc, it becomes <base>/etc and fails to exist.
   it("contains an absolute sub-path instead of following it", () => {
     expect(resolveWithinDirectory(base, "/etc/ssh")).toBe(join(base, "etc", "ssh"));
+  });
+});
+
+/**
+ * #634. A compose service's `build` is a build CONTEXT, so its `dockerfile` is
+ * resolved INSIDE that context, and the candidate list must be relative to it —
+ * that string is what reaches `docker build -f`.
+ */
+describe("dockerBuildContextDirectory", () => {
+  it.each([undefined, null, "", ".", "./", "/"])("reads %j as the source root", (value) => {
+    expect(dockerBuildContextDirectory({ buildContextDirectory: value as never })).toBe("");
+  });
+
+  it("normalizes a declared context", () => {
+    expect(dockerBuildContextDirectory({ buildContextDirectory: "./svc/api/" })).toBe("svc/api");
+  });
+
+  it("rejects a traversing context", () => {
+    expect(() => dockerBuildContextDirectory({ buildContextDirectory: "../.." })).toThrow(
+      /must not contain/,
+    );
+  });
+});
+
+describe("resolveContextDockerfileCandidates", () => {
+  it("resolves the dockerfile INSIDE the context", () => {
+    expect(resolveContextDockerfileCandidates("dinohash-service", "Dockerfile")).toEqual([
+      "Dockerfile",
+    ]);
+    expect(resolveContextDockerfileCandidates("svc", "docker/Dockerfile.prod")).toEqual([
+      "docker/Dockerfile.prod",
+      "Dockerfile",
+    ]);
+  });
+
+  // The one candidate that must NOT be here is the SOURCE-ROOT Dockerfile: it sits
+  // outside the context, so falling back to it would build a different image under
+  // this service's tag — which is what the whole-repo context used to allow.
+  it("never falls back outside the context", () => {
+    expect(resolveContextDockerfileCandidates("svc", "Dockerfile.api")).toEqual([
+      "Dockerfile.api",
+      "Dockerfile",
+    ]);
+  });
+
+  it("tolerates a dockerfile that already carries the context prefix", () => {
+    // How the field was filled while the context WAS the repo root. The strict
+    // compose reading is still tried first.
+    expect(resolveContextDockerfileCandidates("svc", "svc/Dockerfile.prod")).toEqual([
+      "svc/Dockerfile.prod",
+      "Dockerfile.prod",
+      "Dockerfile",
+    ]);
+  });
+
+  it("defaults to the context's own Dockerfile", () => {
+    expect(resolveContextDockerfileCandidates("svc", undefined)).toEqual(["Dockerfile"]);
+    expect(resolveContextDockerfileCandidates("", null)).toEqual(["Dockerfile"]);
+  });
+
+  it("rejects a traversing dockerfilePath", () => {
+    expect(() => resolveContextDockerfileCandidates("svc", "../../etc/passwd")).toThrow(
+      /must not contain/,
+    );
   });
 });

@@ -24,6 +24,10 @@ import type { CommandExecutor, LogEntry, ProvisionLock } from "../types";
 import { checkAll, checkComponents, COMPONENT_CHECKS } from "./checks";
 import { COMPONENT_INSTALLERS } from "./installer";
 import {
+  REMOTE_SERVER_REQUIRED_COMPONENTS,
+  resolveSystemComponentInstallPlan,
+} from "./requirements";
+import {
   type SetupStateStore,
   type SetupState,
   type ComponentState,
@@ -50,9 +54,9 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 /**
  * Resolve prerequisite rules for a given runtime mode.
  *
- * The runtime mode deterministically implies everything:
- *   - docker → Docker + Git + Edge
- *   - bare   → Git + Edge
+ * Runtime mode determines how applications run, but the managed Edge is a
+ * container in both modes. Its Docker dependency comes from the shared system
+ * component graph rather than being repeated in these feature rules.
  *
  * "Edge" is ONE component (the openship-edge container: OpenResty + Lua +
  * certbot). It used to be two rows, `openresty` and `certbot`, for one artifact
@@ -75,16 +79,14 @@ function resolveRules(mode: RuntimeMode): PrerequisiteRule[] {
   // bare mode - language runtimes handled per-stack by toolchain layer
   return [
     { feature: "build", requires: ["git"], message: "Build requires Git" },
-    // Even in bare RUNTIME mode (apps run as host processes) the edge itself is a
-    // container — its installer needs Docker and says so.
     { feature: "routing", requires: ["edge"], message: "Routing requires the edge" },
     { feature: "ssl", requires: ["edge"], message: "SSL requires the edge" },
   ];
 }
 
-/** Resolve which system components must be installed for a given runtime mode. */
-function resolveRequired(mode: RuntimeMode): string[] {
-  return mode === "docker" ? ["docker", "git", "edge"] : ["git", "edge"];
+/** Resolve the complete prerequisite set for a managed deployment target. */
+function resolveRequired(): string[] {
+  return resolveSystemComponentInstallPlan([...REMOTE_SERVER_REQUIRED_COMPONENTS, "edge"]);
 }
 
 // ─── SystemManager ───────────────────────────────────────────────────────────
@@ -134,7 +136,7 @@ export class SystemManager {
     this.mode = mode;
     this.executor = opts.executor;
     this.rules = resolveRules(mode);
-    this.required = resolveRequired(mode);
+    this.required = resolveRequired();
     this.stateStore = opts.stateStore ?? new FileStateStore(opts.executor);
     this.installerConfig = opts.installerConfig ?? {};
     this.provisionLock = opts.provisionLock;
@@ -222,10 +224,12 @@ export class SystemManager {
       return { feature, ready: true, missing: [], message: `No prerequisites for "${feature}"` };
     }
 
+    const required = resolveSystemComponentInstallPlan(rule.requires);
+
     // Try fast path from cached state
     const state = await this.loadState();
     if (state?.setupComplete) {
-      const allPresent = rule.requires.every(
+      const allPresent = required.every(
         (name) => state.components[name]?.healthy === true,
       );
       if (allPresent) {
@@ -243,7 +247,7 @@ export class SystemManager {
     // Slow path: actually check the components. Deliberately NOT persisted — this
     // checked one feature's subset, and freshness is one global stamp (see
     // updateStateFromChecks).
-    const statuses = await checkComponents(this.executor, rule.requires);
+    const statuses = await checkComponents(this.executor, required);
     const unhealthy = statuses.filter((s) => !s.healthy);
 
     return {
@@ -586,12 +590,13 @@ export class SystemManager {
     heading: string,
     errorMessage: (missingNames: string[]) => string,
   ): Promise<void> {
+    const required = resolveSystemComponentInstallPlan(names);
     // The check→install→revalidate below is a check-then-act on server-global
     // state (apt/dpkg, systemd units, port 80, /etc config, the state file).
     // Serialize the WHOLE section — including the "already healthy, skip" check —
     // so concurrent deploys to the same server can't both install or clobber.
     const critical = async () => {
-      const statuses = await checkComponents(this.executor, names);
+      const statuses = await checkComponents(this.executor, required);
       const missing = statuses.filter((status) => !status.healthy);
       if (missing.length === 0) {
         await this.updateStateFromChecks(statuses);
@@ -612,7 +617,7 @@ export class SystemManager {
         throw new Error(failed[0].error ?? `Failed to install ${failed[0].component}`);
       }
 
-      const recheck = await checkComponents(this.executor, names);
+      const recheck = await checkComponents(this.executor, required);
       await this.updateStateFromChecks(recheck);
 
       const unhealthy = recheck.filter((status) => !status.healthy);

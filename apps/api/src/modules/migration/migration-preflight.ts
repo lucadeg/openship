@@ -16,7 +16,7 @@ import { selectDiscoveredServices } from "./select-services";
 import { createServerCommandExecutor } from "../../lib/deployment-runtime";
 import { sshManager } from "../../lib/ssh-manager";
 import { sizeOfMoveSet, type SizedItem } from "./migration-size";
-import { sq } from "./direct-transfer";
+import { probeTargetVolumeConflicts } from "./volume-conflict";
 
 /**
  * Which bind-mount host paths are worth (and safe to) copy across servers.
@@ -270,19 +270,36 @@ export async function buildMigrationPreview(opts: {
   // hitting the run-time "refusing to overwrite" hard-fail. Best-effort — a
   // probe hiccup just omits the conflict (the run-time guard is the backstop).
   let conflicts: MigrationPreview["conflicts"];
+  /** Extra preview warnings this function raises (merged into `stack.warnings` below). */
+  const extraWarnings: string[] = [];
   if (!sameServer && volumesToMove.length > 0) {
     try {
-      const { executor } = await createServerCommandExecutor(targetServerId, organizationId);
-      const hasData = new Set<string>();
-      for (const name of volumesToMove) {
-        const out = await executor
-          .exec(
-            `if docker volume inspect ${sq(name)} >/dev/null 2>&1; then ` +
-              `mp=$(docker volume inspect ${sq(name)} -f '{{.Mountpoint}}'); ` +
-              `[ -n "$(ls -A "$mp" 2>/dev/null)" ] && echo CONFLICT || true; fi`,
-          )
-          .catch(() => "");
-        if (out.includes("CONFLICT")) hasData.add(name);
+      // Through the ADAPTER, which mounts the volume in a helper container and reports
+      // "not empty" for anything it cannot read. The shell probe this replaces ended in
+      // `.catch(() => "")`, so an unreadable `/var/lib/docker/volumes` (root-only 0700 —
+      // i.e. any non-root SSH account) read as "no conflict" and the plan step offered no
+      // choice before the move overwrote a populated volume. See volume-conflict.ts.
+      const hasData = await probeTargetVolumeConflicts({
+        targetServerId,
+        organizationId,
+        // No project exists yet at preview time; only the bare volume NAME is consulted.
+        projectId: "preview",
+        projectSlug: "",
+        queries: volumesToMove.map((name) => ({
+          serviceName: workloads.find((s) => s.volumes.some((v) => v.name === name))?.name ?? name,
+          volume: name,
+        })),
+      });
+      // An UNVERIFIED volume is not the same claim as an occupied one — say which, so an
+      // unreachable target reads as a connectivity problem rather than sending the operator
+      // hunting for data that may not be there.
+      const unverified = [...hasData].filter(([, why]) => why === "unknown").map(([v]) => v);
+      if (unverified.length > 0) {
+        extraWarnings.push(
+          `Could not verify ${unverified.length} target volume(s) (${unverified.join(", ")}) — ` +
+            `they are treated as holding data so the migration never overwrites them. Check the ` +
+            `target server is reachable and its docker API is usable by the SSH account.`,
+        );
       }
       if (hasData.size > 0) {
         // Flatten to one entry PER VOLUME — the unique isolation unit (two
@@ -307,7 +324,7 @@ export async function buildMigrationPreview(opts: {
     hasBlocked: workloads.some((s) => s.blocked),
     downtimeWarning: workloads.length > 0,
     droppedProxies,
-    warnings: stack.warnings,
+    warnings: [...stack.warnings, ...extraWarnings],
     ...(plan ? { plan } : {}),
     ...(sslByDomain ? { sslByDomain } : {}),
     ...(conflicts ? { conflicts } : {}),

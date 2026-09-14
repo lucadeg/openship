@@ -24,20 +24,20 @@
   "features": {
     "everythingIn": "كل ما في خطة «{inherited}»، بالإضافة إلى:",
     "staticOnly": "المواقع الثابتة فقط — SSG وSPA وHTML عادي",
-    "anyWorkload": "شغّل أي شيء — حاويات وحِزم Compose وعمليات خلفية",
-    "managedServices": "خدمات Postgres وRedis مُدارة، مع كتالوج التطبيقات الكامل",
+    "anyWorkload": "شغّل أي شيء — حاويات وCompose وعمليات خلفية وPostgres وRedis",
+    "runningServices": "{runningServices} تطبيق أو قاعدة بيانات أو عملية خلفية قيد التشغيل",
+    "computeMinutes": "{computeMinutes} دقيقة حوسبة شهريًا",
     "buildMinutes": "{buildMinutes} دقيقة بناء شهريًا",
-    "credits": "{credits} وحدة رصيد حوسبة شهريًا",
+    "power": "حتى {powerCpu} vCPU و{powerRamGb} GB RAM لكل تطبيق",
+    "projects": "{maxProjects} مشروع",
+    "projectsUnlimited": "مشاريع غير محدودة",
     "freeSubdomains": "{freeSubdomains} نطاق فرعي مجاني على {freeDomainSuffix}",
     "freeSubdomainsUnlimited": "نطاقات فرعية مجانية غير محدودة على {freeDomainSuffix}",
+    "gitDeploys": "النشر من GitHub أو GitLab أو أي مستودع Git",
     "customDomains": "نطاقات مخصّصة غير محدودة، مع TLS",
+    "deployLogs": "سجلات حيّة للبناء والنشر",
+    "auditLog": "سجل تدقيق لكل تغيير",
     "unlimitedSeats": "أعضاء فريق غير محدودين — بلا رسوم على كل مستخدم",
-    "previewDeploys": "نشر معاينة عند كل دفع للكود",
-    "backups": "نسخ احتياطي يومي مع استعادة إلى لحظة زمنية محدّدة",
-    "observability": "سجلات حيّة ومقاييس وتنبيهات لصحة الخدمة",
-    "mailServer": "خادم بريد مدمج — SMTP وIMAP وبريد على الويب",
-    "auditLog": "سجل تدقيق بمدة حفظ ممتدة",
-    "sharedChannel": "قناة مشتركة على Slack أو Discord",
     "sso": "SSO وSAML",
     "customLimits": "حدود مخصّصة يُتفق عليها في العقد",
     "dedicatedInfra": "بنية تحتية ومناطق مخصّصة",
@@ -50,12 +50,7 @@
     "selfHostedUnlimited": "عمليات نشر ومشاريع وخوادم ونطاقات غير محدودة",
     "selfHostedServices": "كل الخدمات المُدارة — Postgres وRedis والبريد",
     "selfHostedClients": "CLI وواجهة ويب وتطبيق سطح مكتب — خدمة خلفية واحدة",
-    "selfHostedFreeSubdomains": "{freeSubdomains} نطاق فرعي مجاني على {freeDomainSuffix} عند الربط مع Openship Cloud",
-    "runningServices": "{runningServices} خدمة قيد التشغيل — تطبيقات وقواعد بيانات وعمليات خلفية",
-    "power": "حتى {powerCpu} vCPU و{powerRamGb} GB RAM لكل خدمة",
-    "projects": "{maxProjects} مشروع",
-    "projectsUnlimited": "مشاريع غير محدودة",
-    "meteredCredits": "الحوسبة والنطاق الترددي والتخزين تُخصم كلها من رصيدك الشهري"
+    "selfHostedFreeSubdomains": "{freeSubdomains} نطاق فرعي مجاني على {freeDomainSuffix} عند الربط مع Openship Cloud"
   },
   "selfHosted": {
     "name": "استضافة ذاتية",
@@ -65,9 +60,9 @@
     "cta": "ابدأ الاستضافة الذاتية"
   },
   "creditPacks": {
-    "pack_5k": "{credits} وحدة رصيد",
-    "pack_25k": "{credits} وحدة رصيد",
-    "pack_100k": "{credits} وحدة رصيد"
+    "pack_5k": "{computeMinutes} دقيقة حوسبة",
+    "pack_25k": "{computeMinutes} دقيقة حوسبة",
+    "pack_100k": "{computeMinutes} دقيقة حوسبة"
   },
   "ui": {
     "perMonth": "/شهر",
@@ -83,6 +78,8 @@
     "billedMonthly": "فاتورة شهرية، والإلغاء متاح في أي وقت",
     "campaignBadge": "خصم {percentOff}%",
     "campaignEnds": "ينتهي العرض في {date}",
-    "wasPrice": "سابقًا {price}"
+    "wasPrice": "سابقًا {price}",
+    "standardTitle": "في كل الخطط",
+    "creditPackNote": "≈ {appHours} ساعة لتطبيق صغير، أو {buildMinutes} دقيقة بناء"
   }
 }

@@ -157,4 +157,25 @@ describe("GET /mail/status — engine state", () => {
     expect(body.active).toBe(false);
     expect(body.serverId).toBe(SERVER);
   });
+
+  it("does not demote an install finished before the public-port step existed", async () => {
+    readState.mockResolvedValue({
+      ...STATE,
+      finishedAt: new Date("2026-08-01T00:00:00Z").toISOString(),
+      completedSteps: Object.fromEntries(
+        Array.from({ length: 8 }, (_, index) => [
+          String(index + 1),
+          { stepId: index + 1, success: true, message: "done" },
+        ]),
+      ),
+    });
+
+    const body = await callStatus();
+    const publicPorts = (body.steps as Array<Record<string, unknown>>).find(
+      (step) => step.key === "verify_reachability",
+    );
+
+    expect(publicPorts).toMatchObject({ status: "completed" });
+    expect(publicPorts?.warning).toMatch(/Health tab checks it live/i);
+  });
 });

@@ -112,11 +112,40 @@ export interface MailDeliveryHealth {
   detail?: string;
 }
 
+export type MailPortReachabilityStatus =
+  | "reachable"
+  | "blocked"
+  | "not_listening"
+  | "not_exposed"
+  | "unknown";
+
+export interface MailPortReachabilityCheck {
+  key: "smtp" | "smtps" | "submission" | "imaps";
+  port: number;
+  label: string;
+  status: MailPortReachabilityStatus;
+  listening: boolean | null;
+  exposed: boolean | null;
+  reachable: boolean | null;
+  failure?: "timeout" | "refused" | "unresolved" | "no_route" | "error";
+  detail?: string;
+}
+
+export interface MailPortReachability {
+  hostname: string;
+  address: string | null;
+  checkedAt: number;
+  status: "ok" | "fail" | "unknown";
+  ports: MailPortReachabilityCheck[];
+  detail?: string;
+}
+
 export interface MailHealthResponse {
   serverId: string;
   components: MailComponentHealth[];
   definitions: MailComponentDef[];
   delivery: MailDeliveryHealth;
+  reachability: MailPortReachability | null;
 }
 
 /**
@@ -639,8 +668,10 @@ export const mailApi = {
    * Live health of every mail-core daemon on the target server. The Mail
    * tab polls this every ~10 s to render running/stopped pills.
    */
-  getHealth: (serverId: string) =>
-    api.get<MailHealthResponse>(endpoints.mail.health(serverId)),
+  getHealth: (serverId: string, refreshReachability = false) =>
+    api.get<MailHealthResponse>(
+      `${endpoints.mail.health(serverId)}${refreshReachability ? "?refreshReachability=1" : ""}`,
+    ),
 
   /** Standalone port 80/443 scan */
   checkPorts: (serverId: string) =>
@@ -716,4 +747,3 @@ export const mailApi = {
       ),
   },
 };
-

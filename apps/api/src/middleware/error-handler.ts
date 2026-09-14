@@ -1,6 +1,7 @@
 import type { Context } from "hono";
 import { ZodError } from "zod";
 import { AppError } from "@repo/core";
+import { redactSensitiveRequestPath } from "../lib/request-log-redaction";
 
 /**
  * Translate a thrown error to a structured JSON response.
@@ -98,7 +99,7 @@ export function handleApiError(err: unknown, c: Context) {
  */
 export function requestTag(c: Context): string {
   try {
-    return `${c.req.method} ${new URL(c.req.url).pathname}`;
+    return `${c.req.method} ${redactSensitiveRequestPath(new URL(c.req.url).pathname)}`;
   } catch {
     return c.req.method;
   }

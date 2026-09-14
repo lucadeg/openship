@@ -22,12 +22,13 @@ vi.mock("../../../src/modules/github/github.service", () => ({}));
 
 import { connectRedirect } from "../../../src/modules/github/github.controller";
 
-function createContext(headers: Headers) {
+function createContext(headers: Headers, query: Record<string, string> = {}) {
   return {
     req: {
       raw: {
         headers,
       },
+      query: (name: string) => query[name],
     },
     redirect: (url: string) =>
       new Response(null, {
@@ -95,6 +96,25 @@ describe("connectRedirect", () => {
       expect.objectContaining({
         body: expect.objectContaining({
           callbackURL: "/auth/callback/install",
+        }),
+      }),
+    );
+  });
+
+  it("preserves the workspace-bound install state across the OAuth callback", async () => {
+    getGitHubAuthMode.mockReturnValue("app");
+    linkSocialAccount.mockResolvedValue(
+      new Response(JSON.stringify({ url: "https://github.com/login/oauth/authorize" }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await connectRedirect(createContext(new Headers(), { install_state: "workspace nonce" }));
+
+    expect(linkSocialAccount).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          callbackURL: "/auth/callback/install?state=workspace%20nonce",
         }),
       }),
     );

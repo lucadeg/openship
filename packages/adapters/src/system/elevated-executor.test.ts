@@ -122,6 +122,22 @@ describe("elevatedExecutor", () => {
     expect(String(exec.mock.calls[2]?.[0])).toBe(`rm -rf ${sq(stageDirOf(staged))}`);
   });
 
+  it("creates a private-mode payload before publishing a secret", async () => {
+    const { inner, writeFile, exec } = fakeExecutor();
+
+    await elevatedExecutor(inner).writeFile("/etc/postfix/sasl_passwd", "relay-secret", {
+      mode: 0o600,
+    });
+
+    const staged = String(writeFile.mock.calls[0]?.[0]);
+    expect(writeFile).toHaveBeenCalledWith(staged, "relay-secret", { mode: 0o600 });
+    expect(writeFile.mock.invocationCallOrder[0]!).toBeLessThan(exec.mock.invocationCallOrder[1]!);
+    // The content travels through the file channel, never argv/process listings.
+    expect(exec.mock.calls.map((call) => String(call[0])).join("\n")).not.toContain(
+      "relay-secret",
+    );
+  });
+
   it("removes the staged plaintext when the elevated publish fails, and still throws", async () => {
     const { inner, writeFile, exec } = fakeExecutor();
     // Sudo refusing is the case that left a TLS key readable in /tmp for the life of the

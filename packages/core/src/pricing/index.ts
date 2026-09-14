@@ -163,6 +163,8 @@ export interface PlanLimits {
   maxProjects: number | null;
   /** Largest per-service machine this tier may select, or null for uncapped. */
   maxResourceTier: FixedResourceTier | null;
+  /** App runtime included per month, in `low`-machine minutes. See the schema. */
+  computeMinutesPerMonth: number | null;
   buildMinutesPerMonth: number | null;
   freeSubdomains: number | null;
   customDomains: number | null;
@@ -176,6 +178,16 @@ export interface PlanLimits {
 export interface PlanDefinition {
   id: PlanTierId;
   name: string;
+  /**
+   * The resolved "Everything in X, plus:" line, or undefined on a tier that
+   * inherits nothing.
+   *
+   * Kept OUT of `features` deliberately. It is a transition, not a feature, and
+   * while it sat in the list every surface rendered it with a checkmark beside it —
+   * so a sentence ending in a colon read as one of the things you get. Callers
+   * render it as a lead-in above the ticked list.
+   */
+  inheritedFrom?: string;
   /** The tier's one-line pitch. (Named `description` for the pre-catalog API
    *  payload shape, which clients already read.) */
   description: string;
@@ -196,6 +208,16 @@ export interface CreditPackDefinition {
   credits_milli: number;
   price_cents: number;
   sortOrder: number;
+  /**
+   * One line saying what the pack BUYS, in things the customer recognises —
+   * hours of a running app, or build minutes.
+   *
+   * "+25,000 compute minutes" is a true statement that answers nothing: nobody
+   * knows whether that is an afternoon or a year. Both figures are derived from
+   * the catalog's own rates (`computeUnitsPerMinute`, `oblien.buildResources`), so
+   * they cannot drift from what the pack actually gets spent on.
+   */
+  explains: string;
 }
 
 /* ─── Resolution ──────────────────────────────────────────────────────────── */
@@ -213,10 +235,57 @@ export function planLimits(planId: string | null | undefined): PlanLimits {
   return plan.limits;
 }
 
-/** Milli-credits a tier grants per period; null = hand-granted (enterprise). */
+/**
+ * Milli-credits burned by one compute minute — one minute of a `low` machine.
+ *
+ * Lives here, not beside `MILLI_PER_CREDIT` in the API's `billing-credit-units.ts`:
+ * that file is deliberately import-free and owns a different boundary (openship
+ * milli ↔ Oblien whole credits). This is a CATALOG unit, and `packages/core`
+ * cannot import from `apps/api` anyway. One compute minute ≡ one credit, so the
+ * two constants agree by construction; the pricing test asserts it.
+ */
+export const MILLI_PER_COMPUTE_MINUTE = 1000;
+
+/**
+ * Compute units burned per minute by a machine size — `low` is the unit, so it is
+ * 1× and everything else is its ratio.
+ *
+ * Derived from `RESOURCE_TIER_SPECS`, never a hand-written table, for the same
+ * reason `placeholders()` quotes `powerCpu` from it: the published rate has to
+ * follow the sizes the deploy wizard actually offers. A hand-written multiplier
+ * would silently keep charging 4× for `high` after `high` was re-specced.
+ */
+export function computeUnitsPerMinute(tier: FixedResourceTier): number {
+  return RESOURCE_TIER_SPECS[tier].cpuCores / RESOURCE_TIER_SPECS.low.cpuCores;
+}
+
+/** Compute units a minute of the BUILD machine burns (its own workspace, and
+ *  Oblien meters it like any other). */
+function buildUnitsPerMinute(): number {
+  return PRICING.oblien.buildResources.cpuCores / RESOURCE_TIER_SPECS.low.cpuCores;
+}
+
+/**
+ * Milli-credits a tier grants per period; null = hand-granted (enterprise).
+ *
+ * DERIVED from the two published allowances rather than authored, so the figure on
+ * the pricing page and the quota pushed to Oblien are one number in two units.
+ * (Same direction as `toOblienLimits` below, and for the same reason.)
+ *
+ * Build minutes are in the sum, and that is load-bearing rather than tidy:
+ * `toOblienCredits()` REJECTS a non-positive quota, and a static-only tier
+ * legitimately publishes 0 compute minutes — so a compute-only derivation would
+ * make every free-tier quota push throw. Builds are also real metered work in a
+ * real workspace, so counting them is the honest reading either way.
+ */
 export function planMonthlyCredits(planId: string | null | undefined): number | null {
   const plan = PLAN_BY_ID.get(planId ?? "") ?? PLAN_BY_ID.get(DEFAULT_PLAN_TIER)!;
-  return plan.credits.monthlyMilli;
+  const { computeMinutesPerMonth, buildMinutesPerMonth } = plan.limits;
+  // Either allowance being unlimited makes the whole grant hand-managed — there is
+  // no finite number to push.
+  if (computeMinutesPerMonth === null || buildMinutesPerMonth === null) return null;
+  const units = computeMinutesPerMonth + buildMinutesPerMonth * buildUnitsPerMinute();
+  return Math.round(units * MILLI_PER_COMPUTE_MINUTE);
 }
 
 /** May this tier run that workload? Free ships static-only. */
@@ -305,11 +374,15 @@ function placeholders(plan: PricingCatalogRaw["plans"][number], locale: PricingL
     powerCpu: svc ? formatDecimal(svc.cpuCores, locale) : unlimited,
     powerRamGb: svc ? formatDecimal(svc.memoryMb / 1024, locale) : unlimited,
     powerDiskGb: svc ? formatCount(Math.round(svc.diskMb / 1024), locale) : unlimited,
-    credits: plan.credits.monthlyMilli === null ? unlimited : formatCount(plan.credits.monthlyMilli / 1000, locale),
+    computeMinutes: n(limits.computeMinutesPerMonth),
     inherited: plan.inherits ? planName(plan.inherits, locale) : "",
     freeDomainSuffix: PRICING.freeDomainSuffix,
   };
 }
+
+/** The one feature key that resolves to a lead-in rather than a bullet. The
+ *  schema already refuses it on a tier with no `inherits`. */
+const EVERYTHING_IN_KEY = "everythingIn";
 
 /** Resolve one tier's card for a language. */
 export function resolvePlan(planId: PlanTierId, locale: PricingLocale = "en"): PlanDefinition {
@@ -320,10 +393,20 @@ export function resolvePlan(planId: PlanTierId, locale: PricingLocale = "en"): P
     name: planName(plan.id, locale),
     description: planTagline(plan.id, locale),
     price: plan.price,
-    monthlyCredits: plan.credits.monthlyMilli,
+    monthlyCredits: planMonthlyCredits(plan.id),
     oblienLimits: toOblienLimits(plan.limits),
     limits: plan.limits,
+    ...(() => {
+      // `everythingIn` is authored inside `features` so the catalog keeps ONE
+      // ordered list per tier, but it resolves to its own field — see
+      // `inheritedFrom`. Anything else stays a bullet.
+      const lead = plan.features.includes(EVERYTHING_IN_KEY)
+        ? featureTemplate(EVERYTHING_IN_KEY, locale)
+        : null;
+      return lead === null ? {} : { inheritedFrom: fill(lead, values) };
+    })(),
     features: plan.features
+      .filter((key) => key !== EVERYTHING_IN_KEY)
       .map((key) => {
         const template = featureTemplate(key, locale);
         return template === null ? null : fill(template, values);
@@ -454,6 +537,31 @@ export const PLANS: Record<PlanTierId, PlanDefinition> = Object.fromEntries(
   PLAN_IDS.map((id) => [id, resolvePlan(id, "en")]),
 ) as Record<PlanTierId, PlanDefinition>;
 
+/**
+ * What every cloud tier includes, resolved once for a language.
+ *
+ * Rendered as a single block beside the tier grid instead of repeated into each
+ * column. Placeholders resolve against the FREE plan — the same choice
+ * `resolveSelfHosted` makes — because a line in here is true on every tier, so the
+ * lowest one is the honest source for any number it quotes.
+ */
+export function resolveStandard(locale: PricingLocale = "en"): {
+  title: string;
+  features: string[];
+} {
+  const free = PLAN_BY_ID.get(DEFAULT_PLAN_TIER)!;
+  const values = placeholders(free, locale);
+  return {
+    title: uiString(locale, "standardTitle"),
+    features: PRICING.standard.features
+      .map((key) => {
+        const template = featureTemplate(key, locale);
+        return template === null ? null : fill(template, values);
+      })
+      .filter((s): s is string => s !== null),
+  };
+}
+
 /** The self-hosted card — free forever, not a billable tier. Its numbers come
  *  from the FREE plan, so "10 free subdomains" is stated once in the catalog. */
 export function resolveSelfHosted(locale: PricingLocale = "en") {
@@ -480,10 +588,28 @@ export function resolveCreditPacks(locale: PricingLocale = "en"): CreditPackDefi
   return [...PRICING.creditPacks]
     .sort((a, b) => a.sortOrder - b.sortOrder)
     .map((pack) => {
-      const template = copyFor(locale).creditPacks?.[pack.id] ?? copyEn.creditPacks[pack.id as keyof PricingCopy["creditPacks"]] ?? "{credits}";
+      const template = copyFor(locale).creditPacks?.[pack.id] ?? copyEn.creditPacks[pack.id as keyof PricingCopy["creditPacks"]] ?? "{computeMinutes}";
+      // Both tokens carry the same number. A pack is still AUTHORED in credits —
+      // `creditsMilli` and its live Stripe price id are untouched — but it is SOLD
+      // as compute minutes, because that is the unit the plans publish and one
+      // compute minute ≡ one credit. `{credits}` stays accepted so a translation
+      // that hasn't been updated yet still renders a number instead of a literal
+      // placeholder.
+      const minutes = pack.creditsMilli / MILLI_PER_COMPUTE_MINUTE;
+      const amount = formatCount(minutes, locale);
+      // What the pack is worth in the two things people actually spend it on. The
+      // app figure is the BASE (`low`) machine — the honest floor, since a bigger
+      // machine burns a multiple — and the build figure divides by the build
+      // machine's own rate.
+      const noteTemplate =
+        copyFor(locale).ui?.creditPackNote ?? copyEn.ui.creditPackNote;
       return {
         id: pack.id,
-        name: fill(template, { credits: formatCount(pack.creditsMilli / 1000, locale) }),
+        name: fill(template, { computeMinutes: amount, credits: amount }),
+        explains: fill(noteTemplate, {
+          appHours: formatCount(Math.round(minutes / 60), locale),
+          buildMinutes: formatCount(Math.round(minutes / buildUnitsPerMinute()), locale),
+        }),
         credits_milli: pack.creditsMilli,
         price_cents: pack.priceCents,
         sortOrder: pack.sortOrder,
@@ -509,6 +635,7 @@ export function pricingUi(locale: PricingLocale = "en") {
     ctaChoose: uiString(locale, "ctaChoose"),
     ctaContact: uiString(locale, "ctaContact"),
     billedMonthly: uiString(locale, "billedMonthly"),
+    standardTitle: uiString(locale, "standardTitle"),
     // Campaign strings are returned as TEMPLATES with their placeholders intact,
     // like `ctaChoose`: `{percentOff}`, `{date}` and `{price}` are per-plan and
     // per-render values (the discount differs by tier, the date needs the

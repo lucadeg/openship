@@ -91,6 +91,10 @@ export async function listPlans(c: Context) {
       // once read it were removed in favour of the customer-facing `limits`.
       limits: p.limits,
       features: p.features,
+      // Published alongside `features`, not folded into it: it is the "Everything in
+      // X, plus:" lead-in, and a client that renders the bullet list with a
+      // checkmark per item must not put one beside a transition.
+      inheritedFrom: p.inheritedFrom ?? null,
       support: p.support,
       contactSales: p.contactSales ?? null,
     };
@@ -172,9 +176,19 @@ export async function createTopup(c: Context) {
  */
 export async function listTopupPacks(c: Context) {
   await permission.assert(getRequestContext(c), { resourceType: "billing", resourceId: "*", action: "read" });
+
+  // `explains` ("≈ 83 hours of a small app, or 625 build minutes") is a DERIVED
+  // display string, not a column — it comes from the catalog's own rates so it
+  // can't drift from what a credit actually buys. The synced `credit_pack` rows
+  // therefore don't carry it, and it has to be grafted on whichever source wins
+  // below, or the DB path silently loses the one line that makes a pack legible.
+  const explainsById = new Map(CREDIT_PACKS.map((p) => [p.id, p.explains]));
+  const withExplains = <T extends { id: string }>(rows: T[]) =>
+    rows.map((row) => ({ ...row, explains: explainsById.get(row.id) ?? null }));
+
   const packs = await billingService.listActiveCreditPacks();
-  if (packs.length > 0) return c.json({ data: packs });
-  return c.json({ data: [...CREDIT_PACKS] });
+  if (packs.length > 0) return c.json({ data: withExplains(packs) });
+  return c.json({ data: withExplains([...CREDIT_PACKS]) });
 }
 
 /* ---------- Allowance detail (what is using my quota) ---------- */

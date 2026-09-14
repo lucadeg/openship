@@ -72,11 +72,13 @@ import { LocalDeployComingSoonModal } from "@/components/LocalDeployComingSoonMo
 import { useLocalDeployGate } from "@/hooks/useLocalDeployGate";
 import { defaultDomainType } from "@/lib/default-domain-type";
 import { installSettledMessage } from "@/lib/install-settled-message";
+import { appInstallDnsTargets, attachDeploymentDomainIds } from "@/lib/deployment-dns";
 import { OptionCard } from "@/app/(dashboard)/(deployment)/deploy/[slug]/components/DeployTargetStep";
 import { AppLogo } from "@/components/AppLogo";
 import { VerifiedBadge } from "@/components/apps/VerifiedBadge";
 import { HostingBadge } from "@/components/apps/HostingBadge";
 import { UnverifiedBadge } from "@/components/apps/UnverifiedBadge";
+import DnsRecordsModal from "@/components/domains/DnsRecordsModal";
 import { PageContainer } from "@/components/ui/PageContainer";
 import { encodeProjectSlug } from "@/utils/repoSlug";
 import { parseContainerPort } from "@/utils/compose-ports";
@@ -251,7 +253,7 @@ export default function AppInstallPage() {
   const { t, locale } = useI18n();
   const w = t.projectSettings.appInstall;
   const { showToast } = useToast();
-  const { baseDomain, deployMode } = usePlatform();
+  const { baseDomain, deployMode, selfHosted } = usePlatform();
   // Desktop mode → the "open on localhost / forward the port" hints are relevant
   // (a VPS is already public; a local app is already localhost).
   const isDesktop = deployMode === "desktop";
@@ -276,6 +278,11 @@ export default function AppInstallPage() {
   // from the API) is fetched so a repo-fresh app opens + installs without a redeploy.
   const bundledTemplate = useMemo(() => getAppTemplate(appId), [appId]);
   const [template, setTemplate] = useState(bundledTemplate);
+  // A repo-fresh template is absent from the dashboard bundle by definition.
+  // Do not treat that initial `undefined` as a 404: wait for the runtime-catalog
+  // request before redirecting. Without this guard, a newly published catalog
+  // app flashes the route and immediately returns to the catalog.
+  const [templateResolved, setTemplateResolved] = useState(Boolean(bundledTemplate));
   // The org's existing not-yet-deployed draft of this app, if any. The catalog
   // tiles link here WITHOUT ?projectId, so without this the wizard had no idea a
   // draft existed — it showed template defaults while Install landed on the draft.
@@ -286,6 +293,7 @@ export default function AppInstallPage() {
   } | null>(null);
   useEffect(() => {
     setTemplate(bundledTemplate);
+    setTemplateResolved(Boolean(bundledTemplate));
     let cancelled = false;
     appsApi
       .template(appId)
@@ -295,7 +303,10 @@ export default function AppInstallPage() {
         setOpenDraft(r?.draft ?? null);
       })
       .catch(() => {
-        /* keep the bundled template */
+        /* Keep a bundled fallback if the runtime catalog is temporarily unavailable. */
+      })
+      .finally(() => {
+        if (!cancelled) setTemplateResolved(true);
       });
     return () => {
       cancelled = true;
@@ -477,10 +488,11 @@ export default function AppInstallPage() {
 
   // Unknown / non-installable / flow apps don't belong here.
   useEffect(() => {
+    if (!templateResolved) return;
     if (!template || template.kind === "flow" || !template.available) {
       router.replace("/apps/new");
     }
-  }, [template, appId, router]);
+  }, [templateResolved, template, appId, router]);
 
   // ── Draft re-entry: show what's persisted, not the template defaults ───────
   /** The project label the installer will build free hostnames from — its slug,
@@ -1009,34 +1021,89 @@ export default function AppInstallPage() {
         }
       }
 
-      const dep = await deployApi.buildAccess({
-        projectId: pid,
-        serviceDeploymentMode: "services",
-        // Where to install — reuses the deploy wizard's target selection.
-        // Undefined falls back to the project/meta default server-side.
-        deployTarget: destination?.deployTarget,
-        serverId: destination?.deployTarget === "server" ? destination.serverId : undefined,
-      });
-      const depId =
-        dep?.data?.deployment_id ?? dep?.data?.deploymentId ?? dep?.deployment_id ?? null;
-      setDeploymentId(depId);
-      started = true;
-      // Persist the deployment id in the URL so a hard refresh mid-install
-      // resumes the progress view (re-attaches to the same SSE stream) instead
-      // of dropping back to the form. Client-only; best-effort.
-      if (depId) {
+      const startDeploy = async (targetPid: string) => {
+        setBusy(true);
         try {
-          const url = new URL(window.location.href);
-          url.searchParams.set("deployment", depId);
-          if (pid) url.searchParams.set("projectId", pid);
-          window.history.replaceState(null, "", url.toString());
-        } catch {
-          /* resume just won't survive a reload */
+          const dep = await deployApi.buildAccess({
+            projectId: targetPid,
+            serviceDeploymentMode: "services",
+            // Where to install — reuses the deploy wizard's target selection.
+            // Undefined falls back to the project/meta default server-side.
+            deployTarget: destination?.deployTarget,
+            serverId: destination?.deployTarget === "server" ? destination.serverId : undefined,
+          });
+          const depId =
+            dep?.data?.deployment_id ?? dep?.data?.deploymentId ?? dep?.deployment_id ?? null;
+          setDeploymentId(depId);
+          started = true;
+          // Persist the deployment id in the URL so a hard refresh mid-install
+          // resumes the progress view (re-attaches to the same SSE stream) instead
+          // of dropping back to the form. Client-only; best-effort.
+          if (depId) {
+            try {
+              const url = new URL(window.location.href);
+              url.searchParams.set("deployment", depId);
+              url.searchParams.set("projectId", targetPid);
+              window.history.replaceState(null, "", url.toString());
+            } catch {
+              /* resume just won't survive a reload */
+            }
+          }
+          setPhaseLabel(w.phaseQueued);
+          setStartedAt(Date.now());
+          setPhase("installing");
+        } catch (err) {
+          const msg = getApiErrorMessage(err, w.installFailed).replace(
+            /^Pre-deploy checks failed:\s*/i,
+            "",
+          );
+          if (started) {
+            setErrorMsg(msg);
+            setPhase("error");
+          } else {
+            showToast(msg, "error");
+          }
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      // Pre-deploy DNS gate (self-hosted custom domain): surface the records to add
+      // or auto-configure BEFORE the deploy so DNS is pointed when the first-deploy
+      // SSL attempt runs.
+      const pendingDnsTargets = appInstallDnsTargets(routes ?? []);
+      if (selfHosted && pendingDnsTargets.length > 0) {
+        const projectInfo = await projectsApi.getInfo(pid).catch(() => null);
+        const domainRows = Array.isArray(projectInfo?.data?.project?.domains)
+          ? projectInfo.data.project.domains
+          : [];
+        const dnsTargets = attachDeploymentDomainIds(pendingDnsTargets, domainRows);
+        if (dnsTargets.length > 0) {
+          setBusy(false);
+          let modalId = "";
+          modalId = showModal({
+            customContent: (
+              <DnsRecordsModal
+                targets={dnsTargets}
+                serverId={destination?.deployTarget === "server" ? destination.serverId : undefined}
+                confirmLabel={w.install}
+                onConfirm={() => {
+                  hideModal(modalId);
+                  void startDeploy(pid);
+                }}
+                onCancel={() => {
+                  hideModal(modalId);
+                  setBusy(false);
+                }}
+              />
+            ),
+            maxWidth: "560px",
+          });
+          return;
         }
       }
-      setPhaseLabel(w.phaseQueued);
-      setStartedAt(Date.now());
-      setPhase("installing");
+
+      await startDeploy(pid);
     } catch (err) {
       // Strip the server's "Pre-deploy checks failed:" prefix for a cleaner
       // message. Nothing deployed yet → toast + stay on the form; a deploy that

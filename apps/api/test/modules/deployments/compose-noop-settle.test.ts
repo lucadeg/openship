@@ -17,6 +17,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => ({
   activePointer: [] as string[],
   statusWrites: [] as Array<{ id: string; status: string; extra?: Record<string, unknown> }>,
+  sessionStatuses: [] as Array<{ id: string; status: string; detail?: Record<string, unknown> }>,
   containerIdWrites: [] as Array<string | undefined>,
   notifications: [] as string[],
   audits: [] as string[],
@@ -50,7 +51,9 @@ vi.mock("@repo/db", () => ({
 }));
 
 vi.mock("../../../src/modules/deployments/session-manager", () => ({
-  updateStatus: () => {},
+  updateStatus: (id: string, status: string, detail?: Record<string, unknown>) => {
+    h.sessionStatuses.push({ id, status, detail });
+  },
   broadcastServiceStatus: () => {},
   broadcastInstallPhase: () => {},
   appendLog: () => {},
@@ -132,6 +135,7 @@ function optsFor(): PipelineOpts {
 beforeEach(() => {
   h.activePointer = [];
   h.statusWrites = [];
+  h.sessionStatuses = [];
   h.containerIdWrites = [];
   h.notifications = [];
   h.audits = [];
@@ -222,5 +226,35 @@ describe("executeComposePipeline — an all-carried redeploy must not take over"
 
     expect(h.statusWrites.some((w) => w.status === "no_changes")).toBe(false);
     expect(h.activePointer).toEqual(["prj_1:dep_1"]);
+  });
+
+  it("announces a partial-failure decision on the first terminal event", async () => {
+    h.deployResult = {
+      status: "ready",
+      summary: {
+        total: 2,
+        successful: 1,
+        deployed: 1,
+        failed: 1,
+        indeterminate: 0,
+        mutated: true,
+        failedServices: ["worker"],
+      },
+      services: [
+        { serviceId: "app", serviceName: "app", containerId: "cid-app", status: "running" },
+        { serviceId: "worker", serviceName: "worker", status: "failed", error: "exit 1" },
+      ],
+      primaryContainerId: "cid-app",
+      warning: "Some services failed",
+      portChecks: [],
+    };
+
+    await executeComposePipeline(optsFor());
+
+    const terminal = h.sessionStatuses.find((entry) => entry.status === "ready");
+    expect(terminal?.detail).toMatchObject({ decisionPending: true });
+    expect(h.statusWrites.at(-1)?.extra).toMatchObject({
+      meta: { composeDeployment: { decision: "pending" } },
+    });
   });
 });

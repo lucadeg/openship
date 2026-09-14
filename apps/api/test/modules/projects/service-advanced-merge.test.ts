@@ -62,6 +62,12 @@ describe("mergeAdvanced", () => {
     expect(next.readiness).toEqual({ enabled: true, onFailure: "warn" });
   });
 
+  it("can restore and remove generated config files through the service API", () => {
+    const files = [{ path: "/etc/kong.yml", content: "_format_version: '3.0'" }];
+    expect(mergeAdvanced(null, { files }).files).toEqual(files);
+    expect(mergeAdvanced({ files }, { files: null })).toEqual({});
+  });
+
   it("REPLACES a key rather than deep-merging it", () => {
     // A partially-specified healthcheck must not inherit the stored interval —
     // that would resurrect a field the user deleted.

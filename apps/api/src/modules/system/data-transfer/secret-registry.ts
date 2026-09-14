@@ -44,13 +44,27 @@ const SCHEME_BY_KEY: Record<string, { table: AnyTable; scheme: SecretScheme }> =
   "backup_destination.sftpKeyPassphraseEnc": { table: schema.backupDestination, scheme: "enc1" },
   "dns_credential.apiTokenEnc": { table: schema.dnsCredential, scheme: "enc1" },
   "credential.secretsEnc": { table: schema.credential, scheme: "enc1" },
+  "git_source.secretsEnc": { table: schema.gitSource, scheme: "enc1" },
   "servers.sshPassword": { table: schema.servers, scheme: "enc1" },
   "servers.sshPrivateKey": { table: schema.servers, scheme: "enc1" },
   "servers.sshKeyPassphrase": { table: schema.servers, scheme: "enc1" },
+  // scalar, not enc1: server-github.service seals these with encrypt()/decrypt().
+  "server_github_auth.tokenEncrypted": { table: schema.serverGithubAuth, scheme: "scalar" },
+  "server_github_auth.serverKeyPrivateEncrypted": {
+    table: schema.serverGithubAuth,
+    scheme: "scalar",
+  },
+  "github_deploy_key.privateKeyEncrypted": { table: schema.githubDeployKey, scheme: "scalar" },
+  // Plaintext at rest (the Better Auth plugin owns the column) — "plaintext" moves it
+  // into the sealed bundle verbatim rather than pretending it was encrypted.
+  "oauth_application.clientSecret": { table: schema.oauthApplication, scheme: "plaintext" },
   "instance_settings.tunnelToken": { table: schema.instanceSettings, scheme: "plaintext" },
   "instance_settings.ghDeviceTokenEncrypted": { table: schema.instanceSettings, scheme: "scalar" },
   "deployment.envVars": { table: schema.deployment, scheme: "map" },
-  "notification_channel.config": { table: schema.notificationChannel, scheme: "notification-config" },
+  "notification_channel.config": {
+    table: schema.notificationChannel,
+    scheme: "notification-config",
+  },
 };
 
 export const SECRET_COLUMNS: readonly SecretColumn[] = ENCRYPTED_COLUMNS.map((spec) => {

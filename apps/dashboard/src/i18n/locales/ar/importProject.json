@@ -417,5 +417,14 @@
     "rowServices": "الخدمات",
     "rowProject": "المشروع",
     "rowType": "النوع"
+  },
+  "configDiagnostics": {
+    "title": "لم يُطبَّق جزء من ملف openship.json في هذا المستودع",
+    "description": "تم تخطي الحقول المذكورة أدناه، وطُبِّق بقية الملف. وسيستمر النشر.",
+    "titleWholeFile": "تم تجاهل ملف openship.json في هذا المستودع",
+    "descriptionWholeFile": "لم يُطبَّق أي جزء منه. سيستمر النشر باستخدام الإعدادات التي اكتشفها Openship.",
+    "refused": "مرفوض",
+    "unrecognized": "غير معروف",
+    "hint": "شغّل `openship config validate` داخل المستودع لفحص الملف قبل النشر القادم."
   }
 }

@@ -24,20 +24,20 @@
   "features": {
     "everythingIn": "{inherited} planındaki her şey, ayrıca:",
     "staticOnly": "Yalnızca statik siteler — SSG, SPA ve düz HTML",
-    "anyWorkload": "Her şeyi çalıştırın — container'lar, Compose yığınları ve worker'lar",
-    "managedServices": "Yönetilen Postgres, Redis ve uygulama kataloğunun tamamı",
+    "anyWorkload": "Her şeyi çalıştırın — container, Compose, worker, Postgres, Redis",
+    "runningServices": "{runningServices} çalışan uygulama, veritabanı veya worker",
+    "computeMinutes": "Ayda {computeMinutes} hesaplama dakikası",
     "buildMinutes": "Ayda {buildMinutes} build dakikası",
-    "credits": "Ayda {credits} hesaplama kredisi",
+    "power": "Uygulama başına en fazla {powerCpu} vCPU ve {powerRamGb} GB RAM",
+    "projects": "{maxProjects} proje",
+    "projectsUnlimited": "Sınırsız proje",
     "freeSubdomains": "{freeSubdomains} ücretsiz {freeDomainSuffix} alt alan adı",
     "freeSubdomainsUnlimited": "Sınırsız ücretsiz {freeDomainSuffix} alt alan adı",
+    "gitDeploys": "GitHub, GitLab veya herhangi bir Git uzak deposundan dağıtın",
     "customDomains": "Sınırsız özel alan adı, TLS dahil",
+    "deployLogs": "Canlı derleme ve dağıtım logları",
+    "auditLog": "Her değişikliğin denetim kaydı",
     "unlimitedSeats": "Sınırsız ekip üyesi — kullanıcı başına ödeme yok",
-    "previewDeploys": "Her push'ta önizleme dağıtımı",
-    "backups": "Günlük yedekler ve belirli bir ana geri dönüş",
-    "observability": "Canlı loglar, metrikler ve sağlık uyarıları",
-    "mailServer": "Dahili posta sunucusu — SMTP, IMAP ve webmail",
-    "auditLog": "Denetim kaydı, uzatılmış saklama süresiyle",
-    "sharedChannel": "Paylaşımlı Slack veya Discord kanalı",
     "sso": "SSO ve SAML",
     "customLimits": "Sözleşmeye göre belirlenen özel limitler",
     "dedicatedInfra": "Size ayrılmış altyapı ve bölgeler",
@@ -50,12 +50,7 @@
     "selfHostedUnlimited": "Sınırsız dağıtım, proje, sunucu ve alan adı",
     "selfHostedServices": "Tüm yönetilen servisler — Postgres, Redis, posta",
     "selfHostedClients": "CLI, web ve masaüstü — tek backend",
-    "selfHostedFreeSubdomains": "Cloud'a bağlandığınızda {freeSubdomains} ücretsiz {freeDomainSuffix} alt alan adı",
-    "runningServices": "{runningServices} çalışan servis — uygulamalar, veritabanları, worker'lar",
-    "power": "Servis başına en fazla {powerCpu} vCPU ve {powerRamGb} GB RAM",
-    "projects": "{maxProjects} proje",
-    "projectsUnlimited": "Sınırsız proje",
-    "meteredCredits": "Hesaplama, bant genişliği ve depolamanın tamamı aylık kredilerinizden düşer"
+    "selfHostedFreeSubdomains": "Cloud'a bağlandığınızda {freeSubdomains} ücretsiz {freeDomainSuffix} alt alan adı"
   },
   "selfHosted": {
     "name": "Kendi sunucunuzda",
@@ -65,9 +60,9 @@
     "cta": "Kendi sunucunuzda başlayın"
   },
   "creditPacks": {
-    "pack_5k": "{credits} kredi",
-    "pack_25k": "{credits} kredi",
-    "pack_100k": "{credits} kredi"
+    "pack_5k": "{computeMinutes} hesaplama dakikası",
+    "pack_25k": "{computeMinutes} hesaplama dakikası",
+    "pack_100k": "{computeMinutes} hesaplama dakikası"
   },
   "ui": {
     "perMonth": "/ay",
@@ -83,6 +78,8 @@
     "billedMonthly": "aylık faturalanır, istediğiniz zaman iptal edin",
     "campaignBadge": "%{percentOff} indirim",
     "campaignEnds": "Kampanya {date} tarihinde sona eriyor",
-    "wasPrice": "eski fiyat {price}"
+    "wasPrice": "eski fiyat {price}",
+    "standardTitle": "Tüm planlarda",
+    "creditPackNote": "≈ Küçük bir uygulama için {appHours} saat veya {buildMinutes} derleme dakikası"
   }
 }

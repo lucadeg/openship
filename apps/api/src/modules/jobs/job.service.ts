@@ -29,12 +29,44 @@ function resolveRun(row: Job): (() => Promise<JobSummary>) | null {
   return null;
 }
 
+export type SystemJobAvailability = "available" | "unavailable" | "unknown";
+
+/** The registry is the sole source of truth for whether a built-in exists on
+ * this platform. Keeping this check here lets every caller share the same gate
+ * without creating a second scheduler or health-watch implementation. */
+export function systemJobAvailability(key: string): SystemJobAvailability {
+  const def = SYSTEM_JOB_BY_KEY.get(key);
+  if (!def) return "unknown";
+  return def.available && !def.available() ? "unavailable" : "available";
+}
+
+/** Ensure one registered system-job row exists. Safe to call concurrently with
+ * boot reconciliation; the repository upsert converges on the unique job key
+ * while preserving operator schedule/enabled overrides. */
+export async function ensureSystemJob(key: string): Promise<Job> {
+  const def = SYSTEM_JOB_BY_KEY.get(key);
+  if (!def || systemJobAvailability(key) !== "available") {
+    throw new NotFoundError("Job", key);
+  }
+  return repos.job.upsertSystem({
+    key: def.key,
+    label: def.label,
+    defaultCron: def.defaultCron,
+  });
+}
+
 /** Register or unregister a single job on the runner based on its current row.
  *  Only `recurring` jobs with a valid cron register on the runner; `once` jobs
  *  fire via the jobs:oneshot dispatcher and `manual` jobs only via Run-now /
  *  dependencies / event triggers. */
 async function syncJob(row: Job): Promise<boolean> {
   const runner = await getJobRunner();
+  // A row can survive a platform-mode change. It must never make a registered
+  // built-in runnable somewhere its registry definition says it is unavailable.
+  if (systemJobAvailability(row.key) === "unavailable") {
+    await runner.removeRecurring(row.key);
+    return false;
+  }
   const recurring =
     row.enabled &&
     row.scheduleType === "recurring" &&
@@ -78,28 +110,18 @@ export async function reconcileJobs(): Promise<{ registered: number; total: numb
   const runner = await getJobRunner();
 
   for (const def of SYSTEM_JOB_DEFS) {
-    if (def.available && !def.available()) {
+    if (systemJobAvailability(def.key) === "unavailable") {
       // Not applicable here (e.g. ssl:renew off self-hosted) — ensure it isn't
       // scheduled. The row (if any from a prior mode) is left but unscheduled.
       await runner.removeRecurring(def.key);
       continue;
     }
-    await repos.job.upsertSystem({
-      key: def.key,
-      label: def.label,
-      defaultCron: def.defaultCron,
-    });
+    await ensureSystemJob(def.key);
   }
 
   const jobs = await repos.job.listAll();
   let registered = 0;
   for (const row of jobs) {
-    // Skip system jobs whose platform gate is currently false.
-    const def = SYSTEM_JOB_BY_KEY.get(row.key);
-    if (def?.available && !def.available()) {
-      await runner.removeRecurring(row.key);
-      continue;
-    }
     try {
       if (await syncJob(row)) registered++;
     } catch (err) {
@@ -333,13 +355,29 @@ function buildActionConfig(
 /** Update a job. System jobs accept only cron/enabled; custom jobs accept the
  *  full config. Re-syncs the runner registration afterwards. */
 export async function updateJob(key: string, patch: TUpdateJobBody): Promise<Job> {
-  const row = await repos.job.findByKey(key);
-  if (!row) throw new NotFoundError("Job", key);
-
-  // System jobs are code-defined — only schedule/enable are tunable.
+  let row = await repos.job.findByKey(key);
   const advancedKeys = Object.keys(patch).filter(
     (k) => !["cronExpression", "enabled", "label"].includes(k),
   );
+  // A registered built-in may be missing while the async boot reconciliation is
+  // still running (or if that pass failed). PATCH is allowed to repair only that
+  // known definition; arbitrary keys remain a 404. Validate before creating so
+  // a rejected patch cannot leave behind an enabled-but-unscheduled row.
+  if (!row) {
+    if (systemJobAvailability(key) !== "available") throw new NotFoundError("Job", key);
+    if (advancedKeys.length) {
+      throw new ValidationError("System jobs only allow cron/enabled changes");
+    }
+    if (patch.cronExpression !== undefined && !validateCronExpression(patch.cronExpression).valid) {
+      throw new ValidationError(`Invalid cron expression: ${patch.cronExpression}`);
+    }
+    row = await ensureSystemJob(key);
+  }
+  if (systemJobAvailability(key) === "unavailable") {
+    throw new NotFoundError("Job", key);
+  }
+
+  // System jobs are code-defined — only schedule/enable are tunable.
   if (row.kind !== "custom" && advancedKeys.length) {
     throw new ValidationError("System jobs only allow cron/enabled changes");
   }
@@ -414,6 +452,9 @@ export async function runJobNow(
 ): Promise<{ key: string; summary?: JobSummary; runId?: string }> {
   const row = await repos.job.findByKey(key);
   if (!row) throw new NotFoundError("Job", key);
+  if (systemJobAvailability(key) === "unavailable") {
+    throw new NotFoundError("Job", key);
+  }
   if (row.actionType === "command") {
     const runId = await startCommandRun(row);
     return { key, runId };

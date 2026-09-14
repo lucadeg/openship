@@ -47,15 +47,21 @@ export async function createProjectPolicy(c: Context) {
   const body = await c.req.json<{
     serviceId?: string | null;
     destinationId: string;
-    cronExpression?: string;
+    /** Explicit null clears it, same as omitted on create — the dashboard sends null
+     *  for a cleared field because an absent key means "leave alone" on update. */
+    cronExpression?: string | null;
     triggerOnPreDeploy?: boolean;
+    /** Mints the inbound webhook token. `createPolicy` has always supported this;
+     *  this body type simply never read it, so a policy created with the webhook
+     *  trigger switched on came back with no token and the trigger could not fire. */
+    enableWebhook?: boolean;
     /** Omitted = the instance default. Explicit null = keep every run. */
     retainCount?: number | null;
     retainDays?: number | null;
     payloadKind?: string;
     payloadConfig?: Record<string, unknown>;
-    preHook?: string;
-    postHook?: string;
+    preHook?: string | null;
+    postHook?: string | null;
     enabled?: boolean;
   }>();
   if (!body.destinationId) {
@@ -68,6 +74,7 @@ export async function createProjectPolicy(c: Context) {
       destinationId: body.destinationId,
       cronExpression: body.cronExpression,
       triggerOnPreDeploy: body.triggerOnPreDeploy,
+      enableWebhook: body.enableWebhook,
       retainCount: body.retainCount,
       retainDays: body.retainDays,
       payloadKind: body.payloadKind,
@@ -300,12 +307,14 @@ export async function prepareRestore(c: Context) {
     }
   }
 
-  const confirmationToken = crypto.randomBytes(8).toString("hex");
+  const minted = crypto.randomBytes(8).toString("hex");
   try {
-    const { restoreId } = await restoreOrchestrator.beginPrepare({
+    // Return the token beginPrepare settled on, not the one minted above: an
+    // already-active restore of this run is reused and keeps its own.
+    const { restoreId, confirmationToken } = await restoreOrchestrator.beginPrepare({
       runId,
       trigger: { source: "manual", userId: ctx.userId, clientIp },
-      confirmationToken,
+      confirmationToken: minted,
       mode,
       forkMailServerId,
     });

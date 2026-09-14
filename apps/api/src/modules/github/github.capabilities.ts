@@ -22,7 +22,7 @@
  * value. Nothing secret crosses this boundary.
  */
 
-import { env } from "../../config/env";
+import { env, localGitHubAppConfiguration } from "../../config/env";
 import type { RequestContext } from "../../lib/request-context";
 import { CHAINS, type GitHubTokenSource } from "./github.token";
 import { repos } from "@repo/db";
@@ -37,10 +37,10 @@ import { repos } from "@repo/db";
  * overlap without being the same set, so they stay separate types.
  */
 export type GitHubMethodKind =
-  | "device"      // browser device sign-in (instance-wide git identity)
-  | "token"       // pasted PAT (same slot as `device`)
-  | "app"         // Openship Cloud GitHub App installation
-  | "ssh-key"     // per-server deploy key — clone transport, not a token
+  | "device" // browser device sign-in (instance-wide git identity)
+  | "token" // pasted PAT (same slot as `device`)
+  | "app" // local operator-owned or Openship Cloud App installation
+  | "ssh-key" // per-server deploy key — clone transport, not a token
   | "forwarding"; // desktop SSH relay of the operator's identity
 
 export interface GitHubMethod {
@@ -50,10 +50,9 @@ export interface GitHubMethod {
   /** Already set up. Drives "Connected" vs "Set up" affordances. */
   configured: boolean;
   /**
-   * Needs an Openship Cloud link before it can work. The App's private key lives
-   * in openship.io, so a self-hosted instance proxies through it — the UI turns
-   * this row's action into "Connect Openship Cloud" rather than showing a button
-   * that 403s.
+   * Needs an Openship Cloud link before it can work. Set only when this instance
+   * has no complete operator-owned App, so the UI turns the action into
+   * "Connect Openship Cloud" rather than showing a button that 403s.
    */
   requiresCloud?: boolean;
   /** Present when `available` is false, so the UI can explain rather than hide. */
@@ -96,6 +95,9 @@ export async function resolveGitHubCapabilities(
   const settings = await repos.instanceSettings.get().catch(() => null);
   const identityConfigured = Boolean(settings?.ghDeviceTokenEncrypted);
   const identityMethod = settings?.ghDeviceTokenMethod ?? null;
+  const customAppConfigured =
+    platform === "selfhosted" &&
+    (await repos.gitSource.listActiveByOrganization(ctx.organizationId).catch(() => [])).length > 0;
 
   // `gh-cli` in the chain is what carries the instance identity, so its presence
   // there is the real test of whether these two rows can work at all — not a
@@ -128,9 +130,16 @@ export async function resolveGitHubCapabilities(
     {
       kind: "app",
       available: chainHas(platform, "app-installation"),
-      configured: opts.cloudConnected,
-      // Only self-hosted proxies through the cloud; on the SaaS the App is native.
-      requiresCloud: platform === "selfhosted",
+      configured:
+        platform === "saas" ||
+        customAppConfigured ||
+        localGitHubAppConfiguration.configured ||
+        opts.cloudConnected,
+      // A fully configured operator-owned App is native on self-hosted too.
+      requiresCloud:
+        platform === "selfhosted" &&
+        !customAppConfigured &&
+        !localGitHubAppConfiguration.configured,
     },
     {
       kind: "ssh-key",

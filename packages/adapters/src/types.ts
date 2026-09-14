@@ -161,6 +161,23 @@ export interface BuildConfig {
   productionPaths?: string[];
   /** Root directory within the repo for monorepo builds. */
   rootDirectory?: string;
+  /**
+   * The docker build CONTEXT, relative to the source root — compose `build:`
+   * semantics. When set, the builder runs with THIS directory as the context, and
+   * `dockerfilePath` plus `.dockerignore` resolve INSIDE it: a service Dockerfile's
+   * `COPY requirements.txt` means the file next to it (#634).
+   *
+   * Deliberately NOT the same field as `rootDirectory`, which means "the subdir the
+   * app lives in" WITHIN a whole-repo context — a monorepo Dockerfile that COPYs the
+   * workspace-root lockfile depends on that root context, so widening `rootDirectory`
+   * into a context would break it. Set only where the user actually declared a
+   * context: a compose service's `build`.
+   *
+   * Only honoured for builds that use a REPOSITORY Dockerfile. A generated recipe
+   * (see docker-build-plan) COPYs from the source root, so a narrowed context can
+   * never satisfy it — that combination is refused rather than silently built.
+   */
+  buildContextDirectory?: string;
   /** Explicit Dockerfile path relative to the build root/context. */
   dockerfilePath?: string;
   /** Preloaded Dockerfile contents, used when the caller already read the file from the source provider. */
@@ -199,6 +216,9 @@ export interface BuildConfig {
   staticOutDir?: string;
   /** Environment variables injected at build time */
   envVars: Record<string, string>;
+  /** Explicit image-build arguments. Kept separate from runtime/container env;
+   * compose services sharing one Dockerfile may carry different values. */
+  buildArgs?: Record<string, string>;
   /** Resources allocated for the build container */
   resources: ResourceConfig;
   /** Ephemeral token for cloning private repos - never persisted */
@@ -245,6 +265,32 @@ export interface BuildConfig {
   cloneOnServer?: boolean;
 }
 
+/**
+ * Acquire an already-built container image as this runtime's deployable artifact.
+ *
+ * This is deliberately separate from {@link BuildConfig}: `buildImage` is the
+ * builder container (for example `node:22`), while `imageRef` here is the
+ * application artifact the runtime must run verbatim. Keeping the two types
+ * separate makes it impossible for a prebuilt release to become a Dockerfile
+ * `FROM` image by accident.
+ */
+export interface ImageArtifactConfig {
+  /** Build/deploy session that owns any runtime resource created while acquiring the image. */
+  sessionId: string;
+  /** Project identifier, used for runtime naming and ownership metadata. */
+  projectId: string;
+  /** Human-readable/runtime-safe project slug when available. */
+  slug?: string;
+  /** Registry image reference to pull/use verbatim. */
+  imageRef: string;
+  /** Runtime environment available when a cloud workspace starts the image default process. */
+  envVars: Record<string, string>;
+  /** Production resources; there is no build tier for a prebuilt image. */
+  resources: ResourceConfig;
+  /** Refresh a mutable tag even when it is already present on the target. */
+  forcePull?: boolean;
+}
+
 export interface DeployPublicEndpoint {
   port?: number;
   targetPath?: string;
@@ -262,6 +308,14 @@ export interface DeployConfig {
   buildSessionId: string;
   /** Opaque reference to the built artifact (workspace ID, docker image tag, etc.) */
   imageRef?: string;
+  /**
+   * The artifact came from an already-built container image rather than a
+   * source build. Docker naturally preserves the image's CMD/WORKDIR when no
+   * start command is supplied; Cloud needs this explicit signal so it does not
+   * manufacture the buildpack-only `npm start` fallback and replace the image's
+   * own process contract.
+   */
+  prebuiltImage?: boolean;
   /** "production" | "preview" */
   environment: string;
   /** Port the application listens on */
@@ -284,6 +338,20 @@ export interface DeployConfig {
   startCommand?: string;
   /** Detected framework / stack (e.g. "nextjs", "express") */
   stack?: string;
+  /**
+   * Package manager the build used (npm | yarn | pnpm | bun). Carried onto the
+   * DEPLOY config, not just the build config, because a start command names a
+   * dependency binary as often as a build command does (`next start`,
+   * `gatsby serve`) and the runtime has to put `node_modules/.bin` on PATH for
+   * it — see nodeBinPathExport.
+   *
+   * Optional because not every DeployConfig producer sets it (adopt and the
+   * static edge path have no start command to resolve). Do NOT read it as "node
+   * or not": the project column defaults to "npm", so a Go or PHP project
+   * usually carries "npm" here too. nodeBinPathExport is what decides, off the
+   * package manager's own semantics.
+   */
+  packageManager?: string;
   /** Environment variables injected at runtime */
   envVars: Record<string, string>;
   /** Resources allocated for the production container */
@@ -350,6 +418,15 @@ export interface BuildResult {
   status: ContainerStatus;
   /** Opaque reference to the built image / snapshot */
   imageRef?: string;
+  /**
+   * Does this deploy exclusively own the returned artifact and therefore may
+   * delete it if deployment fails or is cancelled?
+   *
+   * Undefined preserves the historical answer (`true`) for source builds.
+   * A Docker registry image is shared/foreign and returns `false`; a temporary
+   * Cloud workspace created from that image returns `true`.
+   */
+  artifactOwned?: boolean;
   durationMs?: number;
   /** Human-readable error description when status is "failed" */
   errorMessage?: string;
@@ -380,7 +457,13 @@ export interface DeploymentResult {
  */
 export type BuildStep = "prepare" | "clone" | "install" | "build" | "deploy";
 
-export const BUILD_STEPS: readonly BuildStep[] = ["prepare", "clone", "install", "build", "deploy"] as const;
+export const BUILD_STEPS: readonly BuildStep[] = [
+  "prepare",
+  "clone",
+  "install",
+  "build",
+  "deploy",
+] as const;
 
 export interface LogEntry {
   timestamp: string;
@@ -412,7 +495,7 @@ export interface LogEntry {
  * `run`; when no lock is injected, callers fall back to running `fn` directly.
  */
 export interface ProvisionLock {
-  run<T>(fn: () => Promise<T>): Promise<T>;
+  run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T>;
 }
 
 export interface ContainerInfo {
@@ -420,8 +503,21 @@ export interface ContainerInfo {
   status: ContainerStatus;
   /** Container IP on the internal network */
   ip?: string;
-  /** Mapped port on host (if applicable) */
+  /** Mapped port on host (if applicable). The FIRST binding the daemon reports —
+   *  arbitrary for a container publishing several ports, which is why anything
+   *  choosing a proxy target for a SPECIFIC container port must read
+   *  `hostPortByContainerPort` instead. */
   hostPort?: number;
+  /**
+   * Every published binding, keyed by CONTAINER port → host port.
+   *
+   * `hostPort` alone cannot answer "what is container port N published on": it is
+   * whichever binding the daemon happened to list first, so a route for the second
+   * port of a multi-port container was dialed at the first port's publish — a vhost
+   * that reaches a different app on the same box. Undefined when the runtime has no
+   * port mapping to report (bare, cloud) or could not be asked.
+   */
+  hostPortByContainerPort?: Record<number, number>;
   /** Uptime in seconds */
   uptimeSeconds?: number;
   /** Current resource consumption */
@@ -436,10 +532,12 @@ export interface ResourceUsage {
   networkTxBytes: number;
 }
 
-/** An extra path-prefix location that reverse-proxies to another target. */
+/** An extra literal-path location that reverse-proxies to another target. */
 export interface RouteProxyLocation {
-  /** nginx location prefix, e.g. "/api/". */
+  /** nginx location path, e.g. "/api/". */
   pathPrefix: string;
+  /** true -> `location = <path>`; unset/false -> `location ^~ <path>`. */
+  exact?: boolean;
   /** Proxy target, e.g. "http://10.0.0.5:3000". When `upstreamPath` is set this is
    *  the ORIGIN only (no path) — the path comes from the template instead. */
   targetUrl: string;
@@ -736,6 +834,20 @@ export interface ExecOnly {
  */
 export interface CommandExecutor extends ExecOnly {
   /**
+   * Bind an AbortSignal to command/file operations started by `fn`.
+   *
+   * Remote executors use an async-local scope rather than mutable instance
+   * state: one deployment may be cancelled while another caller legitimately
+   * shares the pooled connection.  Implementations must not resolve the scope
+   * until an operation which already started has quiesced its transport.  That
+   * invariant lets provisioning locks release safely after cancellation.
+   *
+   * Optional for compatibility with lightweight/custom executors. Callers must
+   * still pass explicit signals to APIs that expose one.
+   */
+  runWithAbortSignal?<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T>;
+
+  /**
    * Run a command with real-time log streaming.
    * Resolves when the command exits - the log callback fires for each line.
    *
@@ -751,8 +863,15 @@ export interface CommandExecutor extends ExecOnly {
     opts?: { signal?: AbortSignal },
   ): Promise<{ code: number; output: string }>;
 
-  /** Write content to a file on the target machine. Creates dirs as needed. */
-  writeFile(path: string, content: string): Promise<void>;
+  /**
+   * Write content to a file on the target machine. Creates dirs as needed.
+   *
+   * `mode` is applied before any payload bytes become reachable at `path`. This
+   * matters for credentials: write-then-chmod briefly publishes a secret under
+   * the login user's umask. Callers that need an atomic replacement should write
+   * a unique sibling and rename it after this call.
+   */
+  writeFile(path: string, content: string, opts?: { mode?: number }): Promise<void>;
 
   /** Read a file from the target machine. */
   readFile(path: string): Promise<string>;

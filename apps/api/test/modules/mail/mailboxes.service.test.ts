@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   queryOne: vi.fn(),
+  queryRows: vi.fn(),
+  execute: vi.fn(),
   transaction: vi.fn(),
   readState: vi.fn(),
   removeMaildirOnDisk: vi.fn(),
@@ -16,9 +18,9 @@ vi.mock("../../../src/lib/ssh-manager", () => ({
 }));
 
 vi.mock("../../../src/modules/mail/admin/psql-runner", () => ({
-  execute: vi.fn(),
+  execute: mocks.execute,
   queryOne: mocks.queryOne,
-  queryRows: vi.fn(),
+  queryRows: mocks.queryRows,
   q: (value: string) => `'${value}'`,
   qInt: (value: number) => String(value),
   transaction: mocks.transaction,
@@ -48,9 +50,17 @@ vi.mock("../../../src/modules/mail/admin/password", () => ({
 vi.mock("../../../src/modules/mail/admin/platform-mailbox.service", () => ({
   buildInsertMailboxSql: vi.fn(),
   buildInsertSelfForwardingSql: vi.fn(),
+  PLATFORM_LOCAL_PART: "openship",
 }));
 
-import { hardDeleteMailbox } from "../../../src/modules/mail/admin/mailboxes.service";
+import {
+  createMailbox,
+  hardDeleteMailbox,
+  listMailboxes,
+  PlatformMailboxProtectedError,
+  softDeleteMailbox,
+  updateMailbox,
+} from "../../../src/modules/mail/admin/mailboxes.service";
 
 function mailbox(username: string, domain: string) {
   return {
@@ -111,5 +121,67 @@ describe("hardDeleteMailbox postmaster protection", () => {
     );
 
     expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("platform mailbox protection", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.readState.mockResolvedValue({ domain: "primary.example" });
+    mocks.transaction.mockResolvedValue(undefined);
+  });
+
+  test("marks only the primary install sender as platform-owned", async () => {
+    mocks.queryRows.mockResolvedValue([
+      mailbox("openship@primary.example", "primary.example"),
+      mailbox("alice@primary.example", "primary.example"),
+    ]);
+
+    const rows = await listMailboxes("srv_test", "primary.example");
+
+    expect(rows.map(({ username, isPlatform }) => ({ username, isPlatform }))).toEqual([
+      { username: "openship@primary.example", isPlatform: true },
+      { username: "alice@primary.example", isPlatform: false },
+    ]);
+  });
+
+  test("fails closed for the reserved sender when install state is unreadable", async () => {
+    mocks.readState.mockResolvedValue(null);
+    mocks.queryOne.mockResolvedValue(mailbox("openship@primary.example", "primary.example"));
+
+    await expect(hardDeleteMailbox("srv_test", "openship@primary.example")).rejects.toBeInstanceOf(
+      PlatformMailboxProtectedError,
+    );
+    expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  test("does not let ordinary create claim the reserved sender while state is unreadable", async () => {
+    mocks.readState.mockResolvedValue(null);
+    mocks.queryOne.mockResolvedValue(null);
+
+    await expect(
+      createMailbox("srv_test", {
+        localPart: "openship",
+        domain: "primary.example",
+        password: "long-enough-password",
+      }),
+    ).rejects.toBeInstanceOf(PlatformMailboxProtectedError);
+    expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["update", () => updateMailbox("srv_test", "openship@primary.example", { active: false })],
+    [
+      "soft delete",
+      () => softDeleteMailbox("srv_test", "openship@primary.example", "admin@example.com"),
+    ],
+    ["hard delete", () => hardDeleteMailbox("srv_test", "openship@primary.example")],
+  ])("refuses ordinary %s operations", async (_operation, run) => {
+    mocks.queryOne.mockResolvedValue(mailbox("openship@primary.example", "primary.example"));
+
+    await expect(run()).rejects.toBeInstanceOf(PlatformMailboxProtectedError);
+
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.execute).not.toHaveBeenCalled();
   });
 });

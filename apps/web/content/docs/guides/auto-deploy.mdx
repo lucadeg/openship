@@ -90,7 +90,7 @@ You don't have to think about this, but here's what happens under the hood so no
 
 - **Public Openship** — if your Openship API has a public web address, turning on Auto Deploy registers a webhook on your repo that points at `…/api/webhooks/github`. GitHub calls it on every push.
 - **Verified domain** — if you set a Webhook Endpoint, GitHub delivers instead to `https://<your-domain>/_openship/hooks/github`, which routes to Openship. This is the option for private or laptop installs.
-- **Openship Cloud** — with the Openship GitHub App installed, push events arrive through the app automatically; there's no per-repo webhook to manage.
+- **GitHub App** — on Openship Cloud or with your own self-hosted App, push events arrive through the App automatically; there's no duplicate per-repo webhook to manage.
 
 In every case, Openship starts a fresh build from the commit you just pushed — the same build you'd get by clicking Deploy.
 

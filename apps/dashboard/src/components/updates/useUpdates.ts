@@ -13,6 +13,8 @@ import { useCallback, useEffect, useState } from "react";
 import {
   RELEASES_LATEST_API,
   advisoryManifestUrl,
+  changelogMarkdownUrl,
+  extractChangelogSection,
   parseManifest,
   resolveUpdateState,
   matchAdvisories,
@@ -93,33 +95,52 @@ async function persistLastSeen(version: string): Promise<void> {
 // unauthenticated calls to 60/hr/IP; navigation shouldn't re-hit it).
 let remoteCache: Promise<{ latest: LatestRelease | null; manifest: AdvisoryManifest | null }> | null = null;
 
-async function fetchRemote(): Promise<{ latest: LatestRelease | null; manifest: AdvisoryManifest | null }> {
-  remoteCache ??= (async () => {
-    let latest: LatestRelease | null = null;
-    let manifest: AdvisoryManifest | null = null;
-    try {
-      const res = await fetch(RELEASES_LATEST_API, {
-        headers: { Accept: "application/vnd.github+json" },
-      });
-      if (res.ok) {
-        const data = (await res.json()) as { tag_name?: string; body?: string };
-        const tag = data.tag_name ?? "";
-        if (tag) {
-          latest = { version: tag.replace(/^v/, ""), tag, notes: data.body ?? "" };
-          // Advisories pinned to the release TAG — main commits never surface.
+/** One uncached update read. Exported so the three-source failure isolation is testable. */
+export async function fetchRemoteUncached(
+  fetcher: typeof fetch = fetch,
+): Promise<{ latest: LatestRelease | null; manifest: AdvisoryManifest | null }> {
+  let latest: LatestRelease | null = null;
+  let manifest: AdvisoryManifest | null = null;
+  try {
+    const res = await fetcher(RELEASES_LATEST_API, {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { tag_name?: string };
+      const tag = data.tag_name ?? "";
+      if (tag) {
+        latest = { version: tag.replace(/^v/, ""), tag, notes: "" };
+        // Both documents are pinned to the release tag. Fetch independently:
+        // a missing changelog must not hide a critical advisory, and a missing
+        // advisory must not erase the release notes.
+        const [changelogResult, manifestResult] = await Promise.allSettled([
+          fetcher(changelogMarkdownUrl(tag)),
+          fetcher(advisoryManifestUrl(tag), { headers: { Accept: "application/json" } }),
+        ]);
+        if (changelogResult.status === "fulfilled" && changelogResult.value.ok) {
           try {
-            const m = await fetch(advisoryManifestUrl(tag), { headers: { Accept: "application/json" } });
-            if (m.ok) manifest = parseManifest(await m.json());
+            latest.notes = extractChangelogSection(await changelogResult.value.text(), latest.version);
           } catch {
-            /* no manifest at this tag → no advisories */
+            /* malformed/unreadable changelog → keep notes empty */
+          }
+        }
+        if (manifestResult.status === "fulfilled" && manifestResult.value.ok) {
+          try {
+            manifest = parseManifest(await manifestResult.value.json());
+          } catch {
+            /* malformed/unreadable manifest → no advisories */
           }
         }
       }
-    } catch {
-      /* offline / rate-limited → no update info */
     }
-    return { latest, manifest };
-  })();
+  } catch {
+    /* offline / rate-limited → no update info */
+  }
+  return { latest, manifest };
+}
+
+async function fetchRemote(): Promise<{ latest: LatestRelease | null; manifest: AdvisoryManifest | null }> {
+  remoteCache ??= fetchRemoteUncached();
   return remoteCache;
 }
 

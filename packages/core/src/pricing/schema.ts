@@ -63,6 +63,25 @@ const planLimitsSchema = z.object({
    * `null` = uncapped (enterprise).
    */
   maxResourceTier: z.enum(RESOURCE_TIER_ORDER).nullable(),
+  /**
+   * App runtime included per month, in COMPUTE MINUTES — one minute of a `low`
+   * machine. Bigger machines burn proportionally more (`computeUnitsPerMinute`:
+   * medium 2×, high 4×, xlarge 8×), so one published number covers every size
+   * without quoting a separate allowance per tier of machine.
+   *
+   * This replaced an authored `credits` blob whose numbers meant nothing: 60,000
+   * credits against a 43,200-minute month, on a tier advertising 50 running
+   * services — i.e. not enough to run ONE app around the clock. The unit now has
+   * a definition, and `planMonthlyCredits()` derives the Oblien grant from it.
+   *
+   * `runningServices` is a CONCURRENCY cap, this is the METER. A tier may allow
+   * more always-on apps than its minutes cover; that is what "up to" means and is
+   * how metered compute works everywhere.
+   *
+   * 0 is meaningful and correct for a static-only tier: the edge serves static
+   * sites, `runningServices` is already 0, so no app compute is consumed.
+   */
+  computeMinutesPerMonth: limitNumber,
   buildMinutesPerMonth: limitNumber,
   freeSubdomains: limitNumber,
   customDomains: limitNumber,
@@ -85,10 +104,6 @@ const planSchema = z.object({
   support: z.enum(["community", "email", "priority", "dedicated"]),
   /** Tier whose features this one builds on — drives the "Everything in X" line. */
   inherits: z.string().min(1).optional(),
-  credits: z.object({
-    /** Milli-credits granted per period; null = granted by hand (enterprise). */
-    monthlyMilli: z.number().int().positive().nullable(),
-  }),
   limits: planLimitsSchema,
   /** Copy keys, in display order. Each must exist in `locales/en.json#features`. */
   features: z.array(z.string().min(1)).min(1),
@@ -197,6 +212,20 @@ export const pricingCatalogSchema = z
     campaigns: z.array(campaignSchema),
     plans: z.array(planSchema).min(1),
     creditPacks: z.array(creditPackSchema),
+    /**
+     * Copy for what EVERY cloud tier includes, stated once instead of repeated
+     * down each column.
+     *
+     * This exists because the per-tier lists had become the differentiator, and
+     * they were differentiating on nothing: the audit log, live logs and metrics
+     * are ungated for everyone, so listing them only under Team implied a paywall
+     * that no code enforces. A tier's bullets are now its NUMBERS; anything true
+     * everywhere belongs here.
+     *
+     * Only put a key here that is actually shipped and reachable on cloud — the
+     * defect this block replaces was advertising capability, not describing it.
+     */
+    standard: z.object({ features: z.array(z.string().min(1)).min(1) }),
     selfHosted: z.object({ features: z.array(z.string().min(1)).min(1) }),
   })
   .superRefine((data, ctx) => {
@@ -327,6 +356,12 @@ export const pricingCopySchema = z.object({
       campaignBadge: z.string(),
       campaignEnds: z.string(),
       wasPrice: z.string(),
+      /** Heading over the `standard.features` block. Lives here, not in an app
+       *  dictionary, because the marketing site has no i18n framework. */
+      standardTitle: z.string(),
+      /** What a top-up pack buys, in recognisable units. Interpolates
+       *  `{appHours}` and `{buildMinutes}`, both derived from the catalog. */
+      creditPackNote: z.string(),
     })
     .partial()
     .optional(),

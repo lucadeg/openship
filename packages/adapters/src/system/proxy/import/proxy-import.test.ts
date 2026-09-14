@@ -93,6 +93,63 @@ describe("scanNginx", () => {
     expect(res.warnings.find((x) => x.includes("path-routes"))).toBeUndefined();
   });
 
+  test("preserves an exact-match location as a clean path plus an exact flag", async () => {
+    const conf = `
+      server {
+        listen 80;
+        server_name example.com;
+        location = /mcp {
+          proxy_pass http://127.0.0.1:3100;
+        }
+      }
+    `;
+    const res = await scanNginx(makeExecutor([["nginx -T", conf]]));
+
+    expect(res.sites).toHaveLength(1);
+    expect(res.sites[0].target).toEqual({ kind: "proxy", url: "http://127.0.0.1:3100" });
+    expect(res.sites[0].routes).toEqual([
+      { path: "/mcp", url: "http://127.0.0.1:3100", exact: true },
+    ]);
+    expect(res.warnings).toEqual([]);
+  });
+
+  test("normalizes ^~ prefixes and skips only regex/named proxy locations", async () => {
+    const conf = `
+      server {
+        server_name mixed.example.com;
+        location / { proxy_pass http://127.0.0.1:3000; }
+        location ^~ /assets/ { proxy_pass http://127.0.0.1:3100; }
+        location ~ ^/users/[0-9]+$ { proxy_pass http://127.0.0.1:3200; }
+        location ~* \\.php$ { proxy_pass http://127.0.0.1:3300; }
+        location @fallback { proxy_pass http://127.0.0.1:3400; }
+      }
+    `;
+    const res = await scanNginx(makeExecutor([["nginx -T", conf]]));
+
+    expect(res.sites).toHaveLength(1);
+    expect(res.sites[0].routes).toEqual([
+      { path: "/", url: "http://127.0.0.1:3000" },
+      { path: "/assets/", url: "http://127.0.0.1:3100" },
+    ]);
+    expect(res.warnings).toHaveLength(3);
+    expect(
+      res.warnings.every((w) => w.includes("mixed.example.com") && w.includes("skipped")),
+    ).toBe(true);
+  });
+
+  test("does not widen an unsupported-only location into a root route", async () => {
+    const conf = `
+      server {
+        server_name regex.example.com;
+        location ~ ^/private { proxy_pass http://127.0.0.1:3200; }
+      }
+    `;
+    const res = await scanNginx(makeExecutor([["nginx -T", conf]]));
+
+    expect(res.sites).toEqual([]);
+    expect(res.warnings.some((w) => w.includes('location "~ ^/private"'))).toBe(true);
+  });
+
   test("nested if/location braces don't truncate the block", async () => {
     const conf = `
       server {

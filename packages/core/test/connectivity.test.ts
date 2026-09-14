@@ -57,6 +57,8 @@ describe("classifyConnectivityError", () => {
   it("maps handshake / channel / reset to protocol_error", () => {
     expect(classifyConnectivityError("Handshake failed").code).toBe("protocol_error");
     expect(classifyConnectivityError("Channel open failure: open failed").code).toBe("protocol_error");
+    expect(classifyConnectivityError("Unable to exec").code).toBe("protocol_error");
+    expect(classifyConnectivityError("sudo: unable to execute helper").code).toBe("unknown");
   });
 
   it("classifies a socket destroyed with no reply, rather than leaving it unknown", () => {

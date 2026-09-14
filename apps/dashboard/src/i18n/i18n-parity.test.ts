@@ -57,7 +57,12 @@ const MISSING_BASELINE: Record<string, number> = {
   // replaced a hardcoded English "Waiting for output…" still shown under a
   // cancelled install. Translated in tr, English-first in the other 7 via
   // deepMerge.
-  projectSettings: 1359,
+  // −6: domains.outputHint reached FULL parity. It gained two keys (`noIndex` for
+  // "the doc-root is there but holds no index file" and `notServed` for "the edge
+  // answered HTTP <status>" — the two static-404 shapes the Domains tab used to
+  // compute and then render nothing for), and all three of its keys are now
+  // translated in all 9 locales, where `body` had been English-first in 6.
+  projectSettings: 1353,
   jobs: 876,
   // +15: discover.envFromImage/Hint/Import — the collapsed "vars come from the
   // image" row and its one-click import. Translated in ar/fr/tr; the other 5

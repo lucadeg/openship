@@ -76,7 +76,7 @@ async function resolvePinnedIp(host: string, allowPrivate: boolean): Promise<{ i
   return { ip: chosen.address, family: chosen.family };
 }
 
-/** Headers that must never cross a redirect to a DIFFERENT host (credential
+/** Headers that must never cross a redirect to a DIFFERENT origin (credential
  *  leak) — matches fetch's cross-origin stripping. */
 function stripCredentialHeaders(headers: Record<string, string> | undefined): Record<string, string> {
   const out: Record<string, string> = {};
@@ -180,9 +180,9 @@ export async function safeFetch(rawUrl: string, opts: SafeFetchOptions = {}): Pr
     const location = res.headers["location"];
     if (location) {
       const nextUrl = new URL(location, url);
-      // Never carry credentials to a DIFFERENT host on redirect.
+      // Never carry credentials across a scheme, hostname, or port boundary.
       const nextHeaders =
-        nextUrl.host === url.host ? opts.headers : stripCredentialHeaders(opts.headers);
+        nextUrl.origin === url.origin ? opts.headers : stripCredentialHeaders(opts.headers);
       return safeFetch(nextUrl.toString(), {
         ...opts,
         headers: nextHeaders,

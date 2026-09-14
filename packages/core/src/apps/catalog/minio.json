@@ -1,6 +1,7 @@
 {
   "available": true,
   "verified": true,
+  "minEngine": "0.6.6",
   "id": "minio",
   "name": "MinIO",
   "description": "S3-compatible object storage with a web console — point any S3 client (aws-cli, SDKs) at it, or bind a bucket straight into another project's uploads.",

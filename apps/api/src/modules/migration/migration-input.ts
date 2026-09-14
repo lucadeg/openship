@@ -14,6 +14,7 @@ export interface MigrationRouteSpec {
   domain?: string;
   customDomain?: string;
   targetPath?: string;
+  exact?: boolean;
 }
 
 /** Normalize a location path prefix to a leading-slash form (`v3` → `/v3`),
@@ -137,6 +138,7 @@ export function sanitizeRoutes(
       domain?: unknown;
       customDomain?: unknown;
       targetPath?: unknown;
+      exact?: unknown;
     };
     const domainType = r.domainType === "custom" ? "custom" : "free";
     const domain = typeof r.domain === "string" ? r.domain.trim().toLowerCase() : undefined;
@@ -146,14 +148,20 @@ export function sanitizeRoutes(
     if (!value) continue; // nothing to publish without a domain
     // A non-root location prefix (e.g. "/v3") → this service serves a PATH of the
     // domain (path fan-out); root ("/") is the default and carries no targetPath.
-    const path = typeof r.targetPath === "string" ? normalizePathPrefix(r.targetPath) : undefined;
+    const path =
+      typeof r.targetPath === "string"
+        ? normalizePathPrefix(r.targetPath)
+        : r.exact === true
+          ? "/"
+          : undefined;
     out[name] = {
       domainType,
       ...(domainType === "custom" ? { customDomain: value } : { domain: value }),
       ...(r.exposedPort != null && String(r.exposedPort).trim()
         ? { exposedPort: String(r.exposedPort).trim() }
         : {}),
-      ...(path && path !== "/" ? { targetPath: path } : {}),
+      ...(path && (path !== "/" || r.exact === true) ? { targetPath: path } : {}),
+      ...(r.exact === true ? { exact: true } : {}),
     };
     if (Object.keys(out).length >= 100) break;
   }

@@ -7,6 +7,7 @@ import BuildSettings from "@/components/import-project/BuildSettings";
 import DockerSettings from "@/components/import-project/DockerSettings";
 import ComposeServices from "@/components/import-project/ComposeServices";
 import { ComposePathField } from "@/components/import-project/ComposePathField";
+import { ConfigDiagnostics } from "@/components/import-project/ConfigDiagnostics";
 import EnvironmentVariables from "@/components/import-project/EnvironmentVariables";
 import MonorepoApps from "@/components/import-project/MonorepoApps";
 import RoutingSection from "@/components/import-project/RoutingSection";
@@ -448,6 +449,11 @@ const DeployRepository: React.FC = () => {
                                 />
                             )}
 
+                            {/* Above every type-specific section: a refused
+                                openship.json field can belong to any of them, and
+                                the notice must survive the `app → services` flip
+                                that applying a compose path causes (#641). */}
+                            <ConfigDiagnostics />
                             {deploymentSections}
                         </div>
                         <Sidebar />

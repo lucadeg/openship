@@ -27,6 +27,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 
 import { BuildLogger, DEFAULT_RESOURCE_CONFIG, DockerRuntime } from "@repo/adapters";
@@ -76,7 +77,7 @@ const dockerEnv = { ...process.env, DOCKER_HOST: `unix://${dockerSocketPath}` };
 
 describeDockerE2E("catalog inline build through the real build pipeline", () => {
   let runtime: DockerRuntime;
-  let builtRef: string | undefined;
+  const builtRefs = new Set<string>();
 
   beforeAll(async () => {
     await requireDocker();
@@ -84,67 +85,87 @@ describeDockerE2E("catalog inline build through the real build pipeline", () => 
   }, 300_000);
 
   afterAll(async () => {
-    if (builtRef) {
+    for (const builtRef of builtRefs) {
       await execFileAsync("docker", ["rmi", "-f", builtRef], { env: dockerEnv }).catch(() => {});
     }
     await runtime?.dispose?.().catch(() => {});
   }, 120_000);
 
-  it("materializes an inline Dockerfile, builds it on the real daemon, and the COPY <service>/<file> prefix resolves", async () => {
-    // A build-ONLY service (image:null) whose Dockerfile COPYs a materialized file
-    // by its service-subdir prefix. `widget/` here === sanitizeComposeImageName("widget").
-    listByProjectMock.mockResolvedValue([
-      {
-        id: SERVICE_ID,
-        name: "widget",
-        enabled: true,
-        image: null,
-        build: null,
-        advanced: {
-          build: {
-            dockerfile:
-              "FROM alpine:3.20\n" +
-              "COPY widget/marker.sh /marker.sh\n" +
-              "RUN chmod +x /marker.sh\n" +
-              'ENTRYPOINT ["/marker.sh"]\n',
-            files: [{ path: "marker.sh", content: `#!/bin/sh\necho ${MARKER}\n` }],
+  it.each(["classic", "buildkit"])(
+    "builds and runs an inline image despite failure-looking logs (%s)",
+    async (builder) => {
+      const runId = randomUUID();
+      const successfulOutput = `build-${runId}: Exited with code 0`;
+      const buildLogs: string[] = [];
+      // A build-ONLY service (image:null) whose Dockerfile COPYs a materialized file
+      // by its service-subdir prefix. `widget/` here === sanitizeComposeImageName("widget").
+      listByProjectMock.mockResolvedValue([
+        {
+          id: SERVICE_ID,
+          name: "widget",
+          enabled: true,
+          image: null,
+          build: null,
+          advanced: {
+            build: {
+              dockerfile:
+                (builder === "buildkit" ? "# syntax=docker/dockerfile:1\n" : "") +
+                "FROM alpine:3.20\n" +
+                "COPY widget/marker.sh /marker.sh\n" +
+                `RUN chmod +x /marker.sh && echo "${successfulOutput}" && echo "fixture: Process exited with code 1"\n` +
+                'ENTRYPOINT ["/marker.sh"]\n',
+              files: [{ path: "marker.sh", content: `#!/bin/sh\necho ${MARKER}\n` }],
+            },
           },
+          framework: null,
+          buildCommand: null,
+          startCommand: null,
+          rootDirectory: null,
+          dockerfile: null,
         },
-        framework: null,
-        buildCommand: null,
-        startCommand: null,
-        rootDirectory: null,
-        dockerfile: null,
-      },
-    ]);
+      ]);
 
-    const result = await buildComposeImages({
-      project: {
-        id: "p-widget",
-        slug: "widget-app",
-        name: "widget-app",
-        localPath: null,
-        workspacePrepareCommand: null,
-      } as never,
-      dep: { id: "d-widget", branch: "main", commitSha: null, trigger: "deploy", meta: null } as never,
-      runtime,
-      logger: new BuildLogger(() => {}),
-      snapshot: SNAPSHOT as never,
-      buildSessionId: "e2e-inline-build",
-      buildEnvVars: {},
-      buildResources: DEFAULT_RESOURCE_CONFIG,
-    });
+      const result = await buildComposeImages({
+        project: {
+          id: "p-widget",
+          slug: "widget-app",
+          name: "widget-app",
+          localPath: null,
+          workspacePrepareCommand: null,
+        } as never,
+        dep: {
+          id: "d-widget",
+          branch: "main",
+          commitSha: null,
+          trigger: "deploy",
+          meta: null,
+        } as never,
+        runtime,
+        logger: new BuildLogger((entry) => buildLogs.push(entry.message)),
+        snapshot: SNAPSHOT as never,
+        buildSessionId: `e2e-inline-build-${builder}-${runId}`,
+        composeInterpolationEnv: {},
+        buildEnvVars: {},
+        buildResources: DEFAULT_RESOURCE_CONFIG,
+      });
 
-    // The build succeeded: a failed COPY prefix would have surfaced here, since a
-    // missing `widget/marker.sh` fails `docker build` (COPY source not found).
-    expect(result.buildFailures.size, [...result.buildFailures.values()].join("; ")).toBe(0);
-    builtRef = result.builtImageRefs.get(SERVICE_ID);
-    expect(builtRef, "a build ref should have been produced").toBeTruthy();
+      // The build succeeded: a failed COPY prefix would have surfaced here, since a
+      // missing `widget/marker.sh` fails `docker build` (COPY source not found).
+      const builtRef = result.builtImageRefs.get(SERVICE_ID);
+      if (builtRef) builtRefs.add(builtRef);
+      expect(result.buildFailures.size, [...result.buildFailures.values()].join("; ")).toBe(0);
+      expect(builtRef, "a build ref should have been produced").toBeTruthy();
+      expect(buildLogs.join("\n")).toContain(successfulOutput);
+      expect(buildLogs.join("\n")).toContain("fixture: Process exited with code 1");
 
-    // Run the produced image. Its ENTRYPOINT is the COPY'd script; the marker on
-    // stdout proves the script is actually baked in, i.e. the prefix resolved and
-    // the file was inside the build context — not merely that `docker build` exited 0.
-    const { stdout } = await execFileAsync("docker", ["run", "--rm", builtRef!], { env: dockerEnv });
-    expect(stdout).toContain(MARKER);
-  }, 300_000);
+      // Run the produced image. Its ENTRYPOINT is the COPY'd script; the marker on
+      // stdout proves the script is actually baked in, i.e. the prefix resolved and
+      // the file was inside the build context — not merely that `docker build` exited 0.
+      const { stdout } = await execFileAsync("docker", ["run", "--rm", builtRef!], {
+        env: dockerEnv,
+      });
+      expect(stdout).toContain(MARKER);
+    },
+    300_000,
+  );
 });

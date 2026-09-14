@@ -36,7 +36,7 @@ import { repos, type Project, type Service } from "@repo/db";
 import type { RequestContext } from "../../lib/request-context";
 import { assertResourceInOrg } from "../../lib/controller-helpers";
 import { encrypt, decrypt } from "../../lib/encryption";
-import type { ProjectDomainRow } from "../../lib/public-endpoints";
+import { comparePublicRouteRows, type ProjectDomainRow } from "../../lib/public-endpoints";
 import { isLoopbackHost, resolveProjectServerHost } from "../../lib/server-target";
 
 const ENVIRONMENT = "production";
@@ -258,12 +258,6 @@ function rowTargetPort(row: ProjectDomainRow): number | undefined {
     : undefined;
 }
 
-/** Primary row first, then stable by hostname — the primary route owns its port. */
-function byPrimaryThenHostname(left: ProjectDomainRow, right: ProjectDomainRow): number {
-  if (left.isPrimary !== right.isPrimary) return left.isPrimary ? -1 : 1;
-  return left.hostname.localeCompare(right.hostname);
-}
-
 /**
  * A service's PERSISTED route URLs, keyed by container port. Read from the
  * project's domain rows — a route exists because a human chose it and it was
@@ -295,7 +289,7 @@ function persistedServiceRouteUrls(
     urls.set(port, `https://${hostname}`);
   };
 
-  const ordered = [...domains].sort(byPrimaryThenHostname);
+  const ordered = [...domains].sort(comparePublicRouteRows);
   for (const row of ordered) {
     if (row.serviceId === service.id) add(row);
   }
@@ -365,10 +359,19 @@ export async function getAppConnectionView(
   const envByService = new Map<string, Record<string, string>>();
   for (const name of needed) {
     const svc = byName.get(name);
-    // Effective env, mirroring the deploy merge: the service's compose env map
-    // (JSONB, template literals like ME_CONFIG_BASICAUTH_USERNAME) as the base,
-    // overlaid by the env_vars table (generated secrets / config, decrypted).
-    // Reading only env_vars missed literals that never became env_var rows.
+    // The service's compose env map (JSONB, template literals like
+    // ME_CONFIG_BASICAUTH_USERNAME) as the base, overlaid by the env_vars table
+    // (generated secrets / config, decrypted). Reading only env_vars missed
+    // literals that never became env_var rows.
+    //
+    // This is NOT the full deploy merge: it omits the project-scoped layer
+    // entirely, so a key whose only real value is project-level resolves here to
+    // the row's inline value (possibly ""), while the container gets the project
+    // one (`inlineEmptyDefers` in deployments/compose/service-env-layers.ts).
+    // Adding that layer changes what every existing app connection resolves to,
+    // which is a deliberate call for its own change — not a side effect of the
+    // #614 deploy fix. Until then, treat a connection output as authoritative
+    // only for keys the app template or its generated rows own.
     const map: Record<string, string> = { ...((svc?.environment as Record<string, string>) ?? {}) };
     const rows = svc ? await repos.project.listEnvVars(projectId, ENVIRONMENT, svc.id) : [];
     for (const row of rows) {

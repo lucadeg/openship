@@ -30,6 +30,21 @@ describe("buildDomainFanoutRegistrations", () => {
     ]);
   });
 
+  it("preserves exact-match locations in the generated registration", () => {
+    const exact: ProjectCompositeRoute = {
+      ...onvo,
+      locations: [{ pathPrefix: "/mcp", serviceId: "svc-api", exact: true }],
+    };
+    const regs = buildDomainFanoutRegistrations({
+      routes: [exact],
+      resolveTargetUrl: (id) => upstreams[id],
+    });
+
+    expect(regs[0].proxyLocations).toEqual([
+      { pathPrefix: "/mcp", targetUrl: "http://10.0.0.2:1020", exact: true },
+    ]);
+  });
+
   it("skips the whole domain when the ROOT upstream can't resolve", () => {
     const regs = buildDomainFanoutRegistrations({
       routes: [onvo],

@@ -1,6 +1,7 @@
 {
   "available": true,
   "verified": false,
+  "minEngine": "0.6.6",
   "id": "redis",
   "name": "Valkey (Redis)",
   "description": "In-memory data store for caching, sessions, rate limits, and queues — Valkey, the open-source Redis fork. Drop-in Redis-compatible: point any redis client at it. Ships with RedisInsight, a browser UI that arrives already connected to this instance.",

@@ -27,6 +27,7 @@ import {
 } from "./docker-reconcile";
 import { scanProxyRoutes } from "./proxy-route-scan";
 import { findOwnStack } from "../../lib/startup/self-services";
+import { mapWithLimit } from "../../lib/map-with-limit";
 
 /** Openship project-id shape — used to reject crafted `openship.project` labels
  *  before they reach the remote snapshot probe (same shape migrate.service uses). */
@@ -47,26 +48,10 @@ const REACHABILITY_TIMEOUT_MS = 25_000;
 // reading compose files, scanning the proxy, image env lookups, project
 // recovery) as one unit — see the comment at its call site. Generous: a large
 // stack (hundreds of containers) legitimately needs more than a few seconds
-// at mapLimit's concurrency of 5, but this still guarantees the scan fails
+// at the limiter's concurrency of 5, but this still guarantees the scan fails
 // loudly well under a minute instead of hanging indefinitely.
 const DISCOVERY_TIMEOUT_MS = 90_000;
 
-async function mapLimit<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) || 1 }, async () => {
-    while (cursor < items.length) {
-      const idx = cursor++;
-      results[idx] = await fn(items[idx]);
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
 
 /**
  * Read + parse every compose file referenced by the discovered containers, in a
@@ -259,10 +244,10 @@ export async function discoverServerStack(
             : `Inspecting ${candidates.length} container(s)…`,
         );
         const [details, managedDetails] = await Promise.all([
-          mapLimit(candidates, 5, (c) => rt.inspectContainer(c.id)).then((d) =>
+          mapWithLimit(candidates, 5, (c) => rt.inspectContainer(c.id)).then((d) =>
             d.filter((x): x is DockerContainerDetail => x !== null),
           ),
-          mapLimit(managedApp, 5, (c) => rt.inspectContainer(c.id)).then((d) =>
+          mapWithLimit(managedApp, 5, (c) => rt.inspectContainer(c.id)).then((d) =>
             d.filter((x): x is DockerContainerDetail => x !== null),
           ),
         ]);
@@ -298,7 +283,7 @@ export async function discoverServerStack(
         const uniqueImages = [
           ...new Set([...details, ...managedDetails].map(imageRefKey).filter(Boolean)),
         ];
-        const imageInfoPairs = await mapLimit(uniqueImages, 4, async (ref) => {
+        const imageInfoPairs = await mapWithLimit(uniqueImages, 4, async (ref) => {
           const [env, cmd] = await Promise.all([rt.inspectImageEnv(ref), rt.inspectImageCmd(ref)]);
           return [ref, { env, cmd }] as const;
         });

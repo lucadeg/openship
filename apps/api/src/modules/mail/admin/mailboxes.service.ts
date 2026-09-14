@@ -32,7 +32,11 @@ import {
   STORAGE_NODE,
 } from "./maildir";
 import { recountDomain, validateDomain } from "./domains.service";
-import { buildInsertMailboxSql, buildInsertSelfForwardingSql } from "./platform-mailbox.service";
+import {
+  buildInsertMailboxSql,
+  buildInsertSelfForwardingSql,
+  PLATFORM_LOCAL_PART,
+} from "./platform-mailbox.service";
 import { safeErrorMessage } from "@repo/core";
 import { readState } from "../mail-state";
 
@@ -52,6 +56,8 @@ export interface MailboxRow {
   isGlobalAdmin: boolean;
   createdAt: string;
   passwordLastChange: string;
+  /** The primary install's Openship-owned SMTP identity. */
+  isPlatform: boolean;
 }
 
 const SELECT_COLUMNS = `
@@ -142,18 +148,57 @@ export async function listMailboxes(
   domain: string,
 ): Promise<MailboxRow[]> {
   validateDomain(domain);
-  return queryRows<MailboxRow>(
-    serverId,
-    `SELECT${SELECT_COLUMNS} FROM mailbox WHERE domain = ${q(domain.toLowerCase())} ORDER BY username`,
-  );
+  return sshManager.withExecutor(serverId, async (exec) => {
+    const rows = await queryRows<Omit<MailboxRow, "isPlatform">>(
+      exec,
+      `SELECT${SELECT_COLUMNS} FROM mailbox WHERE domain = ${q(domain.toLowerCase())} ORDER BY username`,
+    );
+    const state = await readState(exec);
+    return rows.map((row) => annotatePlatformMailbox(row, state?.domain));
+  });
 }
 
 export async function getMailbox(serverId: string, email: string): Promise<MailboxRow | null> {
   const username = normalizeEmail(email);
-  return queryOne<MailboxRow>(
-    serverId,
-    `SELECT${SELECT_COLUMNS} FROM mailbox WHERE username = ${q(username)}`,
-  );
+  return sshManager.withExecutor(serverId, async (exec) => {
+    const row = await queryOne<Omit<MailboxRow, "isPlatform">>(
+      exec,
+      `SELECT${SELECT_COLUMNS} FROM mailbox WHERE username = ${q(username)}`,
+    );
+    if (!row) return null;
+    const state = await readState(exec);
+    return annotatePlatformMailbox(row, state?.domain);
+  });
+}
+
+function annotatePlatformMailbox(
+  row: Omit<MailboxRow, "isPlatform">,
+  installDomain?: string,
+): MailboxRow {
+  const platformEmail = installDomain
+    ? `${PLATFORM_LOCAL_PART}@${installDomain.toLowerCase()}`
+    : null;
+  const normalized = row.username.toLowerCase();
+  // Fail closed when state is temporarily unreadable: `openship@…` is the
+  // reserved infrastructure identity, while ordinary user mailboxes remain
+  // manageable. Once state is available, only the primary install sender is
+  // protected so additional-domain cascade deletion keeps working.
+  const isPlatform = platformEmail
+    ? normalized === platformEmail
+    : normalized.startsWith(`${PLATFORM_LOCAL_PART}@`);
+  return { ...row, isPlatform };
+}
+
+export class PlatformMailboxProtectedError extends Error {
+  constructor(public username: string) {
+    super(
+      `The platform mailbox ${username} is managed by Openship. Use "Rotate platform mailbox password" to repair or rotate it.`,
+    );
+  }
+}
+
+function assertMailboxIsUserManaged(row: MailboxRow): void {
+  if (row.isPlatform) throw new PlatformMailboxProtectedError(row.username);
 }
 
 /**
@@ -183,6 +228,14 @@ export async function createMailbox(
   }
 
   await sshManager.withExecutor(serverId, async (exec) => {
+    const state = await readState(exec);
+    if (
+      input.localPart.toLowerCase() === PLATFORM_LOCAL_PART &&
+      (!state?.domain || username === `${PLATFORM_LOCAL_PART}@${state.domain.toLowerCase()}`)
+    ) {
+      throw new PlatformMailboxProtectedError(username);
+    }
+
     const hash = await hashPassword(exec, input.password);
     const layout = generateMaildir(input.domain.toLowerCase(), input.localPart);
 
@@ -238,6 +291,7 @@ export async function updateMailbox(
 
   const existing = await getMailbox(serverId, username);
   if (!existing) throw new MailboxNotFoundError(username);
+  assertMailboxIsUserManaged(existing);
 
   await sshManager.withExecutor(serverId, async (exec) => {
     const sets: string[] = ["modified = NOW()"];
@@ -300,6 +354,7 @@ export async function softDeleteMailbox(
   const username = normalizeEmail(email);
   const existing = await getMailbox(serverId, username);
   if (!existing) throw new MailboxNotFoundError(username);
+  assertMailboxIsUserManaged(existing);
 
   await sshManager.withExecutor(serverId, async (exec) => {
     await transaction(exec, [
@@ -330,6 +385,7 @@ export async function hardDeleteMailbox(serverId: string, email: string): Promis
   const username = normalizeEmail(email);
   const existing = await getMailbox(serverId, username);
   if (!existing) throw new MailboxNotFoundError(username);
+  assertMailboxIsUserManaged(existing);
 
   await sshManager.withExecutor(serverId, async (exec) => {
     // Only the install domain's postmaster is infrastructure. Additional

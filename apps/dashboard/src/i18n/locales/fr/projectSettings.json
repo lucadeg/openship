@@ -4,6 +4,70 @@
     "save": "Enregistrer",
     "cancel": "Annuler"
   },
+  "releaseImageSource": {
+    "validationInvalid": "La source de l'image de version est incorrecte.",
+    "toast": {
+      "saved": "La source de version du conteneur a été enregistrée.",
+      "saveFailed": "Impossible d'enregistrer la source de version du conteneur."
+    },
+    "status": {
+      "notDeployed": "Pas encore déployée",
+      "checking": "Vérification…",
+      "unavailable": "Indisponible"
+    },
+    "switchToImage": {
+      "title": "Passer à une source d'image préconstruite",
+      "description": "L'enregistrement remplace la source Git ou locale actuelle dans tous les environnements. Les déploiements existants et l'historique de restauration restent disponibles.",
+      "keep": "Conserver la source actuelle"
+    },
+    "switchToGit": {
+      "title": "Passer à une source Git",
+      "description": "Rien ne change tant qu'aucun dépôt n'est lié. La liaison remplace la source d'image suivie dans tous les environnements.",
+      "back": "Revenir à la source d'image"
+    },
+    "entry": {
+      "shortButton": "Utiliser une image préconstruite",
+      "button": "Suivre une image de conteneur préconstruite",
+      "description": "Déployez directement une image de registre versionnée, sans cloner ni construire de dépôt."
+    },
+    "summary": {
+      "title": "Image de conteneur suivie",
+      "badge": "Préconstruite",
+      "description": "Déploie directement une image publiée. Aucun dépôt n'est cloné et aucune commande de construction n'est exécutée.",
+      "linkGit": "Lier un dépôt Git",
+      "image": "Image",
+      "versionSource": "Source de la version",
+      "githubReleases": "Versions GitHub",
+      "pinnedVersion": "Version épinglée",
+      "currentVersion": "Version actuelle",
+      "targetVersion": "Version cible",
+      "latestVersion": "Dernière version",
+      "updateAvailable": "Mise à jour disponible"
+    },
+    "editor": {
+      "trackingTitle": "Suivi des versions",
+      "configureTitle": "Configurer l'image préconstruite",
+      "templateHint": "Utilisez {tag} pour conserver le tag exact de l'éditeur, ou {version} pour la version normalisée.",
+      "provider": "Fournisseur de version",
+      "githubTitle": "Versions GitHub",
+      "githubDescription": "Suivre le dernier tag de version publié.",
+      "urlTitle": "URL de version ou version épinglée",
+      "urlDescription": "Lire un point de terminaison de version ou déployer une version fixe.",
+      "imageTemplate": "Modèle d'image",
+      "imagePlaceholder": "ghcr.io/acme/api:{tag}",
+      "githubRepository": "Dépôt GitHub",
+      "repoPlaceholder": "owner/repository",
+      "versionUrl": "URL de version",
+      "versionUrlPlaceholder": "https://example.com/latest-version",
+      "versionUrlHint": "Point de terminaison HTTPS renvoyant du texte ou du JSON avec version/tag_name.",
+      "pinnedVersion": "Version épinglée",
+      "pinnedPlaceholder": "Facultatif, par ex. v2.4.1",
+      "pinnedHint": "Remplace la dernière version détectée ; laissez vide pour suivre les mises à jour.",
+      "appliesAll": "Les modifications s'appliquent à tous les environnements de ce projet.",
+      "saving": "Enregistrement…",
+      "save": "Enregistrer la source"
+    }
+  },
   "appSettings": {
     "modeApp": "Paramètres de l'application",
     "modeDeployment": "Déploiement",
@@ -108,12 +172,15 @@
       "runningStatus": "En cours — {status}"
     },
     "cache": {
-      "title": "Cache",
-      "description": "Videz les artefacts de build et les installations de dépendances mis en cache",
+      "title": "Cache de build Docker",
+      "description": "Le cache de build inutilisé est automatiquement limité à 5 Go par serveur",
       "clearInstall": "Vider le cache d'installation",
       "clearInstallDesc": "Supprimer les node_modules mis en cache",
       "clearBuild": "Vider le cache de build",
-      "clearBuildDesc": "Supprimer la sortie de build mise en cache"
+      "clearBuildDesc": "Supprimer le cache inutilisé du serveur Docker de ce projet",
+      "clearBuildConfirm": "Vider tout le cache de build Docker inutilisé sur ce serveur ? D'autres projets devront peut-être reconstruire leurs dépendances au prochain déploiement.",
+      "clearBuildSuccess": "{size} de cache de build récupérés",
+      "clearBuildEmpty": "Aucun cache de build inutilisé à vider"
     },
     "transfer": {
       "title": "Transfert et clonage",
@@ -344,28 +411,7 @@
     "unlink": "Supprimer la connexion"
   },
   "gitInfo": {
-    "repository": "Dépôt",
-    "autoDeploy": "Déploiement automatique",
-    "deploysOnPush": "Déploie à chaque push",
-    "manualOnly": "Déploiements manuels uniquement",
-    "branchToDeploy": "Branche à déployer",
-    "chooseBranch": "Choisissez la branche de votre dépôt à déployer",
-    "save": "Enregistrer",
-    "cancel": "Annuler",
-    "viewOnGithub": "Voir sur GitHub",
-    "recentCommits": "Commits récents",
-    "totalCommits": "{count} au total",
-    "noCommits": "Aucun commit pour le moment",
-    "toast": {
-      "fetchBranchesFailed": "Échec de la récupération des branches",
-      "errorTitle": "Erreur",
-      "branchUpdated": "Branche mise à jour avec succès",
-      "updatedTitle": "Mis à jour",
-      "branchUpdateFailed": "Échec de la mise à jour de la branche",
-      "autoDeployEnabled": "Déploiement automatique activé",
-      "autoDeployDisabled": "Déploiement automatique désactivé",
-      "autoDeployFailed": "Échec de la mise à jour du déploiement automatique"
-    }
+    "autoDeploy": "Déploiement automatique"
   },
   "git": {
     "connectFirst": {
@@ -515,6 +561,9 @@
     "title": "Puissance de la machine",
     "description": "Limites de CPU et de mémoire pour les conteneurs de ce projet.",
     "loading": "Lecture de la machine cible…",
+    "unavailable": "Puissance de la machine indisponible",
+    "loadFailed": "Impossible de charger la puissance de la machine",
+    "retry": "Réessayer",
     "machineCapacity": "Machine : {cpu} vCPU · {memory}",
     "exceedsMachine": "Dépasse cette machine",
     "appliesOnNextDeploy": "Les limites s'appliquent à la recréation du conteneur — redéployez pour qu'un changement prenne effet.",
@@ -597,10 +646,6 @@
     "cannotUndo": "Cette action est irréversible.",
     "aboutToPrefix": "Vous êtes sur le point de supprimer ",
     "aboutToSuffix": ".",
-    "deleteAllAria": "Supprimer tous les environnements",
-    "deleteAll": "Supprimer tous les environnements",
-    "deleteAllOn": "Supprime l'application du projet et tous les environnements de branche sous celle-ci.",
-    "deleteAllOff": "Supprime uniquement cet environnement. Les autres branches restent.",
     "scanning": "Analyse des services et volumes attachés…",
     "wipeAria": "Effacer également les données des services",
     "wipeLabelOne": "Effacer également les données des services ({count} volume)",
@@ -615,9 +660,7 @@
     "typePrefix": "Saisissez ",
     "typeSuffix": " pour confirmer.",
     "cancel": "Annuler",
-    "confirmDeleteWipe": "Supprimer + effacer les données",
     "confirmDeleteEnvWipe": "Supprimer l'environnement + effacer les données",
-    "confirmDelete": "Supprimer le projet",
     "confirmDeleteEnv": "Supprimer l'environnement",
     "linkedTitleOne": "{count} projet est connecté à cette app",
     "linkedTitleOther": "{count} projets sont connectés à cette app",
@@ -705,6 +748,9 @@
       "servesPathRedeploy": "Les nouveaux chemins prennent effet au prochain déploiement.",
       "externalIngress": "Ingress et TLS externes",
       "externalIngressDesc": "Le TLS se termine en amont (Cloudflare Tunnel, équilibreur de charge). Vérification par TXT uniquement — le domaine n'a pas besoin de pointer vers ce serveur, et nous n'émettrons pas de certificat.",
+      "dnsChallenge": "Utiliser le défi DNS-01",
+      "dnsChallengeDesc": "Émettez et renouvelez le certificat via votre fournisseur DNS connecté. Utilisez cette option si le port 80 est inaccessible.",
+      "dnsChallengeWildcardDesc": "Les certificats génériques nécessitent DNS-01 et un fournisseur DNS connecté.",
       "noWww": "Saisissez le domaine sans « www. » — activez « Inclure www » ci-dessous pour l'ajouter."
     },
     "dns": {
@@ -822,7 +868,9 @@
       "bodyService": "Service « {service} » : aucune réponse sur le port {port} — les requêtes peuvent renvoyer une erreur 502 tant qu'il n'écoute pas dessus."
     },
     "outputHint": {
-      "body": "Aucune sortie de compilation trouvée à {path} — vérifiez votre répertoire de sortie et redéployez."
+      "body": "Aucune sortie de compilation trouvée à {path} — vérifiez votre répertoire de sortie et redéployez.",
+      "noIndex": "Une sortie existe à {path} mais il n'y a aucun fichier index — les requêtes renverront une erreur 404. Vérifiez votre répertoire de sortie.",
+      "notServed": "Le proxy a répondu HTTP {status} pour {path} — ce chemin n'est pas servi. Vérifiez votre répertoire de sortie et la route."
     },
     "certUpload": {
       "title": "Importer un certificat",

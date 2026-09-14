@@ -86,6 +86,9 @@ describeDockerE2E("build → redeploy → restore without rebuilding", () => {
       // this from the same table detection uses keeps the fixture in step with
       // the stack definitions instead of pinning a tag by hand.
       buildImage: getBuildImage("node", "npm"),
+      // Match importLocal(): without this the schema's historical "github"
+      // default classifies the fixture as clone-backed and discards localPath.
+      gitProvider: "local",
       localPath: sourceDir,
       installCommand: "",
       buildCommand: "",

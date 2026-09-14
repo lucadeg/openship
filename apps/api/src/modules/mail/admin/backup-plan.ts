@@ -18,6 +18,7 @@
  */
 
 import { HOST_STATE_DIR } from "@repo/adapters";
+import { safePipelineFragment } from "@repo/adapters";
 import {
   HOST_AMAVIS_CONF_CANDIDATES,
   mailDaemonReloadCommand,
@@ -133,11 +134,21 @@ export function buildMailBackupPayload(
     // `sudo -n` for the same reason the staging above uses it, and it is not optional
     // here: `cp -a` as root stages root-owned 0600 files, so an unprivileged tar could not
     // read back what was just collected. /var/vmail is vmail:vmail 0700 and was already in
-    // that position — and tar's exit status is masked by `zstd`'s in this pipeline, so on a
-    // non-root login the maildirs were being dropped from the artifact just as quietly.
-    flags.messageData
-      ? 'sudo -n tar -c -C "$tmp" . -C /var/vmail vmail1 | zstd -c -3'
-      : 'sudo -n tar -c -C "$tmp" . | zstd -c -3',
+    // that position.
+    //
+    // The pipeline goes through the SHARED fragment so tar's status is no longer masked by
+    // zstd's. The comment here used to describe that masking — "on a non-root login the
+    // maildirs were being dropped from the artifact just as quietly" — and leave it in
+    // place; this was the last pipeline in the module still carrying it. The fragment form
+    // exists because this is one line of a `set -e` script rather than a standalone
+    // `sh -c`, and it captures each status via `if` for exactly that reason.
+    safePipelineFragment(
+      flags.messageData
+        ? 'sudo -n tar -c -C "$tmp" . -C /var/vmail vmail1'
+        : 'sudo -n tar -c -C "$tmp" .',
+      "zstd -c -3",
+      { left: "tar (staging the mail archive)", right: "the compressor 'zstd'" },
+    ),
   ]
     .filter(Boolean)
     .join("\n");
@@ -146,8 +157,14 @@ export function buildMailBackupPayload(
     "set -e",
     'tmp="$(mktemp -d)"',
     "trap 'rm -rf \"$tmp\"' EXIT",
-    // stdin = the tar.zst artifact.
-    'zstd -d | tar -x -C "$tmp"',
+    // stdin = the tar.zst artifact. Shared fragment again: a `zstd -d` that fails (a
+    // truncated artifact, a missing binary) must not hide behind tar's status, because the
+    // lines after this one TRUNCATE the account tables and then load from "$tmp" — so a
+    // silently-empty extract would wipe the mail database and restore nothing.
+    safePipelineFragment("zstd -d", 'tar -x -C "$tmp"', {
+      left: "the decompressor 'zstd -d'",
+      right: "tar (extracting the mail archive)",
+    }),
     // Data-only restore: wipe the target's account tables, then load.
     `printf '%s' 'TRUNCATE ${truncateList} CASCADE;' | ${mailPsqlFromStdin(flavor)}`,
     `${mailPsqlFromStdin(flavor)} < "$tmp/vmail.data.sql"`,

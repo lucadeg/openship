@@ -18,13 +18,14 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 
 import {
   LocalExecutor,
@@ -69,6 +70,44 @@ const EDGE_SITES_HOST_DIR = `${EDGE_HOST_STATE_DIR}/sites-enabled`;
 const EDGE_ACME_HOST_DIR = `${EDGE_HOST_STATE_DIR}/acme`;
 
 /**
+ * Physical bind source for the local Docker daemon.
+ *
+ * Docker Desktop and OrbStack need macOS's physical `/private/var` and
+ * `/private/etc` paths; handing the daemon their `/var` and `/etc` symlink aliases
+ * can mount empty VM directories instead (#692). Resolve as deeply as the local
+ * filesystem allows so a first install still works before the leaf exists.
+ * Linux deliberately keeps the stable logical paths used by existing installs.
+ */
+export function canonicalComposeHostPath(
+  target: string,
+  platform: NodeJS.Platform = process.platform,
+  resolvePath: (path: string) => string = realpathSync,
+): string {
+  if (platform !== "darwin") return target;
+  try {
+    return resolvePath(target);
+  } catch {
+    let parent = target;
+    while (parent !== dirname(parent)) {
+      parent = dirname(parent);
+      try {
+        return join(resolvePath(parent), relative(parent, target));
+      } catch {
+        // Keep walking to the closest existing ancestor.
+      }
+    }
+    throw new Error(`Could not resolve edge bind-mount source ${target} on this Mac.`);
+  }
+}
+
+function composeEdgeMounts(): ReadonlyArray<{ host: string; container: string }> {
+  return EDGE_CONTAINER_MOUNTS.map((mount) => ({
+    ...mount,
+    host: canonicalComposeHostPath(mount.host),
+  }));
+}
+
+/**
  * The edge's bind mounts as compose YAML lines.
  *
  * Generated from `EDGE_CONTAINER_MOUNTS` — the same array `buildEdgeRunCommand`
@@ -80,7 +119,7 @@ const EDGE_ACME_HOST_DIR = `${EDGE_HOST_STATE_DIR}/acme`;
  * `:z` relabels for SELinux-enforcing hosts; a no-op elsewhere.
  */
 function edgeVolumeYaml(indent: string): string {
-  return EDGE_CONTAINER_MOUNTS.map((m) => `${indent}- ${m.host}:${m.container}:z`).join("\n");
+  return composeEdgeMounts().map((m) => `${indent}- ${m.host}:${m.container}:z`).join("\n");
 }
 
 /** Marker the API service's volume list carries until {@link renderComposeYaml} fills it. */
@@ -413,6 +452,9 @@ export interface ComposeUpOpts {
   hostSshHost?: string;
   /** Port the host's sshd listens on, if it isn't 22. */
   hostSshPort?: string;
+  /** Pin the host account the channel logs in as, instead of letting provisioning settle
+   *  on one (see chooseHostChannelUser). A pin never falls back. */
+  hostSshUser?: string;
   apiPort?: string;
   dashboardPort?: string;
   publicUrl?: string;
@@ -871,6 +913,33 @@ export type HostChannelTarget = {
    * of repeating a root warning that no longer applies to the sudo case.
    */
   elevation: "login" | "sudo" | "none";
+  /** Accounts provisioning would fall through to if this one's dial is refused. Only the
+   *  dry-run preview sets this — a real run has already settled (see previewHostChannel). */
+  fallbacks?: readonly string[];
+};
+
+/**
+ * One account provisioning may settle on, in the order it will try them.
+ *
+ * A LIST rather than a single choice because `authorized_keys` is a file we write and not
+ * a verdict sshd gives: the only thing that can establish whether an account works is
+ * dialing it (verifyChannelAuth). #527 is what a single choice costs — a box with
+ * `PermitRootLogin no` got the root arm, the key landed in a file sshd would never
+ * consult for a login it refuses outright, and there was no second thing to try.
+ */
+export type HostChannelCandidate = {
+  user: string;
+  authKeysPath: string;
+  /** PREDICTED elevation. The dial measures the truth and may downgrade it to `none`
+   *  (see provisionHostSshChannel) — this is what we expect before asking. */
+  elevation: "login" | "sudo" | "none";
+  /**
+   * Why this account is in the list. Load-bearing for two reasons: `pin` must never fall
+   * through to another account (the operator named one), and the settle line names the
+   * source so an auto-migration says what it did rather than silently changing which
+   * credential exists on the box.
+   */
+  source: "pin" | "carried" | "root" | "sudo-user" | "invoker";
 };
 
 const ROOT_AUTHORIZED_KEYS = "/root/.ssh/authorized_keys";
@@ -903,12 +972,28 @@ const ROOT_AUTHORIZED_KEYS = "/root/.ssh/authorized_keys";
  * `scratchDir()` exists beside `stateDir()` in adapters.
  *
  * An operator who WANTS a root channel runs the installer as root — `sudo openship up`
- * makes the invoker uid 0 and takes the first arm. That is deliberately the only way to
- * end up with a standing root credential: this function will not mint one for an account
- * it is not logging in as. It is also the escape hatch for a box provisioned as root by an
- * older CLI, because a re-run as a non-root sudo user MIGRATES that install to an invoker
- * channel (and revokes the old root line). Nothing has to move for that: the on-box state
- * under /root/.openship is reached through `privilegedExecutor`, which elevates.
+ * makes the invoker uid 0, and root is therefore the FIRST candidate on that arm. That is
+ * deliberately the only way to end up with a standing root credential: this function will
+ * not mint one for an account it is not logging in as.
+ *
+ * Why the root arm returns a SECOND candidate (#527): a root login is a request sshd is
+ * free to refuse, and `PermitRootLogin no` is an ordinary hardening choice. Before this,
+ * the root arm was terminal — the key went into `/root/.ssh/authorized_keys`, sshd refused
+ * every dial, and `.env` was written pointing at the refusal. When the run was `sudo`'d we
+ * already know an account that CAN log in (the operator just used it), so `$SUDO_USER`
+ * follows root as the fallback. It is only ever reached when root's dial actually fails,
+ * so a working root install is never migrated out from under an operator who asked for it.
+ *
+ * Nothing has to move for that migration: the on-box state under /root/.openship is
+ * reached through `privilegedExecutor`, which elevates.
+ *
+ * `carried` is promoted to the front when it names a candidate we already have, purely to
+ * avoid re-authorizing (and then revoking) a file the previous run already settled away
+ * from. It cannot introduce an account of its own — an account we would have to elevate
+ * to write to is one we are not logging in as, which is the thing de-rooting removed.
+ *
+ * PURE: every account it can name is resolved by the caller (`plannedHostChannel`), so the
+ * decision is testable without a passwd database or a live sshd.
  *
  * Exported for tests: this decision is the whole fix, so it's verified directly.
  */
@@ -917,47 +1002,125 @@ export function chooseHostChannelUser(input: {
   invokerName: string;
   invokerHome: string;
   hasPasswordlessSudo: boolean;
-}): Omit<HostChannelTarget, "keyPath"> {
+  /** `--host-ssh-user` (or the pin it left in `.env`): one candidate, no fallback. */
+  pinned?: { user: string; home: string } | null;
+  /** `$SUDO_USER` resolved through the passwd database — NOT `$HOME`, which sudo has
+   *  already rewritten to root's. Null when this isn't a sudo'd run. */
+  sudoUser?: { user: string; home: string } | null;
+  /** The account the previous run settled on, from `.env`. */
+  carried?: string | null;
+}): HostChannelCandidate[] {
+  const keysFor = (home: string) => join(home, ".ssh", "authorized_keys");
+  // An operator who names an account has overridden the decision, not seeded it: falling
+  // back past a pin would hand them a channel on an account they deliberately excluded.
+  if (input.pinned) {
+    return [
+      {
+        user: input.pinned.user,
+        authKeysPath:
+          input.pinned.user === "root" ? ROOT_AUTHORIZED_KEYS : keysFor(input.pinned.home),
+        // Unknowable for an arbitrary account; the dial measures it (see provisionHostSshChannel).
+        elevation: input.pinned.user === "root" ? "login" : "sudo",
+        source: "pin",
+      },
+    ];
+  }
+
+  const candidates: HostChannelCandidate[] = [];
   if (input.invokerUid === 0) {
-    return {
+    candidates.push({
       user: "root",
       authKeysPath: ROOT_AUTHORIZED_KEYS,
-      rootUnavailable: false,
       elevation: "login",
-    };
+      source: "root",
+    });
+    // Only when sudo named a real, non-root account. A genuine root login (`ssh root@box`)
+    // sets no SUDO_USER, and there is then no second account we could authorize without
+    // becoming the thing de-rooting removed — so that box legitimately has one candidate.
+    if (input.sudoUser && input.sudoUser.user !== "root") {
+      candidates.push({
+        user: input.sudoUser.user,
+        authKeysPath: keysFor(input.sudoUser.home),
+        elevation: "sudo",
+        source: "sudo-user",
+      });
+    }
+  } else {
+    candidates.push({
+      user: input.invokerName,
+      authKeysPath: keysFor(input.invokerHome),
+      // Reaches root through sudo at run time, so this is NOT `rootUnavailable` — the
+      // caller must not warn that mail and edge will fail, because they won't.
+      elevation: input.hasPasswordlessSudo ? "sudo" : "none",
+      source: "invoker",
+    });
   }
-  const invoker = {
-    user: input.invokerName,
-    authKeysPath: join(input.invokerHome, ".ssh", "authorized_keys"),
-  };
-  if (input.hasPasswordlessSudo) {
-    // Reaches root through sudo at run time, so this is NOT `rootUnavailable` — the
-    // caller must not warn that mail and edge will fail, because they won't.
-    return { ...invoker, rootUnavailable: false, elevation: "sudo" };
-  }
-  return { ...invoker, rootUnavailable: true, elevation: "none" };
+
+  const carried = input.carried?.trim();
+  if (!carried) return candidates;
+  const already = candidates.findIndex((c) => c.user === carried);
+  if (already <= 0) return candidates;
+  const [promoted] = candidates.splice(already, 1);
+  return [{ ...promoted, source: "carried" }, ...candidates];
 }
 
 /**
- * Read-only probe: does `sudo` run WITHOUT prompting for a password? `sudo -n` never
- * prompts — it exits non-zero instead — so this changes nothing on the host.
+ * Read-only probe: does `sudo` run without prompting for a password?
+ *
+ * `-n` never prompts — it exits non-zero instead — so this changes nothing on the host.
+ * `-k` is what makes the answer mean anything: without it, sudo accepts a cached timestamp
+ * ticket from the operator's terminal, so a box with NO passwordless rule at all answered
+ * yes for the lifetime of that ticket. The api container then elevates from a fresh,
+ * tty-less ssh session that has no ticket and never will, so the probe was answering a
+ * different question from the one the caller asks. `-k` invalidates the ticket for this
+ * one invocation only (it does not clear the operator's cached credentials).
+ *
+ * A `true` here is still only a prediction — `provisionHostSshChannel` measures elevation
+ * over the channel it actually dials, which is the session shape the api will use.
  */
 function hasPasswordlessSudo(): boolean {
   try {
-    return spawnSync("sudo", ["-n", "true"], { stdio: "ignore" }).status === 0;
+    return spawnSync("sudo", ["-n", "-k", "true"], { stdio: "ignore" }).status === 0;
   } catch {
     return false;
   }
 }
 
 /**
- * The container→host SSH channel a run WOULD use — resolved identically for the dry-run
- * preview and the real provisioner, so a preview can't describe a channel the install
- * wouldn't provision (or miss one it would). Null when there won't be one
+ * `$SUDO_USER`, resolved through the passwd database into an account + home.
+ *
+ * `$HOME` is deliberately not consulted: sudo has already rewritten it to root's, so
+ * trusting it would authorize the key into `/root/.ssh/authorized_keys` while telling the
+ * container to log in as someone else — the exact drift `plannedHostChannel` uses
+ * `userInfo()` to avoid on the other arm.
+ */
+function sudoInvoker(): { user: string; home: string } | null {
+  const user = process.env.SUDO_USER?.trim();
+  if (!user || user === "root") return null;
+  const home = passwdHome(user);
+  return home ? { user, home } : null;
+}
+
+/** What the account decision needs off the resolved env config (see resolveEnvConfig). */
+type HostChannelPlanCfg = {
+  hostControl: boolean;
+  /** `--host-ssh-user`, or the pin a previous run of it left in `.env`. */
+  hostSshUser?: string;
+  /** The account the previous run SETTLED on (`.env` OPENSHIP_HOST_SSH_USER) — continuity,
+   *  not a pin: it is tried first and falls through like any other candidate. */
+  hostSshUserCarried?: string;
+};
+
+/**
+ * The container→host SSH channel accounts a run WOULD try, in order — resolved identically
+ * for the dry-run preview and the real provisioner, so a preview can't describe a channel
+ * the install wouldn't provision (or miss one it would). Null when there won't be one
  * (`--no-host-control`, or a non-Linux box: host.docker.internal SSH is the Linux path).
  */
-function plannedHostChannel(hostControl: boolean): HostChannelTarget | null {
-  if (!hostControl || process.platform !== "linux") return null;
+function plannedHostChannel(
+  cfg: HostChannelPlanCfg,
+): { candidates: HostChannelCandidate[]; keyPath: string } | null {
+  if (!cfg.hostControl || process.platform !== "linux") return null;
   // `userInfo()` rather than $USER: os.homedir() and $USER can disagree under sudo
   // (HOME=/root with USER preserved, or vice versa), which would write the key into
   // one account's authorized_keys while telling the container to log in as another.
@@ -969,14 +1132,56 @@ function plannedHostChannel(hostControl: boolean): HostChannelTarget | null {
   } catch {
     invoker = { uid: -1, username: process.env.USER || process.env.LOGNAME || "root", home: homedir() };
   }
-  const decision = chooseHostChannelUser({
+  const pin = cfg.hostSshUser?.trim();
+  const candidates = chooseHostChannelUser({
     invokerUid: invoker.uid,
     invokerName: invoker.username,
     invokerHome: invoker.home,
     // Only probe sudo when it could change the outcome — a root invoker never needs it.
     hasPasswordlessSudo: invoker.uid !== 0 && hasPasswordlessSudo(),
+    // A pinned account is dialed, never written to on our guess about its home: root's
+    // file is fixed, and any other account's comes from the passwd database.
+    pinned: pin ? { user: pin, home: passwdHome(pin) ?? join("/home", pin) } : null,
+    sudoUser: invoker.uid === 0 ? sudoInvoker() : null,
+    carried: cfg.hostSshUserCarried ?? null,
   });
-  return { ...decision, keyPath: join(COMPOSE_DIR, "host-ssh", "id_ed25519") };
+  return { candidates, keyPath: join(COMPOSE_DIR, "host-ssh", "id_ed25519") };
+}
+
+/** An account's home from the passwd database, or null when it has none/doesn't exist. */
+function passwdHome(user: string): string | null {
+  try {
+    const r = spawnSync("getent", ["passwd", user], { encoding: "utf8" });
+    if (r.status !== 0) return null;
+    return (r.stdout ?? "").split("\n")[0]?.split(":")[5]?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The channel the dry-run preview describes: the first account provisioning will TRY,
+ * plus the accounts it would fall through to.
+ *
+ * A preview must not dial — a dial means authorizing a key, which is the write the preview
+ * exists to describe rather than perform — so it can only ever name the first candidate.
+ * `fallbacks` is how it stays honest about that: the run may settle elsewhere, and an
+ * operator reading a plan that promised one account and got another would rightly read it
+ * as the plan being wrong.
+ */
+function previewHostChannel(cfg: HostChannelPlanCfg): HostChannelTarget | null {
+  const plan = plannedHostChannel(cfg);
+  if (!plan) return null;
+  const [first, ...rest] = plan.candidates;
+  if (!first) return null;
+  return {
+    user: first.user,
+    keyPath: plan.keyPath,
+    authKeysPath: first.authKeysPath,
+    rootUnavailable: first.elevation === "none",
+    elevation: first.elevation,
+    fallbacks: rest.map((c) => c.user),
+  };
 }
 
 /**
@@ -1061,17 +1266,30 @@ function retireHostSshChannel(prev: Record<string, string>): void {
   if (!existsSync(keyDir) && !prev.OPENSHIP_HOST_SSH_HOST) return;
 
   const invokerKeys = join(homedir(), ".ssh", "authorized_keys");
-  // Which file holds the line is what the channel logged in AS — root unless it fell
-  // back to the invoker (#489). A pre-#489 install wrote the invoker's file either way,
-  // so that one is always swept too.
-  const asRoot = hostChannelAccount(prev) === HOST_CHANNEL_DEFAULT_ACCOUNT;
+  // Which file holds the line is what the channel logged in AS — root unless provisioning
+  // settled on another account. A pre-#489 install wrote the invoker's file either way, so
+  // that one is always swept too.
+  const account = hostChannelAccount(prev);
+  const asRoot = account === HOST_CHANNEL_DEFAULT_ACCOUNT;
+  // Resolved from the ACCOUNT NAME, not from `homedir()`. Since provisioning can settle on
+  // `$SUDO_USER`, the settled account and the invoker are no longer the same thing on a
+  // sudo'd run — and `homedir()` there is root's, so inferring the path from it would
+  // "revoke" a file that never held the line and silently leave the real grant live.
+  const accountKeys = asRoot
+    ? ROOT_AUTHORIZED_KEYS
+    : (() => {
+        const home = passwdHome(account);
+        return home ? join(home, ".ssh", "authorized_keys") : invokerKeys;
+      })();
   const weAreRoot = typeof process.getuid === "function" && process.getuid() === 0;
   const revoked = asRoot
     ? weAreRoot
       ? revokeKeyAt(ROOT_AUTHORIZED_KEYS)
       : hasPasswordlessSudo() && revokeRootKeyViaSudo()
-    : revokeKeyAt(invokerKeys);
-  const alsoInvoker = asRoot ? revokeKeyAt(invokerKeys) : true;
+    : revokeKeyAt(accountKeys);
+  // The invoker's own file on top, whenever it isn't the one already handled: a pre-#489
+  // install put the line there, and so did a run whose settled account has since changed.
+  const alsoInvoker = accountKeys === invokerKeys ? true : revokeKeyAt(invokerKeys);
 
   try {
     rmSync(keyDir, { recursive: true, force: true });
@@ -1079,7 +1297,7 @@ function retireHostSshChannel(prev: Record<string, string>): void {
     /* the key is unusable the moment the channel is off; a leftover file is not a grant */
   }
 
-  const stuck = asRoot ? ROOT_AUTHORIZED_KEYS : invokerKeys;
+  const stuck = accountKeys;
   // Names the `.env` half too: dropping OPENSHIP_HOST_SSH_* is the ONE case where those
   // keys legitimately disappear (a provisioning failure now carries them forward instead
   // — see carriedHostChannel), so the withdrawal has to be the thing that says so.
@@ -1119,7 +1337,25 @@ type HostChannelIssueCode =
    * so the operator was told host control was on and found out weeks later, through an
    * unrelated operation, in wording that blamed their own credentials.
    */
-  | "auth-refused";
+  | "auth-refused"
+  /**
+   * sshd is listening on this host, but nothing accepted a connection at the address the
+   * verification dial used — a `ListenAddress` that excludes loopback, or a local firewall.
+   *
+   * Its own code because the remedy is a different file from `auth-refused`'s: every
+   * non-zero `ssh` exit used to be reported as a refused KEY, which sent operators to
+   * `authorized_keys` on a host that had never read it.
+   */
+  | "unreachable"
+  /**
+   * The key was ACCEPTED and the session was then closed without running anything — sshd's
+   * `forced-commands-only`, whose whole point is that our line carries no `command=`.
+   *
+   * Distinct from `auth-refused` because "the host refused the key" is factually wrong
+   * here, and because it never prints `Permission denied`, so the two cannot be told apart
+   * by matching ssh's message.
+   */
+  | "forced-command";
 
 export interface HostChannelIssue {
   code: HostChannelIssueCode;
@@ -1129,6 +1365,15 @@ export interface HostChannelIssue {
    *  badly: "the key was refused" is unactionable until you know WHICH account to go and
    *  authorize it for (root via sudo, or the invoking user — see chooseHostChannelUser). */
   account?: string;
+  /** Every account this run dialed, in order, when more than one was tried. An operator
+   *  told only about the last one would reasonably ask why we didn't try the obvious other
+   *  account — and on a sudo'd run we did. */
+  tried?: readonly string[];
+  /** What `sshd -T` says about root logins, when it could be read. Advisory ONLY: it
+   *  reports the GLOBAL config, so a `Match Address` block scoped to the docker bridge can
+   *  make it disagree with the dial — which is why it explains a refusal and never causes
+   *  one. See permitRootLoginSetting. */
+  permitRootLogin?: string;
 }
 
 interface HostChannelProvision {
@@ -1164,29 +1409,13 @@ interface HostChannelProvision {
  * socket can't do. sshd is the one prerequisite provisioning cannot create for itself; it
  * is reported, never installed.
  */
-function provisionHostSshChannel(cfg: {
-  hostControl: boolean;
-  hostSshPort: string;
-}): HostChannelProvision {
-  const target = plannedHostChannel(cfg.hostControl);
-  if (!target) return { channel: null };
-  const { user, keyPath, authKeysPath, elevation, rootUnavailable } = target;
-  const provisioned = (channel: { user: string; keyPath: string }): HostChannelProvision => {
-    // The key is authorized and `.env` is about to point the api at the host, but a key
-    // is not a server: `ssh-keygen` is the openssh CLIENT and `authorized_keys` is just a
-    // file, so every step above succeeds on a box with no sshd at all.
-    const port = toPort(cfg.hostSshPort) ?? HOST_CHANNEL_DEFAULT_PORT;
-    if (probeHostSshd(port) === "absent") {
-      return { channel, issue: { code: "no-sshd", detail: `port ${port}` } };
-    }
-    // And a LISTENER is not an accepted key. This is the check whose absence is #527:
-    // everything above can succeed while sshd still refuses the account, and the only
-    // thing that can settle it is asking sshd.
-    const auth = verifyChannelAuth(channel.user, channel.keyPath, port);
-    return auth.state === "refused"
-      ? { channel, issue: { code: "auth-refused", detail: auth.detail, account: channel.user } }
-      : { channel };
-  };
+function provisionHostSshChannel(
+  cfg: HostChannelPlanCfg & { hostSshPort: string },
+): HostChannelProvision {
+  const plan = plannedHostChannel(cfg);
+  if (!plan) return { channel: null };
+  const { candidates, keyPath } = plan;
+  const port = toPort(cfg.hostSshPort) ?? HOST_CHANNEL_DEFAULT_PORT;
   try {
     mkdirSync(join(COMPOSE_DIR, "host-ssh"), { recursive: true, mode: 0o700 });
     if (!existsSync(keyPath)) {
@@ -1202,38 +1431,207 @@ function provisionHostSshChannel(cfg: {
     const pub = readFileSync(`${keyPath}.pub`, "utf8").trim();
     if (!pub) return { channel: null, issue: { code: "empty-key" } };
 
-    if (rootUnavailable) {
-      // Issue #489's failure mode: a non-root invoker with no passwordless sudo. We can't
-      // give the container a root channel, so host ops on root-owned paths (mail state under
-      // /root/.openship, the edge, the recovery manifest) WILL fail. Provision the invoker
-      // channel anyway (non-root host ops still work) but say so loudly.
-      console.warn(
-        "  ⚠ Host control needs root, but this user isn't root and passwordless sudo isn't\n" +
-          "    available. Mail and edge host operations will fail. Re-run `openship up` as root\n" +
-          "    (or enable passwordless sudo) to fix. Continuing with a limited host channel.",
-      );
-      authorizeKeyAt(authKeysPath, pub);
-      return provisioned({ user, keyPath });
+    const tried: string[] = [];
+    // Authorized this run and NOT settled on. Swept only once something else has been
+    // proven to work — see the total-failure branch for why they can't be swept eagerly.
+    const losers: HostChannelCandidate[] = [];
+    let lastFailure: { state: "refused" | "forced-command"; detail: string } | null = null;
+
+    for (const candidate of candidates) {
+      tried.push(candidate.user);
+      // The account's OWN file, always: a root invoker writes /root directly, a non-root
+      // one writes its own home, and `$SUDO_USER`'s comes from the passwd database.
+      // Nothing is ever authorized for an account we are not logging in as — which is what
+      // collapsed the old write-goes-through-sudo distinction.
+      authorizeKeyAt(candidate.authKeysPath, pub);
+
+      // The key is authorized and `.env` is about to point the api at the host, but a key
+      // is not a server: `ssh-keygen` is the openssh CLIENT and `authorized_keys` is just a
+      // file, so every step above succeeds on a box with no sshd at all. Nothing to learn
+      // from the other candidates either — this is the host, not the account.
+      if (probeHostSshd(port) === "absent") {
+        return { channel: { user: candidate.user, keyPath }, issue: { code: "no-sshd", detail: `port ${port}` } };
+      }
+
+      // And a LISTENER is not an accepted key. This is the check whose absence is #527, and
+      // its verdict — not the uid we were invoked with — is what picks the account.
+      const auth = verifyChannelAuth(candidate.user, keyPath, port);
+
+      if (auth.state === "unreachable") {
+        // The address is the problem, not the account, so trying the next one would
+        // authorize a second key to learn the same thing.
+        return {
+          channel: { user: candidate.user, keyPath },
+          issue: { code: "unreachable", detail: auth.detail },
+        };
+      }
+      if (auth.state === "refused" || auth.state === "forced-command") {
+        lastFailure = { state: auth.state, detail: auth.detail };
+        losers.push(candidate);
+        continue;
+      }
+
+      // Settled. `unknown` lands here too: an install with no `ssh` client can't be
+      // verified either way, and failing it over a missing binary would be the opposite
+      // mistake — so it is trusted, exactly as it was before there was a check at all.
+      const elevation: HostChannelCandidate["elevation"] =
+        candidate.user === "root"
+          ? "login"
+          : auth.state === "ok" && auth.elevation === "refused"
+            ? // MEASURED, over the session shape the api will use. This is the arm
+              // `hasPasswordlessSudo` used to get wrong from a cached ticket, which is what
+              // suppressed the warning below on boxes that genuinely could not reach root.
+              "none"
+            : candidate.elevation;
+
+      // Only now, with something proven to work, is it safe to take the others back. Each
+      // one's dial was refused this run, so revoking it cannot remove working access.
+      for (const loser of losers) revokeKeyAt(loser.authKeysPath);
+      if (elevation === "sudo") {
+        // Switching AWAY from root must not leave the old root key live — including a root
+        // line an OLDER CLI wrote, which is not in `losers` because this run never tried
+        // it. Gated on the MEASURED verdict, never the local probe: `revokeRootKeyViaSudo`
+        // spends the same cached ticket that made the probe lie, so a ticket-only re-run
+        // used to strip a working root grant and leave no route to root at all.
+        revokeRootKeyViaSudo();
+      }
+      if (elevation === "none") {
+        // #489's failure mode, now also reached by a non-root login whose sudo genuinely
+        // doesn't work: host ops on root-owned paths (mail state under /root/.openship, the
+        // edge, the recovery manifest) WILL fail. Keep the channel — non-root host ops
+        // still work — but say so loudly.
+        console.warn(
+          "  ⚠ Host control needs root, and this channel has no route to it: it logs in as\n" +
+            `    \`${candidate.user}\`, and \`sudo -n\` was refused over that session. Mail and edge\n` +
+            "    host operations will fail. Grant that account passwordless sudo, or re-run\n" +
+            "    `openship up` as root, to fix. Continuing with a limited host channel.",
+        );
+      }
+      if (candidate.source === "sudo-user") {
+        // An auto-migration changes which credential exists on the box, so it is announced
+        // rather than left for an operator to notice in `.env`.
+        console.log(
+          `  → Host channel settled on \`${candidate.user}\` rather than root: this host refused a\n` +
+            "    root login, and that account's key was accepted. It elevates per operation with\n" +
+            "    sudo, so no standing root credential is created. Pin one with\n" +
+            "    `openship up --host-ssh-user <name>`.",
+        );
+      }
+      return { channel: { user: candidate.user, keyPath }, issue: undefined };
     }
 
-    // The account's OWN file, on every arm: a root invoker writes /root directly, and a
-    // non-root one writes its own home. Nothing is ever authorized for an account we are
-    // not logging in as — which is what collapsed the old write-goes-through-sudo
-    // distinction: no arm touches another account's authorized_keys any more.
-    authorizeKeyAt(authKeysPath, pub);
-    // Switching AWAY from root must not leave the old root key live. Symmetric with the
-    // sweep the root-ward transition used to do alone, and cheap: `revokeRootKeyViaSudo`
-    // is a no-op when there is no line of ours to remove.
-    if (elevation === "sudo") revokeRootKeyViaSudo();
-    return provisioned({ user, keyPath });
+    // Nothing worked. Every account we authorized this run had its dial refused, so their
+    // lines grant nothing — but they are left in place ANYWAY when one of them is the
+    // account `.env` already names, because materialize is about to carry that channel
+    // forward (carriedHostChannel) and revoking its key would turn a fault the operator can
+    // fix into a channel that has to be re-provisioned to work again.
+    const carried = cfg.hostSshUserCarried?.trim();
+    for (const loser of losers) {
+      if (loser.user !== carried) revokeKeyAt(loser.authKeysPath);
+    }
+    return {
+      channel: null,
+      issue: {
+        code: lastFailure?.state === "forced-command" ? "forced-command" : "auth-refused",
+        ...(lastFailure?.detail ? { detail: lastFailure.detail } : {}),
+        account: tried[tried.length - 1] ?? "",
+        tried,
+        ...(tried.includes("root")
+          ? (() => {
+              const setting = permitRootLoginSetting(port);
+              return setting ? { permitRootLogin: setting } : {};
+            })()
+          : {}),
+      },
+    };
   } catch (err) {
     return { channel: null, issue: { code: "error", detail: (err as Error)?.message } };
   }
 }
 
+/**
+ * What `sshd -T` reports for `PermitRootLogin`, or null when the question couldn't be
+ * asked. ADVISORY ONLY — it never decides which account we use.
+ *
+ * Three reasons it can't be a verdict, all of which would make pruning a candidate on it a
+ * bug rather than an optimization:
+ *   - it prints the GLOBAL config, so a `Match Address` block that re-permits root from the
+ *     docker bridge (a reasonable way to run this channel on a hardened box) doesn't show
+ *     up, and `-C addr=127.0.0.1` can't stand in for it — the container dials the BRIDGE
+ *     address, not loopback;
+ *   - `prohibit-password` and its alias `without-password` both PERMIT publickey, and
+ *     `sshd -T` normalizes one to the other, so the value that reads like a restriction is
+ *     the Debian default and works fine;
+ *   - it needs root, needs `/run/sshd` to exist, and exits 255 on any directive the local
+ *     sshd doesn't recognize.
+ * So the dial decides and this explains, which is also why a failure here is silent.
+ */
+function permitRootLoginSetting(port: number): string | null {
+  try {
+    const r = spawnSync(
+      "sudo",
+      ["-n", "sshd", "-T", "-C", `user=root,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=${port}`],
+      { encoding: "utf8" },
+    );
+    if (r.status !== 0) return null;
+    return /^permitrootlogin\s+(\S+)/m.exec(r.stdout ?? "")?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * PURE. Does this `PermitRootLogin` value refuse our key channel?
+ *
+ * `yes`, `prohibit-password` and `without-password` all admit a publickey login, so only
+ * two values are a refusal. Exported for tests because the wrong answer here is a message
+ * that tells an operator to change a setting that was never the problem — and because
+ * "anything but `yes`" is the intuitive rule and it is wrong twice over.
+ */
+export function sshdRefusesRootLogin(value: string | undefined | null): boolean {
+  const v = value?.trim().toLowerCase();
+  return v === "no" || v === "forced-commands-only";
+}
+
+/**
+ * Can the api's per-operation elevation actually work as this account?
+ *
+ * Measured over the channel we just dialed rather than locally, because the two answer
+ * different questions: `privilegedExecutor` elevates from a fresh, tty-less ssh session
+ * with no sudo timestamp ticket, and a local probe runs in the operator's terminal, which
+ * usually has one. `unknown` when the probe itself couldn't be read.
+ */
+type ElevationProbe = "ok" | "refused" | "unknown";
+
 type ChannelAuthCheck =
-  | { state: "ok" }
+  /** sshd accepted the key for this account. `elevation` is the same session's answer to
+   *  whether `sudo -n` works there — see ElevationProbe. */
+  | { state: "ok"; elevation: ElevationProbe }
+  /**
+   * We reached sshd and it would not log this account in with the key we just wrote.
+   *
+   * Deliberately NOT split into "key missing" vs "account refused": `Permission denied
+   * (publickey)` is byte-identical for both (and for `DenyUsers`, an `AllowUsers` that
+   * excludes the account, a `from=` mismatch, and a nonexistent account), and OpenSSH
+   * withholds the difference on purpose. What narrows it is not ssh's stderr but the fact
+   * that we just wrote the line ourselves — so the remedy names sshd's account policy and
+   * the one command that shows it, instead of sending the operator to move key files.
+   */
   | { state: "refused"; detail: string }
+  /**
+   * Auth SUCCEEDED and the session then died without running our probe — the
+   * `PermitRootLogin forced-commands-only` shape (our line carries no `command=`), or a
+   * login shell that can't execute a command. Kept apart from `refused` because "the host
+   * refused the key" is false here and would send the operator to the wrong file.
+   */
+  | { state: "forced-command"; detail: string }
+  /**
+   * Never got as far as authentication: nothing accepted a connection at the address we
+   * dialed. A `ListenAddress` that excludes loopback lands here, and reporting it as a key
+   * refusal — which every non-zero ssh exit used to be — pointed at `authorized_keys` for
+   * a host whose keys were never consulted.
+   */
+  | { state: "unreachable"; detail: string }
   /** The question could not be asked — no `ssh` client, or it never ran. Never reported
    *  as a refusal: failing an otherwise-good install over a missing binary would be the
    *  opposite mistake. */
@@ -1257,6 +1655,7 @@ function verifyChannelAuth(user: string, keyPath: string, port: number): Channel
   const r = spawnSync(
     "ssh",
     [
+      "-v",
       "-i", keyPath,
       "-p", String(port),
       "-o", "BatchMode=yes",
@@ -1266,23 +1665,72 @@ function verifyChannelAuth(user: string, keyPath: string, port: number): Channel
       "-o", "PreferredAuthentications=publickey",
       "-o", "IdentitiesOnly=yes",
       `${user}@127.0.0.1`,
-      "true",
+      CHANNEL_PROBE_COMMAND,
     ],
-    { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"], timeout: 15_000 },
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15_000 },
   );
 
-  if (r.status === 0) return { state: "ok" };
   if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" || r.status === null) {
     return { state: "unknown" };
   }
-  // `StrictHostKeyChecking=no` announces every first contact on stderr; that line is not
-  // a cause and would bury the one that is.
-  const detail = (r.stderr || "")
+  const stderr = r.stderr || "";
+  const stdout = r.stdout || "";
+  // The probe's own marker, not the exit code: the remote script ends in `exit 0` so that
+  // a REFUSED sudo (an ordinary, non-fatal answer) can't be read as a failed login.
+  const sudo = /openship-sudo=(ok|refused)/.exec(stdout)?.[1];
+  if (r.status === 0 && sudo) {
+    return { state: "ok", elevation: sudo === "ok" ? "ok" : "refused" };
+  }
+  // Authenticated, but the marker never arrived. Either the session was closed on us
+  // (forced-commands-only) or the remote shell couldn't run it; both are a working key.
+  if (/Authenticated to |debug1: Authentication succeeded/.test(stderr)) {
+    return r.status === 0
+      ? { state: "ok", elevation: "unknown" }
+      : { state: "forced-command", detail: sshProbeDetail(stderr, r.status) };
+  }
+  // Never reached auth at all — a closed port, a firewall, or an sshd bound to an address
+  // that isn't the one we dialed.
+  if (/^ssh: connect to host/m.test(stderr)) {
+    return { state: "unreachable", detail: sshProbeDetail(stderr, r.status) };
+  }
+  if (r.status === 0) return { state: "ok", elevation: "unknown" };
+  return { state: "refused", detail: sshProbeDetail(stderr, r.status) };
+}
+
+/**
+ * What the verification dial runs on the host.
+ *
+ * Two things in one round trip: proof the login works, and whether `sudo -n` works from
+ * exactly the session shape the api uses (no tty, no inherited ticket — see
+ * hasPasswordlessSudo for why a local probe cannot answer this). The trailing `exit 0` is
+ * load-bearing: without it a refused sudo would exit non-zero and be indistinguishable
+ * from a refused LOGIN, which is the confusion this whole classifier exists to remove.
+ */
+const CHANNEL_PROBE_COMMAND =
+  "if sudo -n -k true 2>/dev/null; then echo openship-sudo=ok; " +
+  "else echo openship-sudo=refused; fi; exit 0";
+
+/**
+ * The one line of ssh's output an operator needs, out of `-v`'s several dozen.
+ *
+ * `-v` is on because the post-auth markers are the only way to tell a key that was
+ * ACCEPTED (and then had its session closed) from one that was refused — but its debug
+ * stream would bury the actual cause, and `StrictHostKeyChecking=no` announces every first
+ * contact on top of that. Both are dropped; what's left is the diagnosis.
+ */
+function sshProbeDetail(stderr: string, status: number | null): string {
+  const detail = stderr
     .split("\n")
     .map((l) => l.trim())
-    .filter((l) => l && !/^Warning: Permanently added/.test(l))
+    .filter(
+      (l) =>
+        l &&
+        !/^debug\d*:/.test(l) &&
+        !/^OpenSSH_/.test(l) &&
+        !/^Warning: Permanently added/.test(l),
+    )
     .join(" ");
-  return { state: "refused", detail: detail || `ssh exited ${r.status}` };
+  return detail || `ssh exited ${status}`;
 }
 
 /** Why `ssh-keygen` didn't produce a key — a missing binary is the common one, and it
@@ -1400,9 +1848,19 @@ export function renderHostChannelIssue(
     issue.code === "no-sshd"
       ? `  ⚠ Host control is provisioned, but nothing on this host is listening for SSH` +
         `${detail}.`
-      : issue.code === "auth-refused"
-        ? `  ⚠ Host control is provisioned, but this host REFUSED the channel's key.`
-        : `  ⚠ Host control could NOT be provisioned on this box.`;
+      : issue.code === "unreachable"
+        ? `  ⚠ Host control is provisioned, but nothing answered at the SSH address we dialed` +
+          `${detail}.`
+        : issue.code === "forced-command"
+          ? // Like `auth-refused` and unlike `no-sshd`: a key that can't run a command is
+            // not a channel, so nothing was written and the headline must not imply it was.
+            `  ⚠ Host control could NOT be provisioned: this host's sshd allows the channel no commands.`
+          : issue.code === "auth-refused"
+            ? // NOT "is provisioned, but": a refusal no longer leaves a channel behind. The
+              // run tried every account it could authorize and none of them were let in, so
+              // there is nothing provisioned to describe.
+              `  ⚠ Host control could NOT be provisioned: this host REFUSED the channel's key.`
+            : `  ⚠ Host control could NOT be provisioned on this box.`;
 
   let cause: string;
   switch (issue.code) {
@@ -1428,25 +1886,64 @@ export function renderHostChannelIssue(
           sshdEnableHint: thisHost().sshdEnableHint(),
         }).body;
       break;
-    case "auth-refused":
-      // The one cause here an operator can act on immediately, so it names both the
-      // possibilities and the command that shows which — #527's reporter had neither, and
-      // spent a dozen messages moving key files that were never read.
+    case "unreachable":
+      // A listener exists (probeHostSshd said so) and yet the dial never reached auth, so
+      // the one thing this cannot be is the key — which is what it used to be reported as.
       cause =
-        `The key was authorized for \`${issue.account ?? "the channel account"}\` and sshd ` +
-        `is listening, but the dial was refused${detail}. Either that account's ` +
-        `\`authorized_keys\` is not the ` +
-        `file we wrote to, or sshd permits it no login — \`sshd -T | grep -i ` +
-        `permitrootlogin\` shows the second. Until it is fixed the api container will be ` +
-        `refused every time it dials ${ctx.target}.`;
+        `sshd is listening on this host, but the verification dial to 127.0.0.1 was not ` +
+        `answered${detail}. That is an ADDRESS problem, not a key problem: a ` +
+        `\`ListenAddress\` that excludes loopback, or a local firewall rule. The api ` +
+        `container dials ${ctx.target}, so check that sshd accepts connections there — ` +
+        `\`sudo sshd -T | grep -i listenaddress\` shows what it binds.`;
       break;
+    case "forced-command":
+      cause =
+        `sshd ACCEPTED the channel's key for \`${issue.account ?? "the channel account"}\` ` +
+        `and then closed the session without running anything${detail}. That is what ` +
+        `\`PermitRootLogin forced-commands-only\` does to a key with no \`command=\` of its ` +
+        `own, and it is indistinguishable from a working channel until a host operation ` +
+        `runs. Either permit this account a normal login, or use an account that has one: ` +
+        `\`openship up --host-ssh-user <name>\`.`;
+      break;
+    case "auth-refused": {
+      // The one cause here an operator can act on immediately, so it names the accounts we
+      // tried and the three things that actually fix it — #527's reporter had none of that,
+      // and spent a dozen messages moving key files that were never read.
+      const accounts = issue.tried?.length
+        ? issue.tried.map((a) => `\`${a}\``).join(" then ")
+        : `\`${issue.account ?? "the channel account"}\``;
+      // Only ever a quote of what sshd reported, never our own inference — see
+      // permitRootLoginSetting for why the dial and this value can legitimately disagree.
+      const rootNote = issue.permitRootLogin
+        ? ` This host's sshd reports \`PermitRootLogin ${issue.permitRootLogin}\`` +
+          `${sshdRefusesRootLogin(issue.permitRootLogin) ? ", which refuses a root login outright" : ""}.`
+        : "";
+      cause =
+        `The key was authorized for ${accounts} and sshd is listening, but every dial was ` +
+        `refused${detail}.${rootNote} sshd is not telling us which of several causes it is — ` +
+        `\`Permission denied (publickey)\` is the same message for an account that may not ` +
+        `log in, an \`authorized_keys\` sshd doesn't read for it, and a home directory whose ` +
+        `permissions it rejects. Three things fix it:\n` +
+        `  • name an account that CAN log in: \`openship up --host-ssh-user <name>\`\n` +
+        `  • permit root a key login: \`PermitRootLogin prohibit-password\` (still refuses ` +
+        `passwords), or scope it to the container with a \`Match Address\` block\n` +
+        `  • or leave host control off: \`openship up --no-host-control\`\n` +
+        `Until one of them is done the api container will be refused every time it dials ` +
+        `${ctx.target}.`;
+      break;
+    }
     case "error":
       cause = `Setting up the channel's key failed${detail}.`;
       break;
   }
 
+  // Silent for the codes that still leave a channel in `.env` — there is nothing to carry
+  // or unset, so both halves of this note would be false. That is exactly the two host-level
+  // faults: no sshd at all, and an sshd that didn't answer at this address. `auth-refused`
+  // and `forced-command` are NOT here — neither returns a channel any more, so an operator
+  // whose working install just lost one (or kept the old one) has to be told which.
   const continuity =
-    issue.code === "no-sshd" || issue.code === "auth-refused"
+    issue.code === "no-sshd" || issue.code === "unreachable"
       ? ""
       : ctx.kept
         ? hostIssueNote(
@@ -2114,6 +2611,10 @@ export function resolveEnvConfig(
   /** Where the api container reaches this machine's sshd for host ops. */
   hostSshHost: string;
   hostSshPort: string;
+  /** Operator-pinned host account (`--host-ssh-user`), if any. */
+  hostSshUser?: string;
+  /** The account the previous run settled on — continuity, not a pin. */
+  hostSshUserCarried?: string;
 } {
   const publicUrl = keepConfig(prev, "OPENSHIP_PUBLIC_URL", opts.publicUrl);
   // Bind interface. An explicit setting always wins and is carried across re-runs
@@ -2165,6 +2666,17 @@ export function resolveEnvConfig(
     hostSshPort:
       keepConfig(prev, "OPENSHIP_HOST_SSH_PORT", opts.hostSshPort) ??
       String(HOST_CHANNEL_DEFAULT_PORT),
+    // Sticky like its siblings, but kept in its OWN key rather than reusing
+    // OPENSHIP_HOST_SSH_USER. That key records what provisioning SETTLED on, and the two
+    // must not be conflated: reading a settled value back as a pin would freeze the account
+    // a box happens to have — including the refused `root` on every install #527 broke — and
+    // the fallback that repairs them could never run.
+    ...(keepConfig(prev, "OPENSHIP_HOST_SSH_USER_PIN", opts.hostSshUser)
+      ? { hostSshUser: keepConfig(prev, "OPENSHIP_HOST_SSH_USER_PIN", opts.hostSshUser) }
+      : {}),
+    ...(prev.OPENSHIP_HOST_SSH_USER?.trim()
+      ? { hostSshUserCarried: prev.OPENSHIP_HOST_SSH_USER.trim() }
+      : {}),
   };
 }
 
@@ -2317,6 +2829,7 @@ export async function resolveComposePorts(
 const OMITTABLE_MANAGED_KEYS: ReadonlySet<string> = new Set([
   "OPENSHIP_HOST_SSH_HOST",
   "OPENSHIP_HOST_SSH_USER",
+  "OPENSHIP_HOST_SSH_USER_PIN",
   "OPENSHIP_HOST_SSH_PORT",
   "OPENSHIP_HOST_SSH_KEY",
   "OPENSHIP_HOST_KEY_PATH",
@@ -2432,6 +2945,8 @@ function managedEnvLines(
     // the compose-side source for the /run/secrets/openship_host_key mount.
     lines.push(
       `OPENSHIP_HOST_SSH_HOST=${cfg.hostSshHost}`,
+      // What provisioning SETTLED on this run — a fact about the box, not a setting. The
+      // operator's pin, when there is one, is written OUTSIDE this block (see below).
       `OPENSHIP_HOST_SSH_USER=${host.user}`,
       `OPENSHIP_HOST_SSH_PORT=${cfg.hostSshPort}`,
       "OPENSHIP_HOST_SSH_KEY=/run/secrets/openship_host_key",
@@ -2442,6 +2957,12 @@ function managedEnvLines(
       ...hostGatewayEnv(prev),
     );
   }
+  // The operator's pinned account, OUTSIDE the `if (host)` above on purpose: it is a
+  // setting, not a property of a channel that got provisioned. A pin whose account sshd
+  // refuses produces no channel at all — and dropping the pin on exactly that run would
+  // lose it the moment it mattered, so the next `up` (after the operator fixed sshd) would
+  // re-decide from scratch and land back on the account they had ruled out.
+  if (cfg.hostSshUser) lines.push(`OPENSHIP_HOST_SSH_USER_PIN=${cfg.hostSshUser}`);
   return lines;
 }
 
@@ -2650,7 +3171,7 @@ export function composePlan(opts: ComposeUpOpts): ComposePlan {
   const prev = readEnvFile();
   const cfg = resolveEnvConfig(prev, opts);
   const buildDir = opts.build === false ? null : sourceBuildDir();
-  const hostChannel = plannedHostChannel(cfg.hostControl);
+  const hostChannel = previewHostChannel(cfg);
   const settings: Array<{ key: string; value: string }> = [];
   const newSecrets: string[] = [];
   for (const line of renderEnv(opts, hostChannel, cfg).split("\n")) {
@@ -2682,7 +3203,7 @@ export function composePlan(opts: ComposeUpOpts): ComposePlan {
     secretRotation: opts.resetSecrets ? null : secretRotationRisk(prev),
     pgDataRisk: pgDataDetectionRisk(prev),
     existing: Object.keys(prev).length > 0,
-    mountDirs: EDGE_CONTAINER_MOUNTS.map((m) => m.host),
+    mountDirs: composeEdgeMounts().map((m) => m.host),
     buildDir,
     hostChannel,
   };
@@ -2841,7 +3362,7 @@ export function composePrefetch(opts: ComposeUpOpts): ComposePrefetchResult {
  */
 function ensureEdgeMountDirs(): string[] {
   const failed: string[] = [];
-  for (const { host } of EDGE_CONTAINER_MOUNTS) {
+  for (const { host } of composeEdgeMounts()) {
     try {
       mkdirSync(host, { recursive: true });
     } catch (err) {

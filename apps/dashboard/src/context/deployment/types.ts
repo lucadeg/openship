@@ -1,9 +1,23 @@
 import type { Terminal } from "@xterm/xterm";
 import type { FrameworkId, EnvironmentVariable } from "@/components/import-project/types";
 import type { PrepareComposeService, PrepareSingleAppCandidate } from "@/lib/api/deploy";
-import { getBuildImage, STACKS, resolveWorkload, type WorkloadType, type ProjectType, type BuildStrategy, type DeployTarget, type RuntimeMode, type StackId, type RoutingConfig, type OpenshipReadiness, type ResourceTier as CoreResourceTier } from "@repo/core";
+import {
+  getBuildImage,
+  STACKS,
+  resolveWorkload,
+  type WorkloadType,
+  type ProjectType,
+  type BuildStrategy,
+  type DeployTarget,
+  type RuntimeMode,
+  type StackId,
+  type RoutingConfig,
+  type OpenshipReadiness,
+  type ResourceTier as CoreResourceTier,
+} from "@repo/core";
 import type { BuildLog } from "@/utils/deploymentPhaseDetector";
 import type { BuildSessionLoadResult } from "./load-session";
+import type { PersistedProjectEnv } from "@/lib/project-env-diff";
 import { randomUUID } from "@/lib/random-uuid";
 
 // ─── Monorepo sub-app ────────────────────────────────────────────────────────
@@ -86,6 +100,7 @@ export type RawComposeService = {
   image?: string | null;
   build?: string | null;
   dockerfile?: string | null;
+  buildArgs?: Record<string, string | null> | null;
   ports?: string[] | null;
   dependsOn?: string[] | null;
   environment?: Record<string, string> | null;
@@ -145,6 +160,7 @@ export function normalizeComposeService(raw: RawComposeService): ComposeServiceI
     image: raw.image ?? undefined,
     build: raw.build ?? undefined,
     dockerfile: raw.dockerfile ?? undefined,
+    buildArgs: raw.buildArgs ?? undefined,
     ports: raw.ports ?? [],
     dependsOn: raw.dependsOn ?? [],
     environment: raw.environment ?? {},
@@ -175,6 +191,8 @@ export interface PublicEndpoint {
   id: string;
   port: string;
   targetPath: string;
+  /** Preserve an imported nginx `location = <path>` route during migration. */
+  exact?: boolean;
   domain: string;
   customDomain: string;
   domainType: "free" | "custom";
@@ -382,7 +400,14 @@ export interface DeploymentConfig {
   buildImage: string;
   publicEndpoints: PublicEndpoint[];
   envVars: EnvironmentVariable[];
-  /** Root .env values detected during prepare; user must import before they apply. */
+  /**
+   * Authoritative production-env snapshot used to persist only the wizard's
+   * changes. `null` means an existing project's env was never loaded, which is
+   * intentionally different from a project with no saved variables.
+   */
+  projectEnvBaseline: PersistedProjectEnv[] | null;
+  /** Root .env values detected during prepare; user must import before they apply.
+   *  Explicit openship.json env is placed directly in envVars instead. */
   rootEnvVars: EnvironmentVariable[];
   branch: string;
   branches: string[];
@@ -414,6 +439,12 @@ export interface DeploymentConfig {
    * and nothing post-start can delay or veto it.
    */
   readiness?: OpenshipReadiness | null;
+  /**
+   * What the scan's openship.json parse refused (#641). NOT a user setting — it's
+   * a fresh observation of the repo, so it is never hydrated from the saved
+   * project and never sent back on save.
+   */
+  configDiagnostics?: { errors: string[]; warnings: string[]; wholeFile?: true };
   /**
    * Resource tier picked for Openship Cloud deploys. Self-hosted servers
    * inherit the host's capacity, so this field is meaningless for them
@@ -479,14 +510,13 @@ export const DEFAULT_CONFIG: DeploymentConfig = {
     workloadType: "web",
   },
   envVars: [],
+  projectEnvBaseline: null,
   rootEnvVars: [],
 };
 
 function isSingleFlowAppStack(framework: string | undefined): framework is StackId {
   return Boolean(
-    framework &&
-    framework in STACKS &&
-    !NON_APP_SINGLE_FLOW_STACKS.has(framework as FrameworkId),
+    framework && framework in STACKS && !NON_APP_SINGLE_FLOW_STACKS.has(framework as FrameworkId),
   );
 }
 
@@ -513,7 +543,10 @@ export function getRecommendedSingleAppBuildImage(
 }
 
 export function resolveBuildImageForDeploymentMode(
-  config: Pick<DeploymentConfig, "projectType" | "serviceDeploymentMode" | "framework" | "packageManager" | "buildImage">,
+  config: Pick<
+    DeploymentConfig,
+    "projectType" | "serviceDeploymentMode" | "framework" | "packageManager" | "buildImage"
+  >,
   nextMode: DeploymentConfig["serviceDeploymentMode"] = config.serviceDeploymentMode,
 ): string {
   if (config.projectType !== "services") {
@@ -551,13 +584,12 @@ export function resolveBuildImageForDeploymentMode(
 // importers are unchanged and client + server share one definition.
 export { servicesNeedCloud, endpointsNeedCloud as publicEndpointsNeedCloud } from "@repo/core";
 
-export function createPublicEndpoint(
-  overrides: Partial<PublicEndpoint> = {},
-): PublicEndpoint {
+export function createPublicEndpoint(overrides: Partial<PublicEndpoint> = {}): PublicEndpoint {
   return {
     id: overrides.id ?? randomUUID(),
     port: overrides.port ?? "",
     targetPath: overrides.targetPath ?? "",
+    ...(overrides.exact ? { exact: true } : {}),
     domain: overrides.domain ?? "",
     customDomain: overrides.customDomain ?? "",
     domainType: overrides.domainType ?? "free",
@@ -599,8 +631,8 @@ function normalizePublicEndpointForMode(
     return createPublicEndpoint({
       ...endpoint,
       port: opts.isPrimary
-        ? (opts.runtimePort || endpoint.port || "")
-        : (endpoint.port || opts.runtimePort || ""),
+        ? opts.runtimePort || endpoint.port || ""
+        : endpoint.port || opts.runtimePort || "",
       targetPath: "",
     });
   }
@@ -612,9 +644,7 @@ function normalizePublicEndpointForMode(
   });
 }
 
-export function syncPublicEndpointState(
-  config: DeploymentConfig,
-): DeploymentConfig {
+export function syncPublicEndpointState(config: DeploymentConfig): DeploymentConfig {
   const workload = workloadOf(config.options);
 
   // A worker (#538) binds no port and is never routed — it has no public
@@ -630,11 +660,7 @@ export function syncPublicEndpointState(
 
   const isWeb = workload === "web";
   const linkedRuntimePort = isWeb
-    ? (
-        config.options.productionPort ||
-        config.publicEndpoints[0]?.port ||
-        ""
-      )
+    ? config.options.productionPort || config.publicEndpoints[0]?.port || ""
     : config.options.productionPort;
   const endpoints = ensurePublicEndpoints(
     config.publicEndpoints,
@@ -645,11 +671,13 @@ export function syncPublicEndpointState(
       : {
           targetPath: "/",
         },
-  ).map((endpoint, index) => normalizePublicEndpointForMode(endpoint, {
-    hasServer: isWeb,
-    runtimePort: linkedRuntimePort,
-    isPrimary: index === 0,
-  }));
+  ).map((endpoint, index) =>
+    normalizePublicEndpointForMode(endpoint, {
+      hasServer: isWeb,
+      runtimePort: linkedRuntimePort,
+      isPrimary: index === 0,
+    }),
+  );
   const primary = endpoints[0];
 
   return {
@@ -658,7 +686,7 @@ export function syncPublicEndpointState(
     options: {
       ...config.options,
       productionPort: isWeb
-        ? (linkedRuntimePort || primary?.port || "")
+        ? linkedRuntimePort || primary?.port || ""
         : config.options.productionPort,
     },
   };
@@ -695,10 +723,10 @@ export function getPublicEndpointHosts(
       const label = endpoint.domain?.trim();
       return label && baseDomain ? `${label}.${baseDomain}` : "";
     })
-    .filter((hostname, index, hostnames) => Boolean(hostname) && hostnames.indexOf(hostname) === index);
+    .filter(
+      (hostname, index, hostnames) => Boolean(hostname) && hostnames.indexOf(hostname) === index,
+    );
 }
-
-
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -719,6 +747,12 @@ export interface OutputCheckUI {
   found: boolean;
   hasIndex: boolean;
   checked: boolean;
+  /** Status the edge answered for a real request to this route. Absent = no HTTP
+   *  signal — pre-fix records have none. */
+  status?: number;
+  /** The edge answered and it was not a failure. ABSENT = no signal: test
+   *  `served === false`, never `!served`, or every older record reads as broken. */
+  served?: boolean;
   skippedReason?: string;
 }
 
@@ -729,6 +763,8 @@ export interface DeploymentState {
   deploymentSuccess: boolean;
   deploymentFailed: boolean;
   deploymentCanceled: boolean;
+  /** A cancelled row whose worker lease has not acknowledged completion yet. */
+  cancellationPending: boolean;
   failureMessage: string;
   warningMessage: string;
   /**
@@ -799,6 +835,7 @@ export const INITIAL_STATE: DeploymentState = {
   deploymentSuccess: false,
   deploymentFailed: false,
   deploymentCanceled: false,
+  cancellationPending: false,
   failureMessage: "",
   warningMessage: "",
   decisionPending: false,
@@ -862,11 +899,22 @@ export interface DeploymentContextType {
     owner: string,
     repo: string,
     force?: string,
-    context?: { branch?: string; projectId?: string; composePath?: string },
+    context?: {
+      branch?: string;
+      projectId?: string;
+      composePath?: string;
+      env?: Record<string, string>;
+      preserveEnvState?: boolean;
+    },
   ) => Promise<{ success: boolean; error?: string; errorType?: string; buildInProgress?: boolean }>;
   initializeFromLocal: (
     path: string,
-    context?: { projectId?: string; composePath?: string },
+    context?: {
+      projectId?: string;
+      composePath?: string;
+      env?: Record<string, string>;
+      preserveEnvState?: boolean;
+    },
   ) => Promise<{ success: boolean; error?: string; errorType?: string }>;
   /**
    * Re-run detection pinned to an explicit compose file path (or clear it with
@@ -894,7 +942,11 @@ export interface DeploymentContextType {
   ) => Promise<{ success: boolean; error?: string; errorType?: string }>;
 
   // Build lifecycle
-  startDeployment: (overrides?: { runtimeMode?: RuntimeMode; buildStrategy?: BuildStrategy; saveConfigOnly?: boolean }) => Promise<string | null>;
+  startDeployment: (overrides?: {
+    runtimeMode?: RuntimeMode;
+    buildStrategy?: BuildStrategy;
+    saveConfigOnly?: boolean;
+  }) => Promise<string | null>;
   connectToBuild: (deploymentId?: string, startBuild?: boolean) => Promise<void>;
   loadBuildSession: (deploymentId: string) => Promise<BuildSessionLoadResult>;
   stopDeployment: () => Promise<void>;

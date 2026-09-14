@@ -23,6 +23,7 @@ import {
   toView,
   isValidActionType,
   isValidAuthMode,
+  assertDeployServiceTargets,
   listProjectDeliveries,
   listHookDeliveries,
   listOrgDeliveries,
@@ -30,6 +31,7 @@ import {
 import { assertJobRunnable, canRunJob } from "../jobs/job.controller";
 import { env } from "../../config";
 import type { IncomingWebhookActionConfig } from "@repo/db";
+import { normalizeDeployActionConfig } from "./incoming-action";
 
 // ─── Public trigger ──────────────────────────────────────────────────────────
 
@@ -156,10 +158,23 @@ export async function create(c: Context) {
   if (!isValidAuthMode(authMode)) {
     return c.json({ error: "Invalid auth mode" }, 400);
   }
-  const actionConfig: IncomingWebhookActionConfig = {
-    serviceId: typeof body?.actionConfig?.serviceId === "string" ? body.actionConfig.serviceId : undefined,
+  let actionConfig: IncomingWebhookActionConfig = {
+    serviceId:
+      typeof body?.actionConfig?.serviceId === "string" ? body.actionConfig.serviceId : undefined,
+    serviceIds: Array.isArray(body?.actionConfig?.serviceIds)
+      ? body.actionConfig.serviceIds
+      : undefined,
     jobKey: typeof body?.actionConfig?.jobKey === "string" ? body.actionConfig.jobKey : undefined,
   };
+  if (actionType === "deploy") {
+    try {
+      actionConfig = normalizeDeployActionConfig(actionConfig);
+    } catch (err) {
+      return c.json({ error: safeErrorMessage(err) }, 400);
+    }
+  } else {
+    actionConfig = { jobKey: actionConfig.jobKey };
+  }
   if (actionType === "job") {
     // Jobs are a self-hosted control-plane feature (Jobs API is localOnly). No
     // job hooks on the SaaS — else a tenant could arm instance-global jobs.
@@ -181,6 +196,7 @@ export async function create(c: Context) {
   }
 
   try {
+    if (actionType === "deploy") await assertDeployServiceTargets(projectId, actionConfig);
     const view = await createHook({
       projectId,
       organizationId: ctx.organizationId,
@@ -217,11 +233,21 @@ export async function update(c: Context) {
   const existing = await getHookForProject(projectId, hookId);
   if (!existing) return c.json({ error: "Not found" }, 404);
   const finalType = body?.actionType ?? existing.actionType;
-  const finalJobKey =
-    (typeof body?.actionConfig?.jobKey === "string" ? body.actionConfig.jobKey : undefined) ??
-    existing.actionConfig?.jobKey;
+  let nextActionConfig: IncomingWebhookActionConfig | undefined = body?.actionConfig
+    ? {
+        serviceId:
+          typeof body.actionConfig.serviceId === "string" ? body.actionConfig.serviceId : undefined,
+        serviceIds: Array.isArray(body.actionConfig.serviceIds)
+          ? body.actionConfig.serviceIds
+          : undefined,
+        jobKey: typeof body.actionConfig.jobKey === "string" ? body.actionConfig.jobKey : undefined,
+      }
+    : undefined;
+  const finalJobKey = nextActionConfig?.jobKey ?? existing.actionConfig?.jobKey;
   const touchesActionOrAuth =
-    body?.actionType !== undefined || body?.actionConfig !== undefined || body?.authMode !== undefined;
+    body?.actionType !== undefined ||
+    body?.actionConfig !== undefined ||
+    body?.authMode !== undefined;
   const enabling = body?.enabled === true;
   if (finalType === "job" && (touchesActionOrAuth || enabling)) {
     if (env.CLOUD_MODE) {
@@ -234,6 +260,23 @@ export async function update(c: Context) {
     if (!finalJobKey) return c.json({ error: "A job is required for a job webhook" }, 400);
     const denied = await assertJobRunnable(c, finalJobKey);
     if (denied) return denied;
+    if (nextActionConfig) nextActionConfig = { jobKey: finalJobKey };
+  }
+
+  if (finalType === "deploy" && (nextActionConfig || enabling || body?.actionType !== undefined)) {
+    try {
+      const effectiveConfig = normalizeDeployActionConfig(
+        nextActionConfig ?? existing.actionConfig ?? {},
+      );
+      await assertDeployServiceTargets(projectId, effectiveConfig);
+      // Persist the normalized deploy-only shape whenever this path is
+      // revalidated. In particular, switching a job hook to deploy without an
+      // explicit actionConfig must clear its stale jobKey instead of carrying
+      // unrelated configuration into the new action type.
+      nextActionConfig = effectiveConfig;
+    } catch (err) {
+      return c.json({ error: safeErrorMessage(err) }, 400);
+    }
   }
 
   // Reveal the (possibly re-minted) secret in the response only to a caller who
@@ -249,7 +292,7 @@ export async function update(c: Context) {
       name: typeof body?.name === "string" ? body.name : undefined,
       enabled: typeof body?.enabled === "boolean" ? body.enabled : undefined,
       actionType: body?.actionType,
-      actionConfig: body?.actionConfig,
+      actionConfig: nextActionConfig,
       authMode: body?.authMode,
     },
     reveal,

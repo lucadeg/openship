@@ -92,6 +92,7 @@ async function run(statuses: Array<"deploying" | "failed" | "cancelled">) {
     logger: new BuildLogger(() => {}),
     snapshot: SNAPSHOT as never,
     buildSessionId: "sess",
+    composeInterpolationEnv: {},
     buildEnvVars: {},
     buildResources: DEFAULT_RESOURCE_CONFIG,
   });

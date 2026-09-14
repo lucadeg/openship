@@ -106,16 +106,21 @@ export function elevatedExecutor(inner: CommandExecutor): CommandExecutor {
    * `chown 0:0` before the move because `mv` PRESERVES ownership, both by rename and by
    * cross-device copy: the published file was landing under /etc owned by the login user,
    * so on exactly the hosts this decorator exists for, a non-root account could rewrite
-   * root's nginx.conf after we wrote it. The mode is deliberately left alone — callers
-   * needing tighter than the default chmod the staged path themselves (`nginx.ts`
-   * `_writeFile`), and forcing one here would silently loosen theirs.
+   * root's nginx.conf after we wrote it. The default mode is deliberately left alone;
+   * secret callers pass `writeFile(..., { mode: 0o600 })`, while forcing one mode here
+   * would silently loosen or over-tighten other configs.
    */
-  const writeFileElevated = async (path: string, content: string): Promise<void> => {
+  const writeFileElevated = async (
+    path: string,
+    content: string,
+    opts?: { mode?: number },
+  ): Promise<void> => {
     const stage = `/tmp/.openship-elev-${randomBytes(12).toString("hex")}`;
     await inner.exec(`mkdir -m 700 ${sq(stage)}`);
     try {
       const staged = `${stage}/payload`;
-      await inner.writeFile(staged, content);
+      if (opts === undefined) await inner.writeFile(staged, content);
+      else await inner.writeFile(staged, content, opts);
       await inner.exec(
         elevateCommand(
           `mkdir -p ${sq(dirOf(path))} && chown 0:0 ${sq(staged)} && mv -f ${sq(staged)} ${sq(path)}`,

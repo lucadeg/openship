@@ -1,8 +1,8 @@
 /**
  * Event triggers — fire a custom job when a platform event happens (a deploy
  * finishes, a backup fails, …). The hook lives on `notification.emit` (see
- * notification-dispatcher): every emitted eventType is offered here, and any
- * enabled job whose `triggerEvents` contains it is fired in the background.
+ * notification-dispatcher): every emitted eventType AND its organization are
+ * offered here, and matching jobs in that organization fire in the background.
  *
  * The curated `JOB_TRIGGER_EVENTS` list is the controlled vocabulary the UI
  * shows and the schema validates against — it mirrors the notifiable events, so
@@ -17,6 +17,7 @@
 import { repos } from "@repo/db";
 import { safeErrorMessage } from "@repo/core";
 import { startCommandRun } from "./job-command";
+import { resolveServerIds, type CommandConfig } from "./job.types";
 
 export interface JobTriggerEvent {
   id: string;
@@ -57,17 +58,42 @@ export async function refreshTriggerArm(): Promise<void> {
   }
 }
 
-/** Fire every enabled job that listens for `eventType`. Fire-and-forget; called
- *  from notification.emit for each emitted event. Cheap no-op when unarmed. */
-export function fireJobTriggers(eventType: string): void {
+/** Fire every enabled job in `organizationId` that listens for `eventType`.
+ *  Fire-and-forget; called from notification.emit for each emitted event. Cheap
+ *  no-op when unarmed.
+ *
+ *  Jobs predate an organizationId column, so their target servers are the
+ *  authoritative tenant boundary (the create/update routes require every target
+ *  to belong to the caller's org). Missing, deleted, mixed-org, and targetless
+ *  jobs fail closed. This check must happen before opening a run row: an event in
+ *  one workspace must never dispatch a command on another workspace's server. */
+export function fireJobTriggers(eventType: string, organizationId: string): void {
   if (!armed.has(eventType)) return;
   void (async () => {
     try {
       const jobs = await repos.job.listAll();
-      for (const job of jobs) {
-        if (job.enabled && job.actionType === "command" && (job.triggerEvents ?? []).includes(eventType)) {
-          await startCommandRun(job, "event");
+      const candidates = jobs
+        .filter(
+          (job) =>
+            job.enabled &&
+            job.actionType === "command" &&
+            (job.triggerEvents ?? []).includes(eventType),
+        )
+        .map((job) => ({
+          job,
+          serverIds: [...new Set(resolveServerIds((job.actionConfig ?? {}) as CommandConfig))],
+        }));
+      const targetIds = [...new Set(candidates.flatMap(({ serverIds }) => serverIds))];
+      const servers = await repos.server.getMany(targetIds);
+
+      for (const { job, serverIds } of candidates) {
+        if (
+          serverIds.length === 0 ||
+          serverIds.some((id) => servers.get(id)?.organizationId !== organizationId)
+        ) {
+          continue;
         }
+        await startCommandRun(job, "event");
       }
     } catch (err) {
       console.warn(`[job-events] trigger dispatch failed for ${eventType}: ${safeErrorMessage(err)}`);

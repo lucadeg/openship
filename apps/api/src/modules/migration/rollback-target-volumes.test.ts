@@ -30,7 +30,7 @@ const undoBody = (() => {
 
 /** Boot recovery's per-run block. */
 const recoveryBody = (() => {
-  const from = src.indexOf("if (run.status !== \"queued\" && run.sourceServerId) {");
+  const from = src.indexOf('if (run.status !== "queued" && run.sourceServerId) {');
   return src.slice(from, from + 1400);
 })();
 
@@ -88,7 +88,8 @@ describe("boot recovery undoes the same things a live rollback does", () => {
   it("leaves a PARKED run alone — the target is up and waiting on a human", () => {
     // awaiting_cutover / partial must survive a restart untouched; undoing them would tear down
     // a verified target the operator was about to confirm.
-    expect(src).toContain('if (run.status === "awaiting_cutover" || run.status === "partial") continue;');
+    expect(src).toContain('if (run.status === "awaiting_cutover" || run.status === "partial") {');
+    expect(src).toContain("acknowledgeExecutionFinished(run.id)");
   });
 
   it("does not undo a crashed CUTOVER, which is a succeeded migration", () => {
@@ -205,8 +206,15 @@ describe("an unused volume carrying this project's own namespace is reused, not 
   });
 
   it("applies on the relay path too, so transfer mode can't decide whether you get stuck", () => {
-    const relay = src.slice(src.indexOf("const relayOurPrefix"));
-    expect(relay.slice(0, 900)).toContain("name.startsWith(relayOurPrefix)");
-    expect(relay.slice(0, 900)).toContain("name.length > relayOurPrefix.length");
+    // Bounded by the loop's own END, not by a character count — a window sized in
+    // characters silently stops covering the block the moment anything is added to it,
+    // which is exactly what a contract test must not do.
+    const from = src.indexOf("const relayOurPrefix");
+    const to = src.indexOf("conflicts.push(", from);
+    expect(from, "relay conflict block not found").toBeGreaterThan(-1);
+    expect(to, "relay conflict block end not found").toBeGreaterThan(from);
+    const relay = src.slice(from, to);
+    expect(relay).toContain("name.startsWith(relayOurPrefix)");
+    expect(relay).toContain("name.length > relayOurPrefix.length");
   });
 });

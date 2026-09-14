@@ -1,13 +1,15 @@
 ---
 title: DNS API
-description: Connect a DNS provider token so Openship writes your domains' records itself, instead of printing them for you to paste.
+description: Connect a DNS provider, preview each DNS change, and apply a domain's records without copying them by hand.
 ---
 
 import { TypeTable } from 'fumadocs-ui/components/type-table';
 
 Adding a custom domain normally ends with Openship telling you which records to create and waiting for you
-to go and create them. Connect a DNS provider here and it writes them itself: the domain verifies on its own
-and gets its certificate without you leaving the page. In the dashboard this is **Settings → DNS**.
+to create them. Connect a DNS provider and Openship can preview and apply those records for you without
+leaving the page. Applying DNS is always an explicit action: creating a project domain or saving a service
+route never changes the provider's zone silently. In the dashboard, credentials live under
+**Settings → DNS** and each pending domain's records panel contains the apply action.
 
 Cloudflare is the only provider today. The provider list is served by the API rather than hard-coded in the
 dashboard, so `GET /api/dns/providers` is the authoritative answer to "what can I connect?".
@@ -29,6 +31,8 @@ Send a personal access token as a bearer header (`Authorization: Bearer <token>`
 | `POST /api/dns/credentials` | `settings:admin` | Connect a credential. The token is verified before it is stored. |
 | `DELETE /api/dns/credentials/:id` | `settings:admin` | Disconnect a credential. Records already written are left alone. |
 | `POST /api/dns/verify-zone` | `settings:read` | Check whether a connected provider manages a hostname's zone. Creates and changes nothing. |
+| `GET /api/domains/:id/dns/plan` | `domain:read` | Preview the exact record actions for one persisted domain. Creates and changes nothing. |
+| `POST /api/domains/:id/dns/apply` | `domain:write` | Apply that domain's records through the matching connected provider. |
 
 ## Connect a provider
 
@@ -80,7 +84,7 @@ The response separates four outcomes, because they call for different actions:
 
 | `status` | `matched` | Meaning |
 |---|---|---|
-| `matched` | `true` | A connected provider hosts this zone; records for this domain will be written automatically. |
+| `matched` | `true` | A connected provider hosts this zone; the domain's records can be previewed and applied from Openship. |
 | `none` | `false` | We asked, and no connected provider hosts it. You add the records yourself. |
 | `unauthorized` | `false` | A stored token was rejected. Re-connect it — `credentialId` says which. |
 | `unavailable` | `false` | The provider could not be reached (rate limit, outage). Unknown, **not** a sign of misconfiguration. |
@@ -92,28 +96,48 @@ curl -X POST https://your-host/api/dns/verify-zone \
   -d '{"hostname":"app.example.com"}'
 ```
 
-## What happens when you add a domain
+## Add, preview, and apply a domain
 
-With a provider connected, `POST /api/domains` writes the records it would otherwise have only shown you,
-and the response carries an extra `autoDns` object reporting what happened per record:
+`POST /api/domains` persists a pending domain and returns the records it needs. It does not call the DNS
+provider. Service-level custom routes follow the same contract: saving the route creates its pending domain
+row, and that row supplies the `:id` used by the shared plan and apply endpoints.
+
+Preview the exact provider changes before writing anything:
+
+```bash
+curl https://your-host/api/domains/dom_123/dns/plan \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN"
+```
 
 ```json
 {
-  "data": { "id": "dom_123", "hostname": "app.example.com" },
-  "records": { "mode": "selfhosted", "records": [{ "type": "A", "name": "app.example.com", "value": "203.0.113.10" }] },
-  "autoDns": {
-    "provisioned": true,
-    "records": [{ "name": "app.example.com", "type": "A", "outcome": "applied" }]
+  "data": {
+    "status": "matched",
+    "provider": "cloudflare",
+    "zoneName": "example.com",
+    "records": [
+      { "name": "app.example.com", "type": "A", "action": "create", "desired": "203.0.113.10" }
+    ]
   }
 }
 ```
 
-`autoDns` is absent when no connected provider manages the zone — that absence is the signal to show the
-records for the operator to add by hand. When it is present, `provisioned` is `true` only if every record
-landed; a partial write reports `provisioned: false` with a `reason` and the per-record `outcome`, so
-"we wrote them" and "we wrote some of them" are never the same answer.
+The plan classifies every record as `create`, `update`, `adopt`, `in-sync`, or `conflict`. A conflict is
+reported rather than overwritten. `status: "none"` means no connected credential manages the zone, so use
+the records returned by `POST /api/domains` (or `GET /api/domains/:id/records`) and add them manually.
 
-No verification is triggered at that moment. The records are seconds old, a resolver may still be holding a
+Apply the previewed records explicitly:
+
+```bash
+curl -X POST https://your-host/api/domains/dom_123/dns/apply \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN"
+```
+
+The response reports `applied`, `skipped`, or `failed` for every record. `provisioned` is `true` only when
+the matching provider has every actionable record in place; a partial write returns `provisioned: false`
+with a reason and the per-record failures.
+
+No verification is triggered by apply. The records are seconds old, a resolver may still be holding a
 negative answer for the name, and a failed check burns one of Let's Encrypt's per-hostname validation
 failures. The domain stays pending and the `domains:verify-pending` sweep picks it up after its
 ten-minute grace window.

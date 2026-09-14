@@ -88,4 +88,58 @@ describe("createProvisionLock", () => {
     const result = await lock.run(async () => "ok");
     expect(result).toBe("ok");
   });
+
+  it("lets a queued deployment cancel without entering the critical section", async () => {
+    const lock = createProvisionLock("scope-cancel");
+    let releaseFirst!: () => void;
+    const first = lock.run(
+      () => new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      }),
+    );
+    const controller = new AbortController();
+    let entered = false;
+    const second = lock.run(
+      async () => {
+        entered = true;
+      },
+      controller.signal,
+    );
+
+    controller.abort();
+    await expect(second).rejects.toThrow("cancelled");
+    expect(entered).toBe(false);
+
+    releaseFirst();
+    await first;
+  });
+
+  it("keeps ownership after a started cancel until transport quiesces, then admits the next deploy", async () => {
+    const lock = createProvisionLock("scope-started-cancel");
+    const controller = new AbortController();
+    let rejectTransport!: (error: Error) => void;
+    let secondEntered = false;
+    const first = lock.run(
+      () => new Promise<void>((_resolve, reject) => {
+        rejectTransport = reject;
+      }),
+      controller.signal,
+    );
+
+    await vi.waitFor(() => expect(rejectTransport).toBeTypeOf("function"));
+    const second = lock.run(async () => {
+      secondEntered = true;
+      return "next deployment entered";
+    });
+    controller.abort();
+    await Promise.resolve();
+
+    // Abort is only a request once the critical section has started. The next
+    // owner cannot enter until the transport confirms its operation is over.
+    expect(secondEntered).toBe(false);
+    rejectTransport(new Error("SSH operation cancelled after channel close"));
+    await expect(first).rejects.toThrow("after channel close");
+    await expect(second).resolves.toBe("next deployment entered");
+    expect(secondEntered).toBe(true);
+  });
 });

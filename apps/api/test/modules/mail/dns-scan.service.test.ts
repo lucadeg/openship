@@ -623,4 +623,29 @@ describe("synthetic address detection (GH-240)", () => {
       expect(looksSyntheticAddress(ip), ip).toBe(false);
     }
   });
+
+  test("reports a synthetic AAAA answer as unknown instead of blaming the zone", async () => {
+    vi.clearAllMocks();
+    state = {
+      ...BASE_STATE,
+      dnsRecords: {
+        ...BASE_STATE.dnsRecords,
+        aaaa: {
+          type: "AAAA",
+          name: "mail.example.com",
+          value: "2606:4700::1111",
+          required: false,
+        },
+      },
+    };
+    dns.resolve6.mockResolvedValue(["fdfe:dcba:9876::11a"]);
+    dns.resolveTxt.mockImplementation(async (name: string) =>
+      name === "_dmarc.example.com" ? [["v=DMARC1; p=reject"]] : [["v=spf1 mx -all"]],
+    );
+
+    const aaaa = (await scanDns("srv_test")).checks.find((check) => check.key === "aaaa");
+
+    expect(aaaa?.status).toBe("unknown");
+    expect(aaaa?.message).toMatch(/synthetic IPv6/i);
+  });
 });

@@ -10,10 +10,9 @@ import { getAuthMode } from "../../lib/auth-mode";
 import { resolveProductMode } from "../../lib/product-mode";
 import { resolveHostControlEnabled } from "../../lib/host-control";
 
-/** Running server version (apps/api/package.json, via lib/app-version — the same
- *  value sent to the cloud on every call). Lets the dashboard tell a self-hosted
- *  operator their instance is outdated / has a security advisory. The desktop
- *  dashboard uses window.desktop.app.version() instead. */
+/** Running API version (apps/api/package.json, via lib/app-version — the same
+ *  value sent to the cloud on every call). The dashboard sidebar displays it;
+ *  desktop update checks independently use window.desktop.app.version(). */
 
 /**
  * Best-effort friendly name for the local machine. On macOS with Bonjour
@@ -54,7 +53,11 @@ healthRoutes.get("/", (c) => {
   // `cloudMode` lets a migrate-control-plane flow cheaply refuse a multi-tenant
   // SaaS as a transfer TARGET before sending anything (GATE 3 probe) — an
   // instance import --wipe against the SaaS would truncate every tenant.
-  return c.json({ status: "ok", cloudMode: env.CLOUD_MODE === true, timestamp: new Date().toISOString() });
+  return c.json({
+    status: "ok",
+    cloudMode: env.CLOUD_MODE === true,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 /** GET /health/env - static deployment info (no auth, cached by callers). Rate-

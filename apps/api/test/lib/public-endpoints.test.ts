@@ -14,6 +14,7 @@ import {
   mergeServiceRoutingPatch,
   pickCanonicalDomainRow,
   resolveProjectAccess,
+  serviceDomainRowsToPublicEndpoints,
   resolveServicePublicEndpoints,
   resolveServiceRouteHostname,
   resolveStoredPublicEndpoints,
@@ -24,10 +25,20 @@ import {
 import { getRoutingBaseDomain } from "../../src/lib/routing-domains";
 import { normalizeCustomHostname, resolveServiceHostnameLabel } from "@repo/core";
 
-// Build a domain row with only the fields the access resolver reads; the rest
-// of ProjectDomainRow is irrelevant here, so cast rather than fill every column.
-const row = (r: Partial<ProjectDomainRow>): ProjectDomainRow =>
-  ({ verified: false, isPrimary: false, serviceId: null, domainType: "custom", ...r }) as ProjectDomainRow;
+const row = (
+  r: Partial<ProjectDomainRow> & Pick<ProjectDomainRow, "hostname">,
+): ProjectDomainRow => ({
+  hostname: r.hostname,
+  verified: false,
+  isPrimary: false,
+  serviceId: null,
+  targetPort: null,
+  targetPath: null,
+  domainType: "custom",
+  redirectTo: null,
+  redirectStatus: null,
+  ...r,
+});
 
 describe("public endpoint helpers", () => {
   it("uses the primary project custom domain when an explicit route target is provided", () => {
@@ -100,6 +111,65 @@ describe("public endpoint helpers", () => {
     });
 
     expect(endpoints).toEqual([]);
+  });
+
+  it.each([
+    ["explicit non-primary rows", false, "free", "custom"],
+    ["explicit primary rows", true, "free", "custom"],
+    ["legacy non-primary rows", false, null, null],
+    ["legacy primary rows", true, null, null],
+  ] as const)(
+    "sorts custom domains ahead of free subdomains for %s",
+    (_, isPrimary, freeType, customType) => {
+      const endpoints = resolveStoredPublicEndpoints({
+        projectDomains: [
+          row({
+            hostname: `app.${getRoutingBaseDomain()}`,
+            isPrimary,
+            verified: true,
+            targetPort: 3000,
+            domainType: freeType,
+          }),
+          row({
+            hostname: "zz-app.example.com",
+            isPrimary,
+            verified: true,
+            targetPort: 3000,
+            domainType: customType,
+          }),
+        ],
+      });
+
+      expect(endpoints[0]).toMatchObject({
+        customDomain: "zz-app.example.com",
+        domainType: "custom",
+      });
+    },
+  );
+
+  it("uses the same inferred ordering for service-scoped route rows", () => {
+    const endpoints = serviceDomainRowsToPublicEndpoints(
+      [
+        row({
+          hostname: `service.${getRoutingBaseDomain()}`,
+          serviceId: "svc-1",
+          targetPort: 3000,
+          domainType: null,
+        }),
+        row({
+          hostname: "zz-service.example.com",
+          serviceId: "svc-1",
+          targetPort: 3000,
+          domainType: null,
+        }),
+      ],
+      "svc-1",
+    );
+
+    expect(endpoints[0]).toMatchObject({
+      customDomain: "zz-service.example.com",
+      domainType: "custom",
+    });
   });
 
   it("creates a default managed route when a target path is provided", () => {

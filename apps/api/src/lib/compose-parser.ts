@@ -8,6 +8,7 @@
 import { parse as parseYaml } from "yaml";
 import {
   commandToArgv,
+  composeBuildIssues,
   composeMountIssues,
   composeMountToSpec,
   composePortToSpec,
@@ -33,9 +34,18 @@ export interface ComposeService {
   image?: string;
   build?: string;
   dockerfile?: string;
+  /** Per-service Docker build arguments from `build.args`. Kept separate from
+   * runtime environment: two services may build the same Dockerfile with
+   * different args, and those values must reach only their own image build. */
+  buildArgs?: Record<string, string | null>;
   ports: string[];
   dependsOn: string[];
   environment: Record<string, string>;
+  /**
+   * Original Compose expressions, kept only until persistence converts those
+   * keys back to their raw form. Never returned by service read APIs.
+   */
+  environmentTemplates?: Record<string, string>;
   environmentMeta?: Record<string, ComposeEnvironmentMeta>;
   volumes: string[];
   command?: string;
@@ -115,6 +125,8 @@ export interface ComposeEnvironmentMeta {
   /** The file declares this one mandatory (`:?` / `?`). Only set when it also
    *  came back unresolved, i.e. alongside `source: "missing"`. */
   required?: boolean;
+  /** Unresolved variable names inside an embedded expression. Names only. */
+  unresolvedVariables?: string[];
 }
 
 export interface ComposeParseOptions {
@@ -140,7 +152,10 @@ export interface ComposeParseOptions {
  * `required` in `environmentMeta` (the wizard's "Needs value" state) and listed
  * in `missingRequired`.
  */
-export function parseComposeFile(content: string, options: ComposeParseOptions = {}): ComposeParseResult {
+export function parseComposeFile(
+  content: string,
+  options: ComposeParseOptions = {},
+): ComposeParseResult {
   // `merge: true` is required, not cosmetic: the parser defaults to YAML 1.2,
   // where `<<` is an ordinary key. Compose files that hoist shared config into
   // an anchor (`x-environment: &shared` + `<<: *shared`) otherwise lose every
@@ -151,7 +166,14 @@ export function parseComposeFile(content: string, options: ComposeParseOptions =
     return { services: [], volumes: [], networks: [], missingRequired: [], unsupported: [] };
   }
 
-  const interpolationEnv = buildInterpolationEnv(options);
+  // Keep the source-only value separate from the effective deployment value.
+  // Legacy rows have no imported baseline; this is the only reliable way to
+  // recognize the value an older scan stored without confusing a later manual
+  // image override for parser-owned state.
+  const sourceInterpolationEnv = buildInterpolationEnv({
+    envFileContent: options.envFileContent,
+  });
+  const interpolationEnv = { ...sourceInterpolationEnv, ...(options.env ?? {}) };
   const missingRequired = new Map<string, string | undefined>();
   missingRequiredSinks.set(interpolationEnv, missingRequired);
   const rawServices = doc.services ?? {};
@@ -163,21 +185,65 @@ export function parseComposeFile(content: string, options: ComposeParseOptions =
     const svc = def as Record<string, unknown>;
     const build = parseBuild(svc.build, interpolationEnv);
     const environment = parseEnvironment(svc.environment, interpolationEnv);
-    const advanced = parseAdvanced(svc, interpolationEnv, name, unsupported);
-    collectUnsupported(name, svc, unsupported);
+    const rawImage = typeof svc.image === "string" ? svc.image : undefined;
+    const image =
+      rawImage === undefined ? undefined : resolveComposeInterpolation(rawImage, interpolationEnv);
+    const sourceImage =
+      rawImage === undefined
+        ? undefined
+        : resolveComposeInterpolation(rawImage, sourceInterpolationEnv);
+    const imageTemplate =
+      rawImage !== undefined && hasComposeInterpolation(rawImage)
+        ? {
+            expression: rawImage,
+            unresolvedVariables: image!.unresolvedVariables,
+            sourceValue: sourceImage!.value,
+          }
+        : undefined;
+    const parsedAdvanced = parseAdvanced(svc, interpolationEnv, name, unsupported);
+    // An empty marker is meaningful: it says this BUILD declaration came from a
+    // provenance-aware parser. Stamp it even when the current `build:` block has
+    // no `args` key, so removing that key clears previously stored args through
+    // non-authoritative snapshot-safe sync paths. A legacy snapshot has no marker
+    // and therefore still treats an omitted buildArgs field as "no opinion".
+    const hasEnvironmentDeclaration = Object.hasOwn(svc, "environment");
+    const hasBuildDeclaration = Object.hasOwn(svc, "build");
+    const advanced: ComposeAdvanced | undefined =
+      parsedAdvanced || imageTemplate || hasEnvironmentDeclaration || hasBuildDeclaration
+        ? {
+            ...(parsedAdvanced ?? {}),
+            ...(imageTemplate && { imageTemplate }),
+            ...(hasEnvironmentDeclaration && {
+              environmentTemplateKeys: Object.keys(environment.templates),
+            }),
+            ...(hasBuildDeclaration && {
+              buildArgTemplateKeys: build.templateKeys,
+            }),
+          }
+        : undefined;
+    collectUnsupported(name, svc, unsupported, interpolationEnv);
 
     services.push({
       name,
-      image: typeof svc.image === "string" ? interpolateComposeString(svc.image, interpolationEnv) : undefined,
+      image: image?.value,
       build: build.context,
       dockerfile: build.dockerfile,
+      ...(build.args && { buildArgs: build.args }),
       ports: parsePorts(svc.ports, interpolationEnv),
       dependsOn: parseDependsOn(svc.depends_on),
       environment: environment.values,
-      ...(Object.keys(environment.metadata).length > 0 && { environmentMeta: environment.metadata }),
+      ...(Object.keys(environment.templates).length > 0 && {
+        environmentTemplates: environment.templates,
+      }),
+      ...(Object.keys(environment.metadata).length > 0 && {
+        environmentMeta: environment.metadata,
+      }),
       volumes: parseVolumes(svc.volumes, interpolationEnv),
       ...parseCommand(svc.command, interpolationEnv),
-      restart: typeof svc.restart === "string" ? interpolateComposeString(svc.restart, interpolationEnv) : undefined,
+      restart:
+        typeof svc.restart === "string"
+          ? interpolateComposeString(svc.restart, interpolationEnv)
+          : undefined,
       ...(advanced && { advanced }),
     });
   }
@@ -219,12 +285,18 @@ export function describeBlockingComposeFields(
  * in `parseComposeEnvFile`) simply has nowhere to report, which is fine.
  */
 const missingRequiredSinks = new WeakMap<Record<string, string>, Map<string, string | undefined>>();
+const unresolvedVariableSinks = new WeakMap<Record<string, string>, Set<string>>();
+
+function reportUnresolvedVariable(key: string, env: Record<string, string>): void {
+  unresolvedVariableSinks.get(env)?.add(key);
+}
 
 function reportMissingRequired(
   key: string,
   rawWord: string,
   env: Record<string, string>,
 ): { value: string; source: "missing"; variable: string; required: true } {
+  reportUnresolvedVariable(key, env);
   const sink = missingRequiredSinks.get(env);
   // First mention wins: the same variable is often required in several services
   // and the first message is as good as the last.
@@ -234,16 +306,96 @@ function reportMissingRequired(
 
 // ─── Field parsers ───────────────────────────────────────────────────────────
 
-function parseBuild(build: unknown, env: Record<string, string>): { context?: string; dockerfile?: string } {
-  if (typeof build === "string") return { context: interpolateComposeString(build, env) };
-  if (build && typeof build === "object") {
-    const b = build as Record<string, unknown>;
+function parseBuildArgs(
+  raw: unknown,
+  env: Record<string, string>,
+): {
+  args?: Record<string, string | null>;
+  templateKeys: string[];
+} {
+  const args: Record<string, string | null> = {};
+  const templateKeys = new Set<string>();
+
+  const preserveValue = (key: string, value: string): string => {
+    // Evaluate once only to collect `${VAR:?message}` diagnostics. Persist the
+    // expression itself so the final deployment-scoped build environment—not a
+    // scan-time .env preview—decides its value.
+    if (value.includes("$")) {
+      interpolateComposeString(value, env);
+      templateKeys.add(key);
+    } else {
+      // List form permits duplicate keys; the last declaration wins in Compose,
+      // so its provenance must win here too.
+      templateKeys.delete(key);
+    }
+    return value;
+  };
+
+  // Compose accepts both map form (`KEY: value`) and list form
+  // (`KEY=value` / bare `KEY`). A bare/null value imports from Compose's
+  // invocation environment at BUILD time. Values containing Compose expressions
+  // are also kept raw and resolved at build time; eagerly persisting their
+  // scan-time value leaked .env values and made later env edits ineffective.
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      if (typeof entry !== "string") continue;
+      const equals = entry.indexOf("=");
+      const rawKey = equals >= 0 ? entry.slice(0, equals) : entry;
+      const key = interpolateComposeString(rawKey, env).trim();
+      if (!key) continue;
+      if (equals >= 0) args[key] = preserveValue(key, entry.slice(equals + 1));
+      else {
+        args[key] = null;
+        templateKeys.delete(key);
+      }
+    }
+  } else if (raw && typeof raw === "object") {
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (!key) continue;
+      if (value === null || value === undefined) {
+        args[key] = null;
+        templateKeys.delete(key);
+      } else if (["string", "number", "boolean"].includes(typeof value)) {
+        args[key] = preserveValue(key, String(value));
+      }
+    }
+  }
+
+  return {
+    ...(Object.keys(args).length > 0 && { args }),
+    templateKeys: [...templateKeys],
+  };
+}
+
+function parseBuild(
+  build: unknown,
+  env: Record<string, string>,
+): {
+  context?: string;
+  dockerfile?: string;
+  args?: Record<string, string | null>;
+  templateKeys: string[];
+} {
+  if (typeof build === "string") {
     return {
-      context: (typeof b.context === "string" ? interpolateComposeString(b.context, env) : undefined) ?? ".",
-      dockerfile: typeof b.dockerfile === "string" ? interpolateComposeString(b.dockerfile, env) : undefined,
+      context: interpolateComposeString(build, env),
+      templateKeys: [],
     };
   }
-  return {};
+  if (build && typeof build === "object") {
+    const b = build as Record<string, unknown>;
+    const parsedArgs = parseBuildArgs(b.args, env);
+    return {
+      context:
+        (typeof b.context === "string" ? interpolateComposeString(b.context, env) : undefined) ??
+        ".",
+      dockerfile:
+        typeof b.dockerfile === "string" ? interpolateComposeString(b.dockerfile, env) : undefined,
+      args: parsedArgs.args,
+      templateKeys: parsedArgs.templateKeys,
+    };
+  }
+  return { templateKeys: [] };
 }
 
 function parsePorts(ports: unknown, env: Record<string, string>): string[] {
@@ -273,12 +425,17 @@ function parseDependsOn(deps: unknown): string[] {
 function parseEnvironment(
   env: unknown,
   interpolationEnv: Record<string, string>,
-): { values: Record<string, string>; metadata: Record<string, ComposeEnvironmentMeta> } {
-  if (!env) return { values: {}, metadata: {} };
+): {
+  values: Record<string, string>;
+  templates: Record<string, string>;
+  metadata: Record<string, ComposeEnvironmentMeta>;
+} {
+  if (!env) return { values: {}, templates: {}, metadata: {} };
 
   // Array form: ["KEY=value", "KEY2=value2"]
   if (Array.isArray(env)) {
     const values: Record<string, string> = {};
+    const templates: Record<string, string> = {};
     const metadata: Record<string, ComposeEnvironmentMeta> = {};
     for (const item of env) {
       if (typeof item !== "string") continue;
@@ -288,37 +445,71 @@ function parseEnvironment(
         const rawValue = item.slice(eqIdx + 1);
         const resolved = resolveComposeValue(rawValue, interpolationEnv);
         values[key] = resolved.value;
+        recordComposeEnvironmentTemplate(templates, key, rawValue);
         if (resolved.meta) metadata[key] = resolved.meta;
       } else {
         const key = interpolateComposeString(item, interpolationEnv);
         const resolved = resolveBareEnvironmentKey(key, interpolationEnv);
         values[key] = resolved.value;
+        templates[key] = `$${key}`;
         if (resolved.meta) metadata[key] = resolved.meta;
       }
     }
-    return { values, metadata };
+    return { values, templates, metadata };
   }
 
   // Object form: { KEY: value }
   if (typeof env === "object") {
     const values: Record<string, string> = {};
+    const templates: Record<string, string> = {};
     const metadata: Record<string, ComposeEnvironmentMeta> = {};
     for (const [key, val] of Object.entries(env as Record<string, unknown>)) {
       if (val == null) {
         const resolved = resolveBareEnvironmentKey(key, interpolationEnv);
         values[key] = resolved.value;
+        templates[key] = `$${key}`;
         if (resolved.meta) metadata[key] = resolved.meta;
         continue;
       }
 
-      const resolved = resolveComposeValue(String(val), interpolationEnv);
+      const rawValue = String(val);
+      const resolved = resolveComposeValue(rawValue, interpolationEnv);
       values[key] = resolved.value;
+      recordComposeEnvironmentTemplate(templates, key, rawValue);
       if (resolved.meta) metadata[key] = resolved.meta;
     }
-    return { values, metadata };
+    return { values, templates, metadata };
   }
 
-  return { values: {}, metadata: {} };
+  return { values: {}, templates: {}, metadata: {} };
+}
+
+/**
+ * Compose interpolation provenance for an already-parsed environment map.
+ *
+ * The parser and the manual services/sync boundary both use this helper so a
+ * value such as `${APP_KEY}` has exactly one meaning everywhere: resolve it from
+ * the deployment-scoped environment. Compose's `$$` escape remains correct —
+ * `$${APP_KEY}` is recorded as a template and resolves once to the literal
+ * `${APP_KEY}`. Keeping the dollar check here prevents the import parser and the
+ * sync endpoint from growing two subtly different interpolation detectors.
+ */
+function recordComposeEnvironmentTemplate(
+  templates: Record<string, string>,
+  key: string,
+  expression: string,
+): void {
+  if (expression.includes("$")) templates[key] = expression;
+}
+
+export function inferComposeEnvironmentTemplates(
+  environment: Record<string, string> | null | undefined,
+): Record<string, string> {
+  const templates: Record<string, string> = {};
+  for (const [key, expression] of Object.entries(environment ?? {})) {
+    recordComposeEnvironmentTemplate(templates, key, expression);
+  }
+  return templates;
 }
 
 function parseVolumes(vols: unknown, env: Record<string, string>): string[] {
@@ -401,7 +592,13 @@ function parseAdvanced(
   const resources = parseServiceResources(svc, env);
   if (resources) advanced.resources = resources;
 
-  const networkMode = parseNamespaceField(svc.network_mode, "network_mode", env, serviceName, unsupported);
+  const networkMode = parseNamespaceField(
+    svc.network_mode,
+    "network_mode",
+    env,
+    serviceName,
+    unsupported,
+  );
   if (networkMode) advanced.networkMode = networkMode;
 
   const pidMode = parseNamespaceField(svc.pid, "pid", env, serviceName, unsupported);
@@ -547,6 +744,7 @@ function collectUnsupported(
   serviceName: string,
   svc: Record<string, unknown>,
   unsupported: ComposeUnsupportedField[],
+  env: Record<string, string>,
 ): void {
   for (const [key, reason] of Object.entries(UNSUPPORTED_SERVICE_KEYS)) {
     if (!requestsSomething(svc[key])) continue;
@@ -590,6 +788,12 @@ function collectUnsupported(
     });
   }
 
+  for (const issue of composeBuildIssues(svc.build, {
+    interpolate: (value) => interpolateComposeString(value, env),
+  })) {
+    unsupported.push({ service: serviceName, ...issue });
+  }
+
   collectUnsupportedMounts(serviceName, svc.volumes, unsupported);
 }
 
@@ -622,7 +826,10 @@ function parseComposeMemory(raw: unknown): number | undefined {
     return raw > 0 ? Math.floor(raw / (1024 * 1024)) : undefined;
   }
   if (typeof raw !== "string") return undefined;
-  const m = raw.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*([kmgt]?)b?$/);
+  const m = raw
+    .trim()
+    .toLowerCase()
+    .match(/^(\d+(?:\.\d+)?)\s*([kmgt]?)b?$/);
   if (!m) return undefined;
   const value = parseFloat(m[1]!);
   if (!Number.isFinite(value) || value <= 0) return undefined;
@@ -652,8 +859,7 @@ function parseServiceResources(
   svc: Record<string, unknown>,
   env: Record<string, string>,
 ): { cpuCores?: number; memoryMb?: number } | undefined {
-  const interp = (v: unknown) =>
-    typeof v === "string" ? interpolateComposeString(v, env) : v;
+  const interp = (v: unknown) => (typeof v === "string" ? interpolateComposeString(v, env) : v);
 
   let memoryMb = parseComposeMemory(interp(svc.mem_limit));
   let cpuCores = parseComposeCpus(interp(svc.cpus));
@@ -682,7 +888,10 @@ function parseServiceResources(
  * and `disable: true` both collapse to `disable`. Durations are kept as compose
  * strings ("30s") — the runtime converts to nanoseconds at create time.
  */
-function parseHealthcheck(hc: unknown, env: Record<string, string>): ComposeHealthcheck | undefined {
+function parseHealthcheck(
+  hc: unknown,
+  env: Record<string, string>,
+): ComposeHealthcheck | undefined {
   if (!hc || typeof hc !== "object") return undefined;
   const h = hc as Record<string, unknown>;
   const result: ComposeHealthcheck = {};
@@ -707,7 +916,11 @@ function parseHealthcheck(hc: unknown, env: Record<string, string>): ComposeHeal
   }
 
   const dur = (v: unknown): string | undefined =>
-    typeof v === "string" ? interpolateComposeString(v, env) : typeof v === "number" ? String(v) : undefined;
+    typeof v === "string"
+      ? interpolateComposeString(v, env)
+      : typeof v === "number"
+        ? String(v)
+        : undefined;
 
   const interval = dur(h.interval);
   if (interval) result.interval = interval;
@@ -875,6 +1088,7 @@ function interpolateComposeString(input: string, env: Record<string, string>): s
     } else {
       const bare = protectedInput.slice(dollar + 1).match(BARE_VARIABLE_RE);
       if (bare) {
+        if (!Object.hasOwn(env, bare[0])) reportUnresolvedVariable(bare[0], env);
         out += env[bare[0]] ?? "";
         cursor = dollar + 1 + bare[0].length;
         continue;
@@ -885,6 +1099,136 @@ function interpolateComposeString(input: string, env: Record<string, string>): s
   }
 
   return (out + protectedInput.slice(cursor)).replaceAll(escapedDollar, "$");
+}
+
+export interface ComposeInterpolationResolution {
+  value: string;
+  /** Variables whose selected Compose branch had no value in this scope. */
+  unresolvedVariables: string[];
+  /** The unresolved subset declared mandatory with `:?` / `?`. */
+  missingRequired: ComposeMissingVariable[];
+}
+
+/**
+ * Resolve one Compose scalar while retaining enough diagnostics for a later
+ * deployment stage to fail closed. Unlike the environment-map helper below,
+ * this also reports ordinary `${VAR}` / `$VAR` misses: an empty runtime env is
+ * legal, but an empty image tag must never be handed to a registry client that
+ * silently rewrites it to `latest`.
+ */
+export function resolveComposeInterpolation(
+  input: string,
+  env: Record<string, string>,
+): ComposeInterpolationResolution {
+  const parentRequired = missingRequiredSinks.get(env);
+  const parentUnresolved = unresolvedVariableSinks.get(env);
+  const missingRequired = new Map<string, string | undefined>();
+  const unresolved = new Set<string>();
+  missingRequiredSinks.set(env, missingRequired);
+  unresolvedVariableSinks.set(env, unresolved);
+
+  try {
+    return {
+      value: interpolateComposeString(input, env),
+      unresolvedVariables: [...unresolved],
+      missingRequired: [...missingRequired].map(([variable, message]) => ({
+        variable,
+        ...(message && { message }),
+      })),
+    };
+  } finally {
+    if (parentRequired) {
+      missingRequiredSinks.set(env, parentRequired);
+      for (const [key, message] of missingRequired) {
+        if (!parentRequired.has(key)) parentRequired.set(key, message);
+      }
+    } else {
+      missingRequiredSinks.delete(env);
+    }
+    if (parentUnresolved) {
+      unresolvedVariableSinks.set(env, parentUnresolved);
+      for (const key of unresolved) parentUnresolved.add(key);
+    } else {
+      unresolvedVariableSinks.delete(env);
+    }
+  }
+}
+
+function hasComposeInterpolation(input: string): boolean {
+  return /\$\$|\$\{|\$[A-Za-z_]/.test(input);
+}
+
+function interpolateComposeStringWithMissing(
+  input: string,
+  env: Record<string, string>,
+): { value: string; missing: Map<string, string | undefined> } {
+  const resolution = resolveComposeInterpolation(input, env);
+  const missing = new Map<string, string | undefined>();
+  for (const { variable, message } of resolution.missingRequired) {
+    missing.set(variable, message);
+  }
+  return { value: resolution.value, missing };
+}
+
+export interface ComposeEnvironmentResolution {
+  env: Record<string, string>;
+  missingRequired: ComposeMissingVariable[];
+}
+
+/**
+ * Resolve persisted Compose environment expressions against the env that will
+ * actually reach a service. Expressions may refer to another templated key, so
+ * iterate to a fixed point instead of depending on YAML key order. Required
+ * variables are reported only after convergence; callers can fail the service
+ * without ever logging a value.
+ */
+export function resolveComposeEnvironmentTemplates(
+  env: Record<string, string>,
+  templates: Record<string, string>,
+): ComposeEnvironmentResolution {
+  const resolved = { ...env };
+  const entries = Object.entries(templates);
+  const evaluate = (key: string, expression: string) => {
+    // A self-reference reads the lower-layer value, not the result we produced
+    // on the previous fixed-point pass (`A=${A}x` must not grow x forever).
+    const scope = { ...resolved };
+    if (Object.hasOwn(env, key)) scope[key] = env[key]!;
+    else delete scope[key];
+    return interpolateComposeString(expression, scope);
+  };
+
+  for (let pass = 0; pass <= entries.length; pass++) {
+    let changed = false;
+    for (const [key, expression] of entries) {
+      const value = evaluate(key, expression);
+      if (resolved[key] !== value) {
+        resolved[key] = value;
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+
+  const missing = new Map<string, string | undefined>();
+  // One final stable pass records only requirements that remain unresolved.
+  for (const [key, expression] of entries) {
+    const scope = { ...resolved };
+    if (Object.hasOwn(env, key)) scope[key] = env[key]!;
+    else delete scope[key];
+    const final = interpolateComposeStringWithMissing(expression, scope);
+    resolved[key] = final.value;
+    for (const [variable, message] of final.missing) {
+      if (!missing.has(variable)) missing.set(variable, message);
+    }
+  }
+
+  return {
+    env: resolved,
+    missingRequired: [...missing].map(([variable, message]) => ({
+      variable,
+      ...(message && { message }),
+    })),
+  };
 }
 
 function resolveComposeValue(
@@ -923,7 +1267,7 @@ function resolveComposeValue(
     };
   }
 
-  const value = interpolateComposeString(input, env);
+  const { value, missing } = interpolateComposeStringWithMissing(input, env);
   if (!input.includes("$")) return { value };
 
   return {
@@ -932,6 +1276,10 @@ function resolveComposeValue(
       source: "interpolated",
       resolvedValue: value,
       expression: input,
+      ...(missing.size > 0 && {
+        required: true,
+        unresolvedVariables: [...missing.keys()],
+      }),
     },
   };
 }
@@ -974,7 +1322,12 @@ function resolveInterpolationExpression(
 
   switch (operator) {
     case undefined:
-      return { value: hasValue ? value : "", source: hasValue ? "env-file" : "missing", variable: key };
+      if (!hasValue) reportUnresolvedVariable(key, env);
+      return {
+        value: hasValue ? value : "",
+        source: hasValue ? "env-file" : "missing",
+        variable: key,
+      };
     case ":-":
       if (isNonEmpty) return { value, source: "env-file", variable: key };
       {
@@ -1006,6 +1359,7 @@ function resolveInterpolationExpression(
         return { value: replacement, source: "default", variable: key, defaultValue: replacement };
       }
     default:
+      reportUnresolvedVariable(key, env);
       return { value: "", source: "missing", variable: key };
   }
 }

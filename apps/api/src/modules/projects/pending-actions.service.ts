@@ -31,7 +31,7 @@
 
 import { repos } from "@repo/db";
 import type { Deployment } from "@repo/db";
-import { compileVercelRouting } from "@repo/adapters";
+import { compileVercelRouting, type PortStopTarget } from "@repo/adapters";
 import * as sessionManager from "../deployments/session-manager";
 // Leaf import, not the ./compose barrel — this needs one pure predicate over
 // `project.framework`, not the whole compose pipeline in the graph.
@@ -127,7 +127,10 @@ type DeployMeta = {
  * The resolution is redeploy, not "resume" — `onFailure` destroys the build
  * artifact on every failure path, so there is nothing to resume. Redeploying
  * re-runs preflight, which raises the port prompt again; that prompt is then a
- * `prompt` item in this same list, with `free_port` as one of its resolutions.
+ * `prompt` item in this same list, carrying whichever action ids it actually offers —
+ * `free_port` when there is something Openship may stop, `re_check` when the owner was
+ * identified and refused (see `portStopTarget`), which is why this copy never names a
+ * button of its own.
  */
 function buildDeployBlocked(dep: Deployment): PendingAction | null {
   const details = (dep.errorDetails ?? {}) as {
@@ -135,6 +138,10 @@ function buildDeployBlocked(dep: Deployment): PendingAction | null {
     pid?: number;
     command?: string;
     isManagedDeployment?: boolean;
+    /** "none" = the port's owner was identified but is not something Openship will
+     *  stop, so redeploying will NOT offer to free it (see portStopTarget). */
+    stopTarget?: PortStopTarget;
+    containerName?: string;
   };
   const redeploy: PendingActionResolution = {
     label: "Redeploy",
@@ -144,25 +151,46 @@ function buildDeployBlocked(dep: Deployment): PendingAction | null {
 
   if (dep.errorCode === "PORT_IN_USE") {
     // `port` can be absent (a row classified before details were persisted), and
-    // `isManagedDeployment` is THREE-valued: the nohup supervisor's PORT_IN_USE
-    // carries only {port, pid, command}, so `undefined` means "we didn't probe
+    // `isManagedDeployment` is THREE-valued: `undefined` means "we didn't probe
     // ownership" — NOT "not ours". Claiming a process isn't Openship's when we
     // don't know would tell the operator it's unsafe to free something that is
-    // in fact a stale deployment of their own.
+    // in fact a stale deployment of their own. A container with no `openship.*`
+    // label lands here too: it may be one adopted in place by the docker migration.
     const subject = details.port ? `Port ${details.port}` : "The port";
-    const holder = details.command ?? "another process";
+    const holder = details.containerName ?? details.command ?? "another process";
+
+    // The deploy identified the owner and refused to offer it as a stop target, so
+    // "redeploy and choose Free Port" would be a lie — that button won't be there.
+    // The message the deploy failed with already names the owner and the way out.
+    // The stop the operator will be offered, named the way the deploy prompt names it —
+    // the button says "Stop Container" for a docker publish and "Stop Service" for a
+    // systemd unit, so this must not promise a literal "Free Port & Continue".
+    const offer =
+      details.stopTarget === "container"
+        ? "stop that container"
+        : details.stopTarget === "unit"
+          ? "stop that service"
+          : "free the port";
+    // The deploy identified the owner and refused to offer it as a stop target, so a
+    // redeploy raises no free action at all — promising one would send the operator to a
+    // button that will not be there. The deploy's own message already names the owner and
+    // the way out, so prefer it verbatim.
     const ownership =
-      details.isManagedDeployment === true
+      details.stopTarget === "none"
+        ? (dep.errorMessage ??
+          `${subject} is held by ${holder}, which Openship will not stop for you. ` +
+            `Free the port on the server, or deploy on a different port, then redeploy.`)
+        : details.isManagedDeployment === true
         ? `${subject} is held by a previous Openship deployment (${holder}). ` +
-          `Redeploy and choose "Free Port & Continue" when asked, and Openship will stop it first.`
+          `Redeploy and confirm the prompt, and Openship will ${offer} first.`
         : details.isManagedDeployment === false
           ? `${subject} is held by ${holder}, which Openship does not manage. ` +
             `Stop it on the server or change the app's port, then redeploy. ` +
-            `Redeploying will offer to free the port, but that would kill a process ` +
+            `Redeploying will offer to ${offer}, but that stops something ` +
             `Openship didn't start.`
           : `${subject} is held by ${holder}. Openship could not tell whether that is ` +
             `one of its own previous deployments, so check before freeing it — ` +
-            `redeploying will offer to, and that kills the process either way.`;
+            `redeploying will offer to ${offer} either way.`;
     return {
       id: `deploy_blocked:${dep.id}`,
       kind: "deploy_blocked",

@@ -41,6 +41,7 @@ import type { SystemManager } from "./system/setup";
 import type { DockerConnectionOptions } from "./runtime/docker";
 import type { BareRuntimeOptions } from "./runtime/bare";
 import type { NginxProviderOptions } from "./infra/nginx";
+import { EDGE_CONTAINER_NAME } from "./system/port-owner";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -426,7 +427,7 @@ async function createSelfHostedPlatform(config: PlatformConfig): Promise<Platfor
   // explicit flag, falling back to the old inference. See PlatformConfig.localHost.
   const targetIsThisMachine = !config.ssh && (config.localHost ?? !config.executor);
   const useDockerEdge = targetIsThisMachine && process.env.OPENSHIP_EDGE_MODE === "docker";
-  const edgeContainer = process.env.OPENSHIP_EDGE_CONTAINER?.trim() || "openship-edge";
+  const edgeContainer = process.env.OPENSHIP_EDGE_CONTAINER?.trim() || EDGE_CONTAINER_NAME;
 
   // Executor - use injected (managed/pooled) executor, or create a fresh one
   let executor: CommandExecutor;

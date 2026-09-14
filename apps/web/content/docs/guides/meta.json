@@ -2,6 +2,7 @@
   "title": "Guides",
   "pages": [
     "deploy-from-github",
+    "self-hosted-github-app",
     "deploy-local-folder",
     "deploy-template-or-url",
     "add-an-app",

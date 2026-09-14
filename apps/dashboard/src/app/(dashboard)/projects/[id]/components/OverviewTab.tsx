@@ -27,7 +27,6 @@ import {
 export const OverviewTab = () => {
   const {
     projectData,
-    gitData,
     buildData,
     setActiveTab,
     id,
@@ -279,15 +278,21 @@ export const OverviewTab = () => {
             value={projectData.gitBranch || projectData.branch || "main"}
             loading={showProjectInfoSkeleton}
           />
+          {/* Both read the /info payload, NOT the Source tab's `gitData`: that
+              slice is fetched only when GitSettings mounts (it also pulls recent
+              commits from GitHub), so on a cold load straight to Overview it was
+              undefined — and every project whose pushes really do deploy rendered
+              "auto-deploy off". `autoDeploy` is the column webhook-push.ts gates
+              on, so this row now shows what actually governs a push. */}
           <StatusItem
             label={t.projects.overview.autoDeploy}
-            active={!!gitData?.autoDeployEnabled}
+            active={!!projectData.autoDeploy}
             loading={showProjectInfoSkeleton}
             t={t}
           />
           <StatusItem
             label={t.projects.overview.webhook}
-            active={!!gitData?.webhookActive}
+            active={!!projectData.webhookActive}
             loading={showProjectInfoSkeleton}
             t={t}
           />

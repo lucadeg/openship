@@ -224,6 +224,19 @@ describe("when the cached row is allowed to answer", () => {
     expect(items).toEqual([]);
   });
 
+  it("polls fresh upstream when cache row was cleared by deployment success", async () => {
+    const p = project();
+    // Cache was invalidated on deploy, so no cached row exists for this project:
+    setup([p], []);
+    resolveUpstreamDrift.mockResolvedValue(upstream(p, NEWER));
+    deploymentRepo.findById.mockResolvedValue({ id: "dep_live", commitSha: NEWER });
+
+    const items = await listOrganizationUpdates(ctx, { behindOnly: true });
+
+    expect(resolveUpstreamDrift).toHaveBeenCalledTimes(1);
+    expect(items).toEqual([]);
+  });
+
   it("re-polls once the row has outlived the scan interval", async () => {
     const p = project();
     setup([p], [cachedRow({ key: commitSourceKey(p), latestSha: SHIPPED, ageMs: 7 * HOUR })]);

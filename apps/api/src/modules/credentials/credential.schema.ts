@@ -37,7 +37,7 @@ export type TCreateCredentialBody = Static<typeof CreateCredentialBody>;
 export const UpdateCredentialBody = Type.Object({
   name: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
   selector: Type.Optional(Type.Union([Type.String({ maxLength: 253 }), Type.Null()])),
-  /** Omit a secret to keep the stored one — see the service's "leave blank to keep". */
+  /** Omit a secret to keep it only when the credential selector is unchanged. */
   values: Type.Optional(CredentialValues),
 });
 

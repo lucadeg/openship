@@ -2,7 +2,13 @@ import { stat, readdir, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { isIgnoredRepoPath, type RepoTreeEntry } from "../../lib/project-root-detector";
 import type { ProjectReader } from "./project-reader";
-import { resolveFromReader, type ProjectInfo, type ResolveOptions } from "./prepare.service";
+import {
+  resolveFromReader,
+  resolveSourceEnvFromReader,
+  type ProjectInfo,
+  type ProjectSourceEnv,
+  type ResolveOptions,
+} from "./prepare.service";
 
 // Local-filesystem project resolution. Loaded ONLY via dynamic import from the
 // non-cloud branch of resolveProjectInfo, so node:fs never enters the cloud
@@ -34,7 +40,7 @@ async function listLocalTree(dirPath: string): Promise<RepoTreeEntry[]> {
 function createLocalReader(dirPath: string): ProjectReader {
   let treePromise: Promise<RepoTreeEntry[]> | null = null;
 
-  const absolutePathFor = (path: string) => path ? join(dirPath, path) : dirPath;
+  const absolutePathFor = (path: string) => (path ? join(dirPath, path) : dirPath);
 
   return {
     listDirectory: async (path: string) => {
@@ -69,6 +75,17 @@ function createLocalReader(dirPath: string): ProjectReader {
       return treePromise;
     },
   };
+}
+
+/** Read only openship.json + the selected root's .env, without detecting or
+ * parsing a Compose topology. */
+export async function resolveSourceEnvFromLocal(
+  dirPath: string,
+  rootDirectory = "",
+): Promise<ProjectSourceEnv> {
+  const st = await stat(dirPath);
+  if (!st.isDirectory()) throw new Error("Path is not a directory");
+  return resolveSourceEnvFromReader(createLocalReader(dirPath), rootDirectory);
 }
 
 export async function resolveFromLocal(

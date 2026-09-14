@@ -50,7 +50,7 @@ belongs to your organization on every call — a `mail_server` grants SSH-level 
 
 | Method & path | Permission | What it does |
 |---|---|---|
-| `GET /api/mail/health/:serverId` | `mail_server:read` | Live systemd status of every mail-core daemon. |
+| `GET /api/mail/health/:serverId` | `mail_server:read` | Mail daemons, outbound delivery, and cached public-port reachability (TCP 25/465/587/993). |
 | `POST /api/mail/credentials/postmaster` | `mail_server:write` | Rotate the postmaster account password. |
 
 ### Admin — domains
@@ -144,6 +144,16 @@ The stream emits `step_start`, `log`, and `step_done` events per step, plus thes
   at your VPS provider, call `POST /api/mail/setup/ptr-ack`, and resume.
 - `complete` — carries `domain`, `webmailUrl`, and `adminUrl`.
 - `error` — carries `message` and (when resumable) `resumeStep`.
+
+The terminal `verify_reachability` step reads the target's TCP listener table and then connects from the API
+host to the public-DNS address on 25, 465, 587, and 993. Listener failures and off-box failures remain distinct
+in the result. A measured failure blocks completion and points at both the host firewall and the provider-level
+firewall/security group/security list/NSG; an unavailable probe is returned as a non-blocking warning rather
+than being invented as an outage.
+
+`GET /api/mail/health/:serverId` reuses one public-port sweep for 60 seconds. Pass
+`?refreshReachability=1` after changing firewall rules to force an immediate recheck; concurrent requests are
+still coalesced into one bounded four-port probe.
 
 ## Acknowledge DNS / PTR
 

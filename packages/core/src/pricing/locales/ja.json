@@ -24,20 +24,20 @@
   "features": {
     "everythingIn": "{inherited} の全機能に加えて:",
     "staticOnly": "静的サイトのみ — SSG、SPA、素の HTML",
-    "anyWorkload": "何でも動かせる — コンテナ、Compose スタック、ワーカー",
-    "managedServices": "マネージドの Postgres と Redis、アプリカタログすべて",
+    "anyWorkload": "何でも動かせる — コンテナ、Compose、ワーカー、Postgres、Redis",
+    "runningServices": "同時に稼働するアプリ・データベース・ワーカー {runningServices} 個",
+    "computeMinutes": "毎月 {computeMinutes} コンピュート分",
     "buildMinutes": "毎月 {buildMinutes} 分のビルド時間",
-    "credits": "毎月 {credits} コンピュートクレジット",
+    "power": "アプリ 1 つあたり最大 {powerCpu} vCPU と {powerRamGb} GB RAM",
+    "projects": "プロジェクト {maxProjects} 個",
+    "projectsUnlimited": "プロジェクトは無制限",
     "freeSubdomains": "無料の {freeDomainSuffix} サブドメイン {freeSubdomains} 個",
     "freeSubdomainsUnlimited": "無料の {freeDomainSuffix} サブドメインが無制限",
+    "gitDeploys": "GitHub、GitLab、任意の Git リモートからデプロイ",
     "customDomains": "カスタムドメインは無制限、TLS 込み",
+    "deployLogs": "ビルドとデプロイのライブログ",
+    "auditLog": "すべての変更を記録する監査ログ",
     "unlimitedSeats": "チームメンバーは無制限 — 人数課金は一切なし",
-    "previewDeploys": "プッシュごとにプレビューデプロイ",
-    "backups": "日次バックアップとポイントインタイムリカバリ",
-    "observability": "ライブログ、メトリクス、ヘルスアラート",
-    "mailServer": "メールサーバー内蔵 — SMTP、IMAP、ウェブメール",
-    "auditLog": "保持期間を延長した監査ログ",
-    "sharedChannel": "Slack または Discord の共有チャンネル",
     "sso": "SSO と SAML",
     "customLimits": "契約ごとに調整するカスタムの上限",
     "dedicatedInfra": "専用インフラと専用リージョン",
@@ -50,12 +50,7 @@
     "selfHostedUnlimited": "デプロイ、プロジェクト、サーバー、ドメインすべて無制限",
     "selfHostedServices": "マネージドサービスはすべて利用可能 — Postgres、Redis、メール",
     "selfHostedClients": "CLI、Web、デスクトップ — バックエンドは一つ",
-    "selfHostedFreeSubdomains": "Openship Cloud に接続すると、無料の {freeDomainSuffix} サブドメインが {freeSubdomains} 個",
-    "runningServices": "同時に稼働するサービス {runningServices} 個 — アプリ、データベース、ワーカー",
-    "power": "サービス 1 つあたり最大 {powerCpu} vCPU と {powerRamGb} GB RAM",
-    "projects": "プロジェクト {maxProjects} 個",
-    "projectsUnlimited": "プロジェクトは無制限",
-    "meteredCredits": "コンピュート、帯域幅、ストレージはすべて毎月のクレジットから消費されます"
+    "selfHostedFreeSubdomains": "Openship Cloud に接続すると、無料の {freeDomainSuffix} サブドメインが {freeSubdomains} 個"
   },
   "selfHosted": {
     "name": "セルフホスト",
@@ -65,9 +60,9 @@
     "cta": "セルフホストを始める"
   },
   "creditPacks": {
-    "pack_5k": "{credits} クレジット",
-    "pack_25k": "{credits} クレジット",
-    "pack_100k": "{credits} クレジット"
+    "pack_5k": "{computeMinutes} コンピュート分",
+    "pack_25k": "{computeMinutes} コンピュート分",
+    "pack_100k": "{computeMinutes} コンピュート分"
   },
   "ui": {
     "perMonth": "/月",
@@ -83,6 +78,8 @@
     "billedMonthly": "月額請求、いつでもキャンセル可能",
     "campaignBadge": "{percentOff}% オフ",
     "campaignEnds": "キャンペーンは {date} まで",
-    "wasPrice": "通常 {price}"
+    "wasPrice": "通常 {price}",
+    "standardTitle": "すべてのプランに含まれるもの",
+    "creditPackNote": "小規模アプリ約 {appHours} 時間、またはビルド {buildMinutes} 分"
   }
 }

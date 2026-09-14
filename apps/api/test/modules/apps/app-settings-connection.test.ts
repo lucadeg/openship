@@ -238,6 +238,27 @@ describe("persisted route rows are read verbatim", () => {
 
     expect(valueOf(outputs, "url")).toBe("https://a.example.com");
   });
+
+  it("prefers an inferred custom route when tied rows contest a port", async () => {
+    listDomains.mockResolvedValue([
+      domainRow({
+        serviceId: "svc-backend",
+        hostname: "convex-app.opsh.io",
+        isPrimary: false,
+        domainType: "free",
+      }),
+      domainRow({
+        serviceId: "svc-backend",
+        hostname: "zz-convex.example.com",
+        isPrimary: false,
+        domainType: null,
+      }),
+    ]);
+
+    const { outputs } = await getAppConnectionView(ctx, "proj1");
+
+    expect(valueOf(outputs, "url")).toBe("https://zz-convex.example.com");
+  });
 });
 
 describe("port-only host is never invented", () => {

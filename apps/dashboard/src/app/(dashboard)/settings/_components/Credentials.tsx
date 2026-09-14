@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, CheckCircle2, KeyRound, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
-import type { CredentialProvider } from "@repo/core";
+import { normalizeCredentialSelector, type CredentialProvider } from "@repo/core";
 
 import { credentialsApi, type Credential } from "@/lib/api";
 import { getApiErrorMessage } from "@/lib/api/client";
@@ -251,9 +251,9 @@ export function Credentials() {
 /**
  * The add/edit form for ONE provider, rendered from its declared fields.
  *
- * On edit a secret input starts EMPTY with a "leave blank to keep" placeholder, and a blank
- * secret is omitted from the payload — the server then keeps what it has. That is why the
- * stored value is never sent to the browser in the first place.
+ * On edit a secret input starts EMPTY. A blank secret keeps the stored value only while
+ * the selector is unchanged; moving a credential to another destination requires the
+ * operator to enter the secret again. The stored value is never sent to the browser.
  */
 function CredentialForm({
   provider,
@@ -281,12 +281,17 @@ function CredentialForm({
     return seed;
   });
   const [saving, setSaving] = useState(false);
+  const selectorChanged = Boolean(
+    existing &&
+    provider.selector &&
+    normalizeCredentialSelector(provider, selector) !== existing.selector,
+  );
 
   const submit = async () => {
     setSaving(true);
     try {
-      // Drop blanks. For a secret on edit this means "keep the stored one"; for a readable
-      // field it means "unchanged". Either way `""` would be a different, wrong request.
+      // Drop blanks. For a secret on edit the server keeps the stored value only when the
+      // selector is unchanged; readable blanks mean "unchanged" in either case.
       const payload: Record<string, string> = {};
       for (const [k, v] of Object.entries(values)) if (v !== "") payload[k] = v;
 
@@ -371,11 +376,13 @@ function CredentialForm({
               type={field.type === "secret" ? "password" : "text"}
               value={values[field.key] ?? ""}
               onChange={(e) => setValues((v) => ({ ...v, [field.key]: e.target.value }))}
-              // A stored secret is never sent to the browser, so on edit the placeholder is
-              // the only thing that can say it is set — without it a saved credential looks
-              // like an empty field and the operator retypes it needlessly.
+              // The stored secret never reaches the browser. While the destination is
+              // unchanged, the placeholder says it is set; changing the destination removes
+              // that promise because the secret must be entered again.
               placeholder={
-                field.type === "secret" && existing ? copy.secretKeptPlaceholder : (field.placeholder ?? "")
+                field.type === "secret" && existing && !selectorChanged
+                  ? copy.secretKeptPlaceholder
+                  : (field.placeholder ?? "")
               }
               autoComplete={field.type === "secret" ? "new-password" : "off"}
               className={`${inputClass}${field.type === "secret" ? " font-mono" : ""}`}

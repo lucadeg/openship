@@ -96,9 +96,18 @@ export function BillingPlansRoute({ currentPlan }: { currentPlan: PlanTierId }) 
     );
   }
 
+  // The Plans tab is where you BUY something, so the $0 tier has no place in it:
+  // it is nothing to buy, and for the overwhelming majority of viewers it is the
+  // plan they are already on — a card whose only button says "Current plan".
+  // Where you stand is stated on Overview and in the allowance cards above.
+  // Filtered on price rather than the id `free` so any future $0 tier is covered
+  // by the same rule. Downgrading is not lost: it happens by cancelling, which
+  // Stripe's portal owns, and `subscription.deleted` drops the org back to free.
+  const purchasable = payload.plans.filter((p) => p.price.monthly !== 0);
+
   return (
     <PricingCards
-      plans={payload.plans}
+      plans={purchasable}
       ui={payload.ui}
       currentPlan={currentPlan}
       onSelectPlan={handleSelectPlan}

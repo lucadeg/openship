@@ -6,15 +6,15 @@
  * marked `skipped` rather than rebuilt.
  *
  * "forceAll" overrides smart routing and rebuilds every service. We
- * derive it from three signals:
+ * derive it from four signals:
  *
  *   1. `payload.forced === true` (a `git push --force`). The commit
  *      list is unreliable in that case; the caller should still call
  *      `compareCommits(before, after)` if it cares about the file set.
  *   2. `head_commit.message` contains `[force]`, `[force-deploy]`, or
  *      `[redeploy-all]` (case-insensitive).
- *   3. A root-config file changed (Dockerfile, compose, package.json,
- *      .dockerignore at repo root) — any of these affect every service.
+ *   3. A repository-wide build input changed (Dockerfile, compose,
+ *      manifests, lockfiles, workspace config) — these affect every service.
  *   4. For monorepos (`framework === "monorepo"` or compose-style
  *      projects) a `packages/**` file changed — v1 assumes any shared
  *      package may affect every sub-app and forces all.
@@ -42,7 +42,7 @@ export interface CompareCommitsFn {
     repo: string,
     base: string,
     head: string,
-  ): Promise<{ files: string[] } | null>;
+  ): Promise<{ files: string[]; truncated?: boolean } | null>;
 }
 
 interface ExtractOptions {
@@ -77,14 +77,40 @@ const ROOT_CONFIG_FILES = new Set([
   "compose.yml",
   "compose.yaml",
   ".dockerignore",
+  ".npmrc",
+  ".yarnrc",
+  ".yarnrc.yml",
   "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "yarn.lock",
+  "bun.lock",
+  "bun.lockb",
+  "turbo.json",
+  "nx.json",
+  "rush.json",
+  "tsconfig.json",
+  "tsconfig.base.json",
+  "Cargo.toml",
+  "Cargo.lock",
+  "go.work",
+  "go.work.sum",
+  "pyproject.toml",
+  "uv.lock",
+  "pom.xml",
+  "settings.gradle",
+  "settings.gradle.kts",
+  "gradle.properties",
+  "mix.exs",
+  "mix.lock",
 ]);
 
 function normalizeSharedPrefix(p: string): string {
   // Accept both "packages" and "packages/**"; normalize to "packages/".
   let s = p.trim();
   if (!s) return "";
-  s = s.replace(/\*+$/g, "");      // strip trailing *'s
+  s = s.replace(/\*+$/g, ""); // strip trailing *'s
   s = s.replace(/\*+\/?$/g, "");
   if (!s.endsWith("/")) s += "/";
   return s;
@@ -114,19 +140,13 @@ export async function extractChangedFiles(
   // GitHub clamps payload.commits at 20 today; treat >= 20 as
   // "potentially truncated" so a future bump (or an off-by-one in the
   // docs) doesn't silently strand commits.
-  if (
-    commits.length >= 20 &&
-    opts.compareCommits &&
-    owner &&
-    repo &&
-    before &&
-    after
-  ) {
+  if (commits.length >= 20 && opts.compareCommits && owner && repo && before && after) {
     // commits[] is clamped to 20 per push — fall back to compare API
     // so smart routing sees the full set.
     const compare = await opts.compareCommits(owner, repo, before, after);
     if (compare) {
       files = new Set(compare.files);
+      truncated = compare.truncated === true;
     } else {
       // compare failed → degrade to the truncated commits[] union and
       // signal upstream that the deploy may be missing some changes.
@@ -231,4 +251,24 @@ export function serviceMatchesChanges(
     if (f === normalized || f.startsWith(prefix)) return true;
   }
   return false;
+}
+
+/**
+ * Decide whether a commit can affect a project rooted below the repository root.
+ * Besides files inside the project itself, repository-wide build inputs and the
+ * project's explicitly configured shared paths are part of its effective build
+ * context. Keeping this rule beside webhook routing prevents the update banner
+ * and auto-deploy from disagreeing about the same change set.
+ */
+export function projectMatchesChanges(
+  rootDirectory: string,
+  changedFiles: Iterable<string>,
+  monorepoSharedPaths?: string[] | null,
+): boolean {
+  const files = Array.from(changedFiles);
+  if (serviceMatchesChanges(rootDirectory, files)) return true;
+  return classifyChangedFiles(files, {
+    isMonorepo: true,
+    monorepoSharedPaths,
+  }).forceAll;
 }

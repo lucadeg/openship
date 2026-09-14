@@ -32,6 +32,7 @@ import { runHealthWatch, pruneResolvedIncidents } from "../monitoring/health-wat
 import { runUsageSampleSweep } from "../monitoring/usage-sampler";
 import { runAnalyticsScrapeSweep } from "../system/analytics-scraper";
 import { runDueOnceJobs } from "./job-command";
+import { runBuildCacheGcSweep } from "../deployments/build-cache-gc";
 import type { JobSummary } from "../../lib/system-jobs";
 
 export interface SystemJobDef {
@@ -382,6 +383,23 @@ export const SYSTEM_JOB_DEFS: SystemJobDef[] = [
     // delayed schedule, so we poll every minute.
     defaultCron: "* * * * *",
     run: async () => runDueOnceJobs(),
+  },
+  {
+    key: "build-cache:gc",
+    label: "Docker build-cache garbage collection",
+    // Build cache is daemon-wide and has no reliable project label. Keep a 5 GiB
+    // LRU budget on each Docker host instead of coupling it to image retention.
+    defaultCron: "37 4 * * *",
+    available: () => platform().target !== "cloud",
+    run: async () => {
+      const r = await runBuildCacheGcSweep();
+      return {
+        scanned: r.hostsScanned,
+        removed: r.cachesDeleted,
+        bytesReclaimed: r.bytesReclaimed,
+        failed: r.errors,
+      };
+    },
   },
   {
     key: "jobs:run-prune",

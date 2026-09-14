@@ -14,11 +14,24 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  */
 
 const withExecutor = vi.fn();
+const reachabilityMocks = vi.hoisted(() => ({
+  check: vi.fn(),
+}));
+
 vi.mock("../../../src/lib/ssh-manager", () => ({
   sshManager: {
     withExecutor: (id: string, fn: (e: unknown) => unknown) => withExecutor(id, fn),
   },
 }));
+vi.mock("../../../src/modules/mail/mail-port-reachability.service", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("../../../src/modules/mail/mail-port-reachability.service")
+  >();
+  return {
+    ...actual,
+    checkMailPortReachability: reachabilityMocks.check,
+  };
+});
 
 vi.mock("../../../src/lib/permission", () => ({
   permission: { assert: vi.fn().mockResolvedValue(undefined) },
@@ -34,6 +47,7 @@ import { getHealth } from "../../../src/modules/mail/mail.controller";
 import { forgetMailEngine } from "../../../src/modules/mail/mail-engine";
 import type { MailComponentHealth } from "../../../src/modules/mail/mail-health.service";
 import type { MailDeliveryHealth } from "../../../src/modules/mail/mail-delivery.service";
+import type { MailPortReachability } from "../../../src/modules/mail/mail-port-reachability.service";
 
 const SERVER = "srv_1";
 
@@ -91,9 +105,12 @@ function box(opts: { queue?: string | Error; relay?: boolean; unit?: string } = 
 
 let executor: ReturnType<typeof box>;
 
-function context() {
+function context(query?: Record<string, string>) {
   return {
-    req: { param: (k: string) => (k === "serverId" ? SERVER : undefined) },
+    req: {
+      param: (k: string) => (k === "serverId" ? SERVER : undefined),
+      query: (k: string) => query?.[k],
+    },
     json: (body: unknown) => body,
   } as never;
 }
@@ -102,6 +119,7 @@ async function callHealth(): Promise<{
   serverId: string;
   components: MailComponentHealth[];
   delivery: MailDeliveryHealth;
+  reachability: MailPortReachability | null;
 }> {
   return (await getHealth(context())) as never;
 }
@@ -114,6 +132,13 @@ function use(exec: ReturnType<typeof box>) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  reachabilityMocks.check.mockResolvedValue({
+    status: "ok",
+    hostname: "mail.example.com",
+    address: "203.0.113.10",
+    checkedAt: new Date(0).toISOString(),
+    ports: [],
+  });
   use(box());
 });
 
@@ -123,7 +148,26 @@ describe("GET /mail/health — outbound delivery", () => {
 
     expect(body.components).toHaveLength(9);
     expect(body.delivery).toMatchObject({ status: "ok", mode: "direct", queued: 0 });
+    expect(body.reachability).toMatchObject({
+      status: "ok",
+      hostname: "mail.example.com",
+    });
+    expect(reachabilityMocks.check).toHaveBeenCalledWith(
+      executor,
+      "mail.example.com",
+      expect.objectContaining({ cacheKey: `mail-health:${SERVER}`, force: false }),
+    );
     expect(withExecutor).toHaveBeenCalledTimes(1);
+  });
+
+  it("forces the shared reachability cache only for an explicit rescan", async () => {
+    await getHealth(context({ refreshReachability: "1" }));
+
+    expect(reachabilityMocks.check).toHaveBeenCalledWith(
+      executor,
+      "mail.example.com",
+      expect.objectContaining({ cacheKey: `mail-health:${SERVER}`, force: true }),
+    );
   });
 
   it("shares the engine probe with the daemon sweep instead of detecting twice", async () => {

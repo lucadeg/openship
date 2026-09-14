@@ -15,6 +15,7 @@ const h = vi.hoisted(() => ({
   touchedUserIds: [] as string[],
   members: [] as Array<{ userId: string }>,
   verifiedByKinds: [] as Array<{ id: string; kind: string; enabled: boolean; verified: boolean; userId: string }>,
+  jobTriggers: [] as Array<{ eventType: string; organizationId: string }>,
 }));
 
 vi.mock("@repo/db", () => ({
@@ -45,7 +46,11 @@ vi.mock("@repo/db", () => ({
 
 // Job-trigger side-effect is irrelevant here — stub it so we don't pull the
 // job machinery (and its config/env chain) into this unit test.
-vi.mock("../../src/modules/jobs/job-events", () => ({ fireJobTriggers: () => {} }));
+vi.mock("../../src/modules/jobs/job-events", () => ({
+  fireJobTriggers: (eventType: string, organizationId: string) => {
+    h.jobTriggers.push({ eventType, organizationId });
+  },
+}));
 
 import { notification } from "../../src/lib/notification-dispatcher";
 
@@ -65,9 +70,21 @@ beforeEach(() => {
   h.touchedUserIds = [];
   h.members = [];
   h.verifiedByKinds = [];
+  h.jobTriggers = [];
 });
 
 describe("notification dispatcher", () => {
+  it("carries the event organization into command-job dispatch", async () => {
+    await notification.emitSync({
+      organizationId: "org-source",
+      eventType: "deployment.failed",
+    });
+
+    expect(h.jobTriggers).toEqual([
+      { eventType: "deployment.failed", organizationId: "org-source" },
+    ]);
+  });
+
   it("tier-1: delivers to explicitly subscribed verified channels, skips unverified", async () => {
     h.channelsById = {
       c_ok: ch("c_ok", "u1", "email"),

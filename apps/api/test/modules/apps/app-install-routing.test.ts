@@ -8,15 +8,23 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
  * tried to correct them after the fact.
  */
 
-const { createProjectMock, createServiceMock, setEnvMock, requireCloudMock, draftMock } = vi.hoisted(
-  () => ({
-    createProjectMock: vi.fn(),
-    createServiceMock: vi.fn(),
-    setEnvMock: vi.fn(),
-    requireCloudMock: vi.fn(),
-    draftMock: vi.fn(),
-  }),
-);
+const {
+  createProjectMock,
+  createServiceMock,
+  updateServiceMock,
+  setEnvMock,
+  requireCloudMock,
+  draftMock,
+  listServicesMock,
+} = vi.hoisted(() => ({
+  createProjectMock: vi.fn(),
+  createServiceMock: vi.fn(),
+  updateServiceMock: vi.fn(),
+  setEnvMock: vi.fn(),
+  requireCloudMock: vi.fn(),
+  draftMock: vi.fn(),
+  listServicesMock: vi.fn(),
+}));
 
 vi.mock("@repo/db", () => ({
   repos: {
@@ -27,10 +35,7 @@ vi.mock("@repo/db", () => ({
       mergeEnvVars: async () => {},
     },
     service: {
-      listByProject: async () => [
-        { id: "svc-backend", name: "backend" },
-        { id: "svc-dashboard", name: "dashboard" },
-      ],
+      listByProject: listServicesMock,
     },
     customAppTemplate: {
       findByAppId: async () => undefined,
@@ -45,6 +50,7 @@ vi.mock("../../../src/modules/projects/project-crud.service", () => ({
 
 vi.mock("../../../src/modules/services/service.service", () => ({
   createService: createServiceMock,
+  updateService: updateServiceMock,
   setServiceEnvVars: setEnvMock,
 }));
 
@@ -54,11 +60,16 @@ vi.mock("../../../src/lib/cloud/require-cloud", () => ({
 
 import {
   installApp,
+  installServicePorts,
   planInstallRouting,
   serviceRoutingPatch,
   type InstallAppRoute,
 } from "../../../src/modules/apps/app-install.service";
-import { mergeServiceRoutingPatch, type StoredServiceRouting } from "../../../src/lib/public-endpoints";
+import { buildPublicUrlLookup, getAppTemplate, servicePortPairs } from "@repo/core";
+import {
+  mergeServiceRoutingPatch,
+  type StoredServiceRouting,
+} from "../../../src/lib/public-endpoints";
 import type { RequestContext } from "../../../src/lib/request-context";
 
 const ctx = { organizationId: "org1", userId: "u1" } as RequestContext;
@@ -68,6 +79,7 @@ const payloadFor = (name: string) =>
   createServiceMock.mock.calls.find((c) => c[2]?.name === name)?.[2] as
     | {
         exposed: boolean;
+        ports: string[];
         domainType?: "free" | "custom";
         publicEndpoints: Array<{
           port: number;
@@ -84,8 +96,13 @@ const install = (routes?: InstallAppRoute[]) =>
 beforeEach(() => {
   vi.clearAllMocks();
   draftMock.mockResolvedValue(undefined);
+  listServicesMock.mockResolvedValue([
+    { id: "svc-backend", name: "backend" },
+    { id: "svc-dashboard", name: "dashboard" },
+  ]);
   createProjectMock.mockResolvedValue({ id: "p1", slug: "convex", name: "Convex" });
   createServiceMock.mockResolvedValue({ id: "svc" });
+  updateServiceMock.mockResolvedValue(undefined);
   setEnvMock.mockResolvedValue(undefined);
   requireCloudMock.mockResolvedValue(undefined);
   // The catalog overlay refresh is fire-and-forget; keep it off the network.
@@ -106,11 +123,12 @@ describe("app install — routing comes from the operator's choice", () => {
       { port: 3210, domainType: "custom", customDomain: "api.example.com" },
     ]);
 
-    // Port-only: nothing public is persisted, so the deploy's free-domain gate
-    // has nothing to trip on.
+    // Port-only persists no hostname, but it does persist a deliberately public
+    // fixed binding; otherwise the URL shown by the wizard is fiction.
     const dashboard = payloadFor("dashboard")!;
     expect(dashboard.exposed).toBe(false);
     expect(dashboard.publicEndpoints).toEqual([]);
+    expect(dashboard.ports).toContain("0.0.0.0:6791:6791");
   });
 
   it("invents nothing when the caller sends no routing", async () => {
@@ -176,6 +194,113 @@ describe("app install — routing comes from the operator's choice", () => {
       /doesn't serve port 9999/i,
     );
     expect(createProjectMock).not.toHaveBeenCalled();
+  });
+
+  it("atomically reconciles routing and ports on an adopted failed draft", async () => {
+    draftMock.mockResolvedValue({ id: "p1", slug: "convex", name: "Convex" });
+    listServicesMock.mockResolvedValue([
+      {
+        id: "svc-backend",
+        name: "backend",
+        // A prior attempt chose port-only for both endpoints.
+        ports: ["0.0.0.0:3210:3210", "0.0.0.0:3211:3211"],
+      },
+      {
+        id: "svc-dashboard",
+        name: "dashboard",
+        ports: ["0.0.0.0:6791:6791"],
+      },
+    ]);
+
+    await install([
+      { service: "backend", port: 3210, mode: "custom", customDomain: "api.example.com" },
+      { service: "backend", port: 3211, mode: "port" },
+      { service: "dashboard", port: 6791, mode: "port" },
+    ]);
+
+    expect(createProjectMock).not.toHaveBeenCalled();
+    expect(createServiceMock).not.toHaveBeenCalled();
+    const backendPatch = updateServiceMock.mock.calls.find(
+      (call) => call[2] === "svc-backend",
+    )?.[3];
+    expect(backendPatch).toMatchObject({
+      exposed: true,
+      ports: ["3210:3210", "0.0.0.0:3211:3211"],
+      publicEndpoints: [{ port: 3210, domainType: "custom", customDomain: "api.example.com" }],
+    });
+  });
+});
+
+describe("installServicePorts", () => {
+  it("publishes Supabase Kong and gives its publicUrl token a real URL", () => {
+    const kong = getAppTemplate("supabase")!.services!.find((svc) => svc.name === "kong")!;
+    const ports = installServicePorts(kong.name, kong.ports, [
+      { service: "kong", port: 8000, mode: "port" },
+    ]);
+    expect(ports).toEqual(["0.0.0.0:8000:8000"]);
+
+    // This is the same lookup the deploy uses for `{{publicUrl:kong}}` in
+    // Supabase Auth/Studio env. The missing pair was the issue's runtime failure.
+    const urls = buildPublicUrlLookup(
+      [{ name: "kong", portPairs: servicePortPairs(ports), primaryPort: 8000 }],
+      "203.0.113.5",
+    );
+    expect(urls.get("kong")).toBe("http://203.0.113.5:8000");
+  });
+
+  it("makes an authored host remap public while preserving its protocol", () => {
+    expect(
+      installServicePorts("web", ["8203:80/tcp"], [{ service: "web", port: 80, mode: "port" }]),
+    ).toEqual(["0.0.0.0:8203:80/tcp"]);
+  });
+
+  it("preserves an explicit template interface instead of widening it", () => {
+    expect(
+      installServicePorts(
+        "admin",
+        ["127.0.0.1:9000:9000"],
+        [{ service: "admin", port: 9000, mode: "port" }],
+      ),
+    ).toEqual(["127.0.0.1:9000:9000"]);
+  });
+
+  it("is idempotent on a failed-draft retry", () => {
+    const routes: InstallAppRoute[] = [{ service: "kong", port: 8000, mode: "port" }];
+    const once = installServicePorts("kong", [], routes);
+    expect(installServicePorts("kong", [], routes, once)).toEqual(once);
+  });
+
+  it("removes its generated binding when a retry switches port-only to a domain", () => {
+    expect(
+      installServicePorts(
+        "kong",
+        [],
+        [{ service: "kong", port: 8000, mode: "custom", customDomain: "db.example.com" }],
+        ["0.0.0.0:8000:8000", "127.0.0.1:9000:9000"],
+      ),
+    ).toEqual(["127.0.0.1:9000:9000"]);
+  });
+
+  it("restores an authored remap when a retry switches to a domain", () => {
+    expect(
+      installServicePorts(
+        "web",
+        ["8203:80/tcp"],
+        [{ service: "web", port: 80, mode: "free" }],
+        ["0.0.0.0:8203:80/tcp", "127.0.0.1:9000:9000"],
+      ),
+    ).toEqual(["8203:80/tcp", "127.0.0.1:9000:9000"]);
+  });
+
+  it("does not remove an unrelated operator remap while reconciling a domain", () => {
+    expect(
+      installServicePorts(
+        "kong",
+        [],
+        [{ service: "kong", port: 8000, mode: "free" }],
+        ["0.0.0.0:18000:8000"],
+      ),
+    ).toEqual(["0.0.0.0:18000:8000"]);
   });
 });
 

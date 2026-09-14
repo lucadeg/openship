@@ -58,6 +58,33 @@ describe("createDockerSshBridge — a failed request is answered, not reset", ()
     return channel;
   }
 
+  /** A tiny Docker-shaped channel that answers after `delayMs`. Delaying only the first
+   *  probe lets the test distinguish the cached transport without involving real SSH. */
+  function httpChannel(body: string, delayMs = 0) {
+    let answered = false;
+    let responseTimer: ReturnType<typeof setTimeout> | null = null;
+    const channel = new Duplex({
+      read() {},
+      write(_chunk, _enc, cb) {
+        if (!answered) {
+          answered = true;
+          responseTimer = setTimeout(() => {
+            channel.push(
+              `HTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+            );
+            // Let the bridge attach its post-first-byte pipe before EOF arrives.
+            setImmediate(() => channel.push(null));
+          }, delayMs);
+        }
+        cb();
+      },
+    });
+    channel.once("close", () => {
+      if (responseTimer) clearTimeout(responseTimer);
+    });
+    return channel;
+  }
+
   /** Send one Docker API request through a started bridge and return the whole raw reply.
    *  `start()` binds the listener and is called once per bridge, as the transport does. */
   async function request(bridge: { start: () => Promise<{ host: string; port: number }> }) {
@@ -152,7 +179,6 @@ describe("createDockerSshBridge — a failed request is answered, not reset", ()
     expect(reply).toContain("exit code 1");
   });
 
-
   it("names a forced command that answers instead of the daemon", async () => {
     // The AWS AMI root key: an authorized_keys `command=` that echoes a banner intercepts
     // every exec, so dial-stdio's stdout carries prose, not an HTTP response. Piped
@@ -245,6 +271,60 @@ describe("createDockerSshBridge — a failed request is answered, not reset", ()
     expect(reply).toBe("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
     expect(reply).not.toContain("502");
   });
+
+  it("does not drop a multi-chunk response between verification and piping", async () => {
+    // ssh2 commonly delivers channel data in ~32 KiB frames. awaitFirstByte used
+    // to remove its only `data` listener while leaving the channel in flowing
+    // mode; a second frame emitted before the promise continuation installed the
+    // pipe was discarded. dockerode then waited forever for Content-Length.
+    const body = "x".repeat(96 * 1024);
+    const header = `HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\n\r\n`;
+    const reply = await request(
+      bridgeWith(async () => {
+        const channel = fakeChannel();
+        setImmediate(() => {
+          channel.push(header + body.slice(0, 32 * 1024));
+          channel.push(body.slice(32 * 1024, 64 * 1024));
+          channel.push(body.slice(64 * 1024));
+          setImmediate(() => channel.push(null));
+        });
+        return channel;
+      }),
+    );
+
+    expect(reply).toBe(header + body);
+  });
+
+  it("does not select streamlocal when its probe exceeds the real-channel verify window", async () => {
+    let streamlocalOpens = 0;
+    let dialStdioOpens = 0;
+    const bridge = createDockerSshBridge({
+      host: "test-host",
+      username: "root",
+      dockerSocketPath: "/var/run/docker.sock",
+      executor: {
+        forwardUnixSocket: async (): Promise<Duplex> => {
+          streamlocalOpens += 1;
+          // The capability probe answers after the 3s deadline used by every real
+          // streamlocal channel. Accepting it under the old 8s probe deadline cached a
+          // transport that the bridge itself considered unusable for later requests.
+          return httpChannel("probe", streamlocalOpens === 1 ? 3_200 : 0);
+        },
+        openDockerDialStdio: async (): Promise<Duplex> => {
+          dialStdioOpens += 1;
+          return httpChannel("dial-stdio");
+        },
+      },
+    } as unknown as DockerConnectionOptions);
+    bridges.push(bridge);
+
+    await bridge.probe();
+    const reply = await request(bridge);
+
+    expect(reply).toContain("dial-stdio");
+    expect(streamlocalOpens).toBe(1);
+    expect(dialStdioOpens).toBe(1);
+  }, 15_000);
 
   /**
    * Downgrading streamlocal → dial-stdio REPLAYS the buffered request, which is only free

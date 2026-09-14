@@ -1,20 +1,31 @@
 /**
- * Mail server setup service - orchestrates iRedMail installation against a
- * `CommandExecutor`, broken into discrete resumable steps.
+ * Mail server setup service — orchestrates mail provisioning against a
+ * `CommandExecutor`, broken into discrete resumable steps (`MAIL_SETUP_STEPS`
+ * below is the authoritative list).
  *
  * Locality-agnostic: every step receives a `CommandExecutor`, which can be
  * a `LocalExecutor` (same machine, child_process + fs) or an `SshExecutor`
- * (remote VPS, ssh2). This file does not know - or care - which.
+ * (remote VPS, ssh2). This file does not know — or care — which.
  *
- * The engine tree (`apps/email/engine/`) is the source of truth: step 6
- * transfers it onto the target box via `executor.transferIn`, and step 8
- * runs `iRedMail.sh` from that copy. We don't `wget` upstream tarballs;
- * the in-repo engine is what gets installed.
+ * The install is a CONTAINER PULL, not a host takeover: `stepDeployEngine` runs
+ * the `openship-mail` image plus its pinned postgres sidecar via
+ * `ensureContainerMail`. Nothing here transfers the engine tree or executes
+ * `iRedMail.sh` on the target any more — that installer now runs at image BUILD
+ * time (`apps/email/Dockerfile`), and `MAIL_SERVER_ENGINE_DIR` is vestigial.
+ *
+ * Legacy `iRedMail.sh` boxes remain first-class rather than migrated: the flavor
+ * probe (`detect-engine.ts`) reports `container | host | none`, and
+ * `mail-engine.ts` makes SQL transport, daemon probes and config paths a function
+ * of it. There is deliberately no host→container conversion yet.
  */
 
 import { randomBytes } from "node:crypto";
 import type { CommandExecutor, SystemLogCallback, SystemLog } from "@repo/adapters";
 import { checkMailHealth, requiresMailComponent } from "./mail-health.service";
+import {
+  checkMailPortReachability,
+  mailReachabilityFailureMessage,
+} from "./mail-port-reachability.service";
 import { safeErrorMessage, mailHostname } from "@repo/core";
 import {
   installDocker,
@@ -38,6 +49,8 @@ import {
   mailEngineCommand,
   mailUnitActionCommand,
   requireMailEngine,
+  resolveMailMutationAccess,
+  writeMailConfigFile,
   type MailEngineFlavor,
 } from "./mail-engine";
 
@@ -168,6 +181,7 @@ export const STEP_TIMEOUT_MS: Record<string, number> = {
   dkim_keys:            60_000,
   request_ssl:          5 * 60_000,
   configure_ssl:        2 * 60_000,
+  verify_reachability:  30_000,
 };
 
 /** Fallback when a step key isn't in the map. Never used as long as the map stays in sync. */
@@ -187,6 +201,7 @@ export const MAIL_SETUP_STEPS: MailSetupStep[] = [
   { id: 6, key: "dkim_keys",            label: "Retrieve DKIM Keys",        description: "Get DKIM keys and DNS records" },
   { id: 7, key: "request_ssl",          label: "Request SSL Certificate",   description: "Obtain Let's Encrypt SSL for mail domain" },
   { id: 8, key: "configure_ssl",        label: "Configure SSL",             description: "Link certificates and reload mail daemons" },
+  { id: 9, key: "verify_reachability",  label: "Verify Public Mail Ports",  description: "Confirm SMTP and IMAP are reachable through the public address" },
 ];
 
 export const TOTAL_STEPS = MAIL_SETUP_STEPS.length;
@@ -430,6 +445,10 @@ export async function stepOpenMailFirewall(
   const profile = await resolveEnvironment(exec);
   const ops = envOps(profile);
   const manager = ops.firewallManager();
+  const providerNotice =
+    `This step can change only the server firewall. A cloud firewall/security list/security ` +
+    `group/NSG may still need TCP ${MAIL_PORTS.join(", ")}; public reachability is verified ` +
+    `after the mail engine starts.`;
 
   if (!manager.supported) {
     // Two different observations, and only one of them is good news. `none` means we looked
@@ -445,10 +464,11 @@ export async function stepOpenMailFirewall(
         message: "Could not tell which firewall this host runs — the inbound mail ports were left alone",
         warning:
           `${manager.reason} If this box does filter, open ${MAIL_PORTS.join(", ")}/tcp yourself ` +
-          `or mail will not arrive.`,
+          `or mail will not arrive. ${providerNotice}`,
       };
     }
-    return { stepId, success: true, message: "No firewall to open on this host" };
+    log(stepId, "warn", providerNotice);
+    return { stepId, success: true, message: "No firewall to open on this host; the provider firewall will be checked separately" };
   }
 
   // Every rule up front, so a refusal is reported once and never silently dropped: it is a
@@ -464,7 +484,7 @@ export async function stepOpenMailFirewall(
         stepId,
         success: true,
         message: "Inbound mail ports were not opened",
-        warning: op.reason,
+        warning: `${op.reason} ${providerNotice}`,
       };
     }
     rules.push({ port, script: opScript(op.value) });
@@ -486,7 +506,7 @@ export async function stepOpenMailFirewall(
       stepId,
       success: true,
       message: `Left the ${profile.firewall} ruleset alone — the inbound mail ports still need a rule`,
-      warning: `Inbound mail ports (${MAIL_PORTS.join(", ")}) were not opened.`,
+      warning: `Inbound mail ports (${MAIL_PORTS.join(", ")}) were not opened. ${providerNotice}`,
     };
   }
 
@@ -524,12 +544,17 @@ export async function stepOpenMailFirewall(
       stepId,
       success: true,
       message: `Opened the inbound mail ports via ${profile.firewall}, except ${failed.length} of ${MAIL_PORTS.length}`,
-      warning: `Still closed: ${failed.join("; ")}`,
+      warning: `Still closed: ${failed.join("; ")}. ${providerNotice}`,
     };
   }
 
   log(stepId, "info", `Opened ${MAIL_PORTS.length} inbound mail ports via ${profile.firewall}`);
-  return { stepId, success: true, message: `Inbound mail ports opened via ${profile.firewall}` };
+  log(stepId, "warn", providerNotice);
+  return {
+    stepId,
+    success: true,
+    message: `Host firewall opened via ${profile.firewall}; provider firewall check runs after startup`,
+  };
 }
 
 /** Random URL-safe secret. iRedMail's installer treats these as opaque strings. */
@@ -867,30 +892,33 @@ export async function provisionDomainDkim(
 ): Promise<string> {
   // ── Step 1: resolve where amavis lives + which binary it ships ─────────
   const { bin, run, conf, flavor } = await resolveAmavis(exec);
+  const { hostFiles, engineExec } = await resolveMailMutationAccess(exec, flavor, [
+    { path: conf.write, read: true },
+  ]);
   const amavisBin = run(bin);
 
   // ── Step 2: generate the keypair (engine-side path; bind-mounted on container) ─
   const keyPath = `/var/lib/dkim/${newDomain}.pem`;
-  await exec.exec(run("mkdir -p /var/lib/dkim"));
+  await engineExec.exec(run("mkdir -p /var/lib/dkim"));
   // genrsa exits non-zero if the file already exists; treat that as success.
-  await exec.exec(run(`sh -c ${sq(`[ -s ${keyPath} ] || ${bin} genrsa ${keyPath}`)}`));
-  await exec.exec(run("chown -R amavis:amavis /var/lib/dkim")).catch(() => {});
+  await engineExec.exec(run(`sh -c ${sq(`[ -s ${keyPath} ] || ${bin} genrsa ${keyPath}`)}`));
+  await engineExec.exec(run("chown -R amavis:amavis /var/lib/dkim")).catch(() => {});
 
   // ── Step 3: splice the directive into 50-user (the writable side) ───────
   const confPath = conf.write;
-  const existing = await exec.readFile(confPath).catch(() => "");
+  const existing = await hostFiles.readFile(confPath).catch(() => "");
   const dkimKeyLine = `dkim_key('${newDomain}', 'dkim', '${keyPath}');`;
   const signEntry = `   '.${newDomain}'  => { d => '${newDomain}', a => 'rsa-sha256', ttl => 21*24*3600 },`;
   const next = spliceAmavisConf(existing, newDomain, dkimKeyLine, signEntry);
   if (next !== existing) {
-    await exec.writeFile(confPath, next);
+    await writeMailConfigFile(hostFiles, confPath, next, { mode: 0o644 });
   }
 
   // ── Step 4: reload amavis so the new key is signed with ──────────────
-  await exec.exec(mailUnitActionCommand(flavor, "amavis", "amavis", "restart")).catch(() => {});
+  await engineExec.exec(mailUnitActionCommand(flavor, "amavis", "amavis", "restart")).catch(() => {});
 
   // ── Step 5: read the public key out ──────────────────────────────────
-  const showOutput = await exec.exec(`${amavisBin} showkeys ${sq(newDomain)} 2>&1`);
+  const showOutput = await engineExec.exec(`${amavisBin} showkeys ${sq(newDomain)} 2>&1`);
   const matches = showOutput.match(/"([^"]+)"/g);
   const dkimValue = matches
     ? matches.map((m: string) => m.replace(/"/g, "")).join("").replace(/\s+/g, "")
@@ -1116,6 +1144,53 @@ export async function stepConfigureSSL(
   };
 }
 
+/**
+ * Step 9: prove the public path, not merely the local listener.
+ *
+ * The API connects to the public DNS address after checking the host listeners.
+ * A known failure blocks completion. An unavailable probe or an isolated inbound
+ * SMTP timeout remains unverified: the API's own outbound-25 filter may prevent
+ * the check. These use the same warning path, without declaring mail healthy.
+ */
+export async function stepVerifyMailReachability(
+  exec: CommandExecutor,
+  domain: string,
+  log: StepLogger,
+): Promise<StepResult> {
+  const stepId = 9;
+  const hostname = mailHostname(domain);
+  log(stepId, "info", `Checking public TCP reachability for ${hostname} on 25, 465, 587 and 993...`);
+
+  const reachability = await checkMailPortReachability(exec, hostname, {
+    cacheKey: `mail-setup:${domain}`,
+    force: true,
+  });
+  if (reachability.status === "fail") {
+    const message = mailReachabilityFailureMessage(reachability);
+    log(stepId, "error", message);
+    return { stepId, success: false, message, data: { reachability } };
+  }
+  if (reachability.status === "unknown") {
+    const warning = reachability.detail ?? "The public mail ports could not be verified from the control plane.";
+    log(stepId, "warn", warning);
+    return {
+      stepId,
+      success: true,
+      message: "Mail is listening, but public reachability could not be verified",
+      warning,
+      data: { reachability },
+    };
+  }
+
+  log(stepId, "info", "Public SMTP and IMAP ports are reachable from the control plane");
+  return {
+    stepId,
+    success: true,
+    message: "Public SMTP and IMAP ports are reachable",
+    data: { reachability },
+  };
+}
+
 // ─── Step runner map ─────────────────────────────────────────────────────────
 
 export type BasicStepFn = (
@@ -1160,6 +1235,5 @@ export const STEP_RUNNERS: Record<
   6: stepDkimKeys,
   7: stepRequestSSL,
   8: stepConfigureSSL,
+  9: stepVerifyMailReachability,
 };
-
-

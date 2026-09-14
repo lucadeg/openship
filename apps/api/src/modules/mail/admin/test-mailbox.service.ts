@@ -49,6 +49,7 @@ import {
   buildUpsertMailboxSql,
   buildUpsertSelfForwardingSql,
   DOMAIN_RE,
+  isManagedMailboxUsable,
   PLATFORM_LOCAL_PART,
   PlatformMailboxError,
   randomPassword,
@@ -71,8 +72,9 @@ export interface EnsureOpenshipTestMailboxOptions {
 /**
  * Provision (or reuse) `openship@<domain>` as a per-domain test mailbox.
  *
- * Fast path: `state.testMailboxes[domain].email` matches and `rotate` is
- * not set — pure read, decrypt cached password, return.
+ * Fast path: `state.testMailboxes[domain].email` matches, `rotate` is not
+ * set, and its active mailbox + self-forwarding rows still exist. Decrypt
+ * the cached password and return.
  *
  * Slow path: validate the domain exists in `vmail.domain`, mint a 24-byte
  * base64url password, hash via doveadm, UPSERT mailbox + self-forwarding
@@ -110,7 +112,14 @@ export async function ensureOpenshipTestMailbox(
     // platform helper — log once and use the raw value; next rotation
     // re-encrypts.
     const cached = state.testMailboxes?.[targetDomain];
-    if (!rotate && cached && cached.email === email && cached.password) {
+    if (
+      !rotate &&
+      cached &&
+      cached.email &&
+      cached.email.toLowerCase() === email &&
+      cached.password &&
+      (await isManagedMailboxUsable(exec, email))
+    ) {
       let plaintext: string;
       try {
         plaintext = decrypt(cached.password);
@@ -126,6 +135,18 @@ export async function ensureOpenshipTestMailbox(
         smtpHost: cached.smtpHost ?? smtpHost,
         rotated: false,
       });
+    }
+
+    if (
+      !rotate &&
+      cached &&
+      cached.email &&
+      cached.email.toLowerCase() === email &&
+      cached.password
+    ) {
+      console.warn(
+        `[ensureOpenshipTestMailbox] cached mailbox ${email} is missing or inactive in vmail; recreating it and rotating the stale credential.`,
+      );
     }
 
     // Slow path: confirm the domain row exists, then mint + UPSERT + persist.

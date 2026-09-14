@@ -41,12 +41,16 @@
  * every call, same as a transient failure.
  */
 
+import { randomBytes } from "node:crypto";
+import { dirname } from "node:path/posix";
+
 import {
   detectMailEngine,
   MAIL_CONTAINER,
   MAIL_DB_CONTAINER,
   MAIL_DB_NAME,
   MAIL_HOST_PATHS,
+  privilegedExecutor,
   type CommandExecutor,
   type MailEngineFlavor,
   type MailEngineProbe,
@@ -141,6 +145,124 @@ export class MailDbNotInitializedError extends AppError {
       "MAIL_DB_NOT_INITIALIZED",
     );
     this.name = "MailDbNotInitializedError";
+  }
+}
+
+/**
+ * A mail mutation reached a root-owned host path without a safe route to root.
+ * Typed separately from an unavailable engine: the engine is healthy here, but
+ * changing its bind-mounted configuration would otherwise fail as an opaque
+ * SFTP EACCES.
+ */
+export class MailConfigPermissionError extends AppError {
+  constructor(message?: string) {
+    super(
+      message ??
+        "Changing mail configuration needs root. Connect this server as root, or as a user with passwordless sudo.",
+      409,
+      "MAIL_CONFIG_PERMISSION_REQUIRED",
+    );
+    this.name = "MailConfigPermissionError";
+  }
+}
+
+/**
+ * The two namespaces involved in a mail mutation.
+ *
+ * Host-side config normally belongs to root, but a container-mail operator may
+ * explicitly grant the SSH login access to its bind-mount directory. We prove
+ * that capability first and otherwise use the existing privilege gate. Engine
+ * commands deliberately do NOT inherit host elevation: on the container
+ * topology the login user's Docker context/socket is authoritative, and `sudo
+ * docker ...` can address a different daemon. A legacy host has no second
+ * namespace, so its daemon commands use the privileged executor too.
+ */
+export interface MailMutationAccess {
+  hostFiles: CommandExecutor;
+  engineExec: CommandExecutor;
+}
+
+export interface MailHostFileRequirement {
+  path: string;
+  /** Existing content must be readable before it can be safely replaced. */
+  read?: boolean;
+}
+
+/**
+ * A container-mail host path can be managed without root when an operator has
+ * deliberately granted access (for example with the ACL workaround from #756).
+ * Atomic replacement needs write/search permission on the parent; a read/merge
+ * path such as amavis additionally needs the existing file to be readable.
+ */
+async function loginCanManageMailFiles(
+  executor: CommandExecutor,
+  requirements: readonly MailHostFileRequirement[],
+): Promise<boolean> {
+  if (!requirements.length) return false;
+  const checks = requirements.map(({ path, read }) => {
+    const parent = dirname(path);
+    const canReplace = `[ -d ${sq(parent)} ] && [ -w ${sq(parent)} ] && [ -x ${sq(parent)} ]`;
+    const canRead = read ? ` && { [ ! -e ${sq(path)} ] || [ -r ${sq(path)} ]; }` : "";
+    return `{ ${canReplace}${canRead}; }`;
+  });
+  const result = await executor
+    .exec(
+      `if ${checks.join(" && ")}; then echo opsh_mail_access=yes; else echo opsh_mail_access=no; fi`,
+    )
+    .catch(() => "");
+  return result.trim() === "opsh_mail_access=yes";
+}
+
+export async function resolveMailMutationAccess(
+  executor: CommandExecutor,
+  flavor: MailEngineFlavor,
+  requirements: readonly MailHostFileRequirement[] = [],
+): Promise<MailMutationAccess> {
+  // Container commands already run as root INSIDE the engine. If the SSH login
+  // can safely replace the host side of every bind-mounted file, no host-root
+  // operation remains and an operator-provided ACL is sufficient.
+  if (flavor === "container" && (await loginCanManageMailFiles(executor, requirements))) {
+    return { hostFiles: executor, engineExec: executor };
+  }
+
+  const grant = await privilegedExecutor(executor, "Changing mail configuration", {
+    // This operation only edits known paths; it does not install packages or
+    // derive commands from the distro. Still measure privilege on an otherwise
+    // unsupported host, then refuse explicitly if no route to root exists.
+    onRefusedHost: "proceed",
+  });
+  if (!grant.supported) throw new MailConfigPermissionError(grant.reason);
+  if (grant.value.elevation === "none") throw new MailConfigPermissionError();
+
+  return {
+    hostFiles: grant.value.executor,
+    engineExec: flavor === "container" ? executor : grant.value.executor,
+  };
+}
+
+/**
+ * Atomically replace one host-side mail config file.
+ *
+ * The optional mode is applied to a unique sibling before rename, so a relay
+ * password is never published under the SSH user's umask. When `writer` is the
+ * sudo-backed executor its own private 0700 staging path remains the single
+ * elevation implementation; this helper only adds the atomic sibling rename.
+ */
+export async function writeMailConfigFile(
+  writer: CommandExecutor,
+  path: string,
+  content: string,
+  opts?: { mode?: number },
+): Promise<void> {
+  const tmp = `${path}.openship-${randomBytes(8).toString("hex")}`;
+  try {
+    if (opts === undefined) await writer.writeFile(tmp, content);
+    else await writer.writeFile(tmp, content, opts);
+    if (writer.rename) await writer.rename(tmp, path);
+    else await writer.exec(`mv -f ${sq(tmp)} ${sq(path)}`);
+  } catch (err) {
+    await writer.rm(tmp).catch(() => undefined);
+    throw err;
   }
 }
 
@@ -591,13 +713,22 @@ export function parseMailUnitProbe(
 ): MailUnitState {
   if (flavor === "container") {
     if (key === "postgresql") {
-      const value = firstOutputLine(raw);
-      if (value === "true") return { status: "active" };
-      if (value === "false") return { status: "inactive" };
+      // The verdict may not be the FIRST line: `2>&1` (deliberate — see
+      // mailUnitProbeCommand) folds the CLI's stderr into the stream, and docker
+      // prints its warnings ("WARNING: Error loading config file: …",
+      // `level=warning` notices) ahead of the inspect result. Judging line one
+      // turned a healthy sidecar into a required-component failure that halted
+      // mail setup (#783). The template prints exactly `true` or `false`, so an
+      // exact line match anywhere in the output is the daemon's answer and
+      // nothing else's — the same past-the-noise reading the supervisorctl and
+      // systemd branches below already do.
+      const lines = raw.split("\n").map((l) => l.trim());
+      if (lines.includes("true")) return { status: "active" };
+      if (lines.includes("false")) return { status: "inactive" };
       // Only docker saying the container isn't there means missing. A refused
       // daemon or a permission error is a probe we can't conclude from.
-      if (/no such object|no such container/i.test(value)) return { status: "missing" };
-      return { status: "unknown", detail: value || "probe returned no output" };
+      if (/no such object|no such container/i.test(raw)) return { status: "missing" };
+      return { status: "unknown", detail: firstOutputLine(raw) || "probe returned no output" };
     }
     // supervisord always names the program it reports on — "postfix RUNNING pid 12,
     // uptime 0:03:11", or "postfix: ERROR (no such process)". No such line means

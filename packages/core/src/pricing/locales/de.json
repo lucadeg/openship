@@ -24,20 +24,20 @@
   "features": {
     "everythingIn": "Alles aus {inherited}, plus:",
     "staticOnly": "Nur statische Websites – SSG, SPA und reines HTML",
-    "anyWorkload": "Beliebige Workloads – Container, Compose-Stacks und Worker",
-    "managedServices": "Managed Postgres, Redis und der komplette App-Katalog",
+    "anyWorkload": "Beliebige Workloads – Container, Compose, Worker, Postgres, Redis",
+    "runningServices": "{runningServices} laufende Apps, Datenbanken oder Worker",
+    "computeMinutes": "{computeMinutes} Compute-Minuten pro Monat",
     "buildMinutes": "{buildMinutes} Build-Minuten pro Monat",
-    "credits": "{credits} Compute-Credits pro Monat",
+    "power": "Bis zu {powerCpu} vCPU und {powerRamGb} GB RAM pro App",
+    "projects": "{maxProjects} Projekte",
+    "projectsUnlimited": "Unbegrenzt viele Projekte",
     "freeSubdomains": "{freeSubdomains} kostenlose Subdomains unter {freeDomainSuffix}",
     "freeSubdomainsUnlimited": "Unbegrenzt viele kostenlose Subdomains unter {freeDomainSuffix}",
+    "gitDeploys": "Deployen von GitHub, GitLab oder jedem Git-Remote",
     "customDomains": "Unbegrenzt viele eigene Domains, TLS inklusive",
+    "deployLogs": "Live-Logs für Build und Deployment",
+    "auditLog": "Audit-Log für jede Änderung",
     "unlimitedSeats": "Unbegrenzt viele Teammitglieder – nie Kosten pro Nutzer",
-    "previewDeploys": "Preview-Deploys bei jedem Push",
-    "backups": "Tägliche Backups mit Point-in-Time-Recovery",
-    "observability": "Live-Logs, Metriken und Health-Alerts",
-    "mailServer": "Integrierter Mailserver – SMTP, IMAP und Webmail",
-    "auditLog": "Audit-Log mit verlängerter Aufbewahrungsdauer",
-    "sharedChannel": "Gemeinsamer Slack- oder Discord-Channel",
     "sso": "SSO und SAML",
     "customLimits": "Individuelle Limits, vertraglich vereinbart",
     "dedicatedInfra": "Dedizierte Infrastruktur und Regionen",
@@ -50,12 +50,7 @@
     "selfHostedUnlimited": "Unbegrenzt viele Deploys, Projekte, Server und Domains",
     "selfHostedServices": "Alle Managed Services – Postgres, Redis, Mail",
     "selfHostedClients": "CLI, Web und Desktop – ein Backend",
-    "selfHostedFreeSubdomains": "{freeSubdomains} kostenlose Subdomains unter {freeDomainSuffix} bei Verbindung mit Openship Cloud",
-    "runningServices": "{runningServices} laufende Services – Apps, Datenbanken, Worker",
-    "power": "Bis zu {powerCpu} vCPU und {powerRamGb} GB RAM pro Service",
-    "projects": "{maxProjects} Projekte",
-    "projectsUnlimited": "Unbegrenzt viele Projekte",
-    "meteredCredits": "Compute, Datenübertragung und Speicher werden alle über die monatlichen Credits abgerechnet"
+    "selfHostedFreeSubdomains": "{freeSubdomains} kostenlose Subdomains unter {freeDomainSuffix} bei Verbindung mit Openship Cloud"
   },
   "selfHosted": {
     "name": "Selbst gehostet",
@@ -65,9 +60,9 @@
     "cta": "Self-Hosting starten"
   },
   "creditPacks": {
-    "pack_5k": "{credits} Credits",
-    "pack_25k": "{credits} Credits",
-    "pack_100k": "{credits} Credits"
+    "pack_5k": "{computeMinutes} Compute-Minuten",
+    "pack_25k": "{computeMinutes} Compute-Minuten",
+    "pack_100k": "{computeMinutes} Compute-Minuten"
   },
   "ui": {
     "perMonth": "/Mon.",
@@ -83,6 +78,8 @@
     "billedMonthly": "monatliche Abrechnung, jederzeit kündbar",
     "campaignBadge": "{percentOff} % Rabatt",
     "campaignEnds": "Angebot endet am {date}",
-    "wasPrice": "vorher {price}"
+    "wasPrice": "vorher {price}",
+    "standardTitle": "In jedem Plan enthalten",
+    "creditPackNote": "≈ {appHours} Stunden einer kleinen App oder {buildMinutes} Build-Minuten"
   }
 }

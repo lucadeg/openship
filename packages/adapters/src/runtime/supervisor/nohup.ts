@@ -18,7 +18,7 @@ import type { CommandExecutor, LogEntry, LogCallback, ResourceUsage } from "../.
 import type { ProcessSupervisor, SupervisorDeployOpts } from "./types";
 import { sampleBareUsage, ZERO_USAGE } from "./usage";
 import { sq, parseLogLevel } from "../build-pipeline";
-import { probeListeningPort } from "../port-conflict";
+import { portOccupantDetails, probeListeningPort } from "../port-conflict";
 import { execReliable } from "../../system/remote-journal";
 import { DeployError } from "@repo/core";
 
@@ -151,7 +151,7 @@ export class NohupSupervisor implements ProcessSupervisor {
             (occupant ? ` by ${occupant.command}` : "") +
             ". Stop the existing process before deploying.",
           "PORT_IN_USE",
-          { port: opts.port, pid: occupant?.pid, command: occupant?.command },
+          portOccupantDetails(opts.port, occupant),
         );
       }
 

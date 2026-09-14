@@ -17,6 +17,7 @@ const { resolveGitHubAuthMode } = vi.hoisted(() => ({ resolveGitHubAuthMode: vi.
 
 vi.mock("../../../src/modules/github/github.auth", () => ({
   resolveGitHubAuthMode,
+  getGitHubAuthMode: () => "gh-first",
   getGitHubConnectionState: vi.fn(),
   getInstallationId: vi.fn(),
   getInstallationToken: vi.fn(),

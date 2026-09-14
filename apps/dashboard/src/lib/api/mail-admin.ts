@@ -159,6 +159,8 @@ export interface AdminMailbox {
   isGlobalAdmin: boolean;
   createdAt: string;
   passwordLastChange: string;
+  /** Protected Openship-owned SMTP identity for the primary install. */
+  isPlatform: boolean;
 }
 
 export interface CreateMailboxPayload {
@@ -367,6 +369,10 @@ export const mailAdminApi = {
     hardDelete: (serverId: string, email: string) =>
       api.delete<{ ok: boolean; mode: "soft" | "hard" }>(
         `${endpoints.mail.admin.mailbox(serverId, email)}?hard=true`,
+      ),
+    rotatePlatform: (serverId: string) =>
+      api.post<{ ok: boolean; email: string; rotated: boolean }>(
+        endpoints.mail.admin.rotatePlatformMailbox(serverId),
       ),
   },
   aliases: {

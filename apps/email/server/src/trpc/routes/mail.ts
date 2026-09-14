@@ -55,6 +55,12 @@ export function formatFromAddress(
   return name ? `"${name}" <${raw.trim()}>` : raw;
 }
 
+/** Injectable seam for route-level tests; production uses the real IMAP/SMTP drivers. */
+export const mailRouteInternals = {
+  getThread,
+  send: driverSend,
+};
+
 // Folder comes in as a loose string (client uses `bin`/`draft`/`snoozed`
 // while the canonical enum is `trash`/`drafts`). Normalize on the way in
 // instead of rejecting; see normalizeFolderSlug.
@@ -127,7 +133,7 @@ export const mailRouter = router({
       }),
     )
     .query(async ({ ctx, input }) => {
-      const detail = await getThread(
+      const detail = await mailRouteInternals.getThread(
         ctx.imap,
         input.id,
         normalizeFolderSlug(input.folder),
@@ -156,24 +162,59 @@ export const mailRouter = router({
         threadId: z.string().nullable().optional(),
         isForward: z.boolean().optional(),
         originalMessage: z.string().optional(),
+        originalMessageId: z.string().optional(),
+        originalFolder: folderInput,
         scheduleAt: z.string().optional(),
         headers: z.record(z.string(), z.string()).optional(),
         inReplyTo: z.string().optional(),
         references: z.array(z.string()).optional(),
       }),
     )
-    .mutation(({ ctx, input }) => {
+    .mutation(async ({ ctx, input }) => {
       const refsHeader = input.headers?.References;
       const inReplyToHeader = input.headers?.['In-Reply-To'];
       const fromAddress = formatFromAddress(input.fromEmail, ctx.session.email, ctx.session.name);
-      return driverSend(ctx.smtp, ctx.imap, fromAddress, {
+
+      let originalHtml = input.originalMessage;
+      let forwardedAttachments: typeof input.attachments;
+      if (input.isForward && input.originalMessageId) {
+        const original = await mailRouteInternals.getThread(
+          ctx.imap,
+          input.originalMessageId,
+          normalizeFolderSlug(input.originalFolder),
+          undefined,
+          { includeAttachmentBytes: true },
+        );
+        if (!original?.latest) {
+          throw new TRPCError({
+            code: 'NOT_FOUND',
+            message: 'Original message could not be loaded for forwarding',
+          });
+        }
+        originalHtml = original.latest.decodedBody ?? originalHtml;
+        forwardedAttachments = original.latest.attachments.map((attachment) => ({
+          name: attachment.filename,
+          type: attachment.contentType,
+          base64: attachment.body,
+        }));
+      }
+
+      const outgoingHtml = input.isForward
+        ? `${input.message ?? input.html ?? input.body ?? ''}${originalHtml ?? ''}`
+        : input.message ?? input.html ?? input.body ?? undefined;
+      const attachments =
+        forwardedAttachments?.length || input.attachments?.length
+          ? [...(forwardedAttachments ?? []), ...(input.attachments ?? [])]
+          : undefined;
+
+      return mailRouteInternals.send(ctx.smtp, ctx.imap, fromAddress, {
         to: input.to.map(senderToAddress),
         cc: input.cc?.map(senderToAddress),
         bcc: input.bcc?.map(senderToAddress),
         subject: input.subject,
-        html: input.message ?? input.html ?? input.body ?? undefined,
+        html: outgoingHtml,
         text: input.text,
-        attachments: input.attachments,
+        attachments,
         inReplyTo: input.inReplyTo ?? inReplyToHeader ?? undefined,
         references:
           input.references ??
@@ -248,9 +289,15 @@ export const mailRouter = router({
   ]),
 
   getMessageAttachments: protectedProcedure
-    .input(z.object({ messageId: z.string() }))
+    .input(z.object({ messageId: z.string().min(1), folder: folderInput }))
     .query(async ({ ctx, input }) => {
-      const thread = await getThread(ctx.imap, input.messageId);
+      const thread = await mailRouteInternals.getThread(
+        ctx.imap,
+        input.messageId,
+        normalizeFolderSlug(input.folder),
+        undefined,
+        { includeAttachmentBytes: true },
+      );
       return thread?.latest.attachments ?? [];
     }),
 

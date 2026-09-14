@@ -88,7 +88,8 @@ anti-spam), a Let's Encrypt **SSL Certificate**, **DNS Configuration** (DKIM, SP
 **Admin Panel**. The **Prerequisites** box lists what you need first:
 
 - A domain with DNS access.
-- Port 25 not blocked by your provider.
+- Outbound port 25 allowed by your provider, plus inbound TCP 25, 465, 587, and 993 allowed in the
+  provider firewall/security group/security list/NSG.
 - A clean Ubuntu/Debian server (recommended).
 
 <Callout title="Screenshot">Mail Server Setup form — Domain and Admin Password fields, **Start Setup**, and the "What gets installed" / "Prerequisites" sidebar. *(screenshot pending)*</Callout>
@@ -102,6 +103,20 @@ tracks **All steps** and, if ports 80/443 are already taken, surfaces a **Port C
 continuing.
 
 Twice during the install, the wizard pauses and needs you to act — first for DNS, then for reverse DNS.
+
+The final **Verify Public Mail Ports** step first confirms the daemons are listening on the server, then
+connects from the Openship API to the public DNS address on TCP 25, 465, 587, and 993. The API may run on the
+mail server itself. Missing or loopback-only listeners, failed client ports (465/587/993), and non-timeout
+errors on TCP 25 stop setup. Check both the host firewall and the cloud provider's firewall when a listening
+port cannot be reached.
+
+A timeout on **TCP 25 only** lets setup finish with a warning when that port has a non-loopback listener and
+465/587/993 all complete a TCP handshake. Public reachability remains **unverified** in Health. AWS
+[blocks outbound port 25 to public addresses by default](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-resource-limits.html),
+which can prevent the API's check even when inbound mail works. The same timeout can also mean inbound TCP 25
+is blocked, so verify it from an independent host or send a test message from another mail provider before
+relying on receiving mail. An SMTP relay configured in **Sending**, such as Amazon SES, handles outgoing mail
+only; it does not make a blocked inbound port reachable.
 
 ### DNS hold — publish your records
 
@@ -247,13 +262,23 @@ actual values when something's off.
 
 ### Health
 
-The single "is everything working?" screen. A banner at the top aggregates a verdict, then two sections:
+The single "is everything working?" screen. A banner at the top aggregates a verdict across four sections:
 
 - **Daemons** — live systemd status of each mail process (Postfix, Dovecot, anti-spam, etc.), refreshed on a
   10-second poll. Each row has a **Logs** button and a menu to **Start**, **Stop**, or **Restart** that unit.
+- **Public mail ports** — combines the server's local listener table with connections from the Openship
+  control plane to the public DNS address on TCP 25, 465, 587, and 993. The UI poll reuses one result for 60
+  seconds, so this is a bounded health check rather than a continuous port watcher.
+- **Outbound delivery** — shows the direct/relay send path, queue depth, and actionable deferral reasons.
 - **DNS scan** — a live public-DNS check of every expected record, with a **Rescan** button.
 
-<Callout title="Screenshot">Health tab — the summary banner, the Daemons list with per-row Logs/actions, and the DNS scan section. *(screenshot pending)*</Callout>
+<Callout title="Provider firewall is a separate layer" type="warn">
+Opening UFW or firewalld on the server does not change OCI security lists, AWS security groups, GCP firewall
+rules, Azure NSGs, or another provider firewall. A row that says **Blocked** while the daemon is listening
+usually means this outer layer is dropping the connection.
+</Callout>
+
+<Callout title="Screenshot">Health tab — the summary banner, Daemons, Public mail ports, Outbound delivery, and DNS scan. *(screenshot pending)*</Callout>
 
 ### Backup
 

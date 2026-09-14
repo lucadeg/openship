@@ -95,6 +95,10 @@ export {
   checkRsync,
   COMPONENT_CHECKS,
 } from "./checks";
+export {
+  REMOTE_SERVER_REQUIRED_COMPONENTS,
+  resolveSystemComponentInstallPlan,
+} from "./requirements";
 
 // ─── Installers ───────────────────────────────────────────────────────────────
 export {

@@ -25,6 +25,8 @@ import { runJobNow } from "../jobs/job.service";
 import { audit } from "../../lib/audit";
 import { incomingWebhookUrl } from "../../lib/public-url";
 import { env } from "../../config";
+import { deployServiceIds } from "./incoming-action";
+import { assertExactServiceTargets } from "../deployments/exact-service-targets";
 
 const ACTION_TYPES: IncomingWebhookActionType[] = ["deploy", "job"];
 const AUTH_MODES: IncomingWebhookAuthMode[] = ["token", "hmac", "none"];
@@ -34,6 +36,19 @@ export function isValidActionType(v: unknown): v is IncomingWebhookActionType {
 }
 export function isValidAuthMode(v: unknown): v is IncomingWebhookAuthMode {
   return typeof v === "string" && (AUTH_MODES as string[]).includes(v);
+}
+
+/** Fail instead of silently turning stale/cross-project ids into a partial or
+ * whole-project deployment. */
+export async function assertDeployServiceTargets(
+  projectId: string,
+  config: IncomingWebhookActionConfig,
+): Promise<string[] | undefined> {
+  const requested = deployServiceIds(config);
+  if (!requested) return undefined;
+  const services = await repos.service.listByProject(projectId);
+  assertExactServiceTargets(services, requested, "Webhook");
+  return requested;
 }
 
 /** 192 bits of entropy — same generator the backup webhook token uses. */
@@ -46,8 +61,10 @@ function mintCredentials(authMode: IncomingWebhookAuthMode): {
   tokenEncrypted: string | null;
   hmacSecretEncrypted: string | null;
 } {
-  if (authMode === "token") return { tokenEncrypted: encrypt(generateSecret()), hmacSecretEncrypted: null };
-  if (authMode === "hmac") return { tokenEncrypted: null, hmacSecretEncrypted: encrypt(generateSecret()) };
+  if (authMode === "token")
+    return { tokenEncrypted: encrypt(generateSecret()), hmacSecretEncrypted: null };
+  if (authMode === "hmac")
+    return { tokenEncrypted: null, hmacSecretEncrypted: encrypt(generateSecret()) };
   return { tokenEncrypted: null, hmacSecretEncrypted: null };
 }
 
@@ -291,16 +308,27 @@ export async function triggerIncomingWebhook(opts: {
   // ── Dispatch ──
   const owner = await resolveOrgOwner(hook.organizationId).catch(() => null);
   const actorUserId = owner?.userId ?? hook.createdBy ?? "system";
-  const ctx = webhookActorCtx(actorUserId, hook.organizationId, `incoming-webhook:${hook.actionType}`);
+  const ctx = webhookActorCtx(
+    actorUserId,
+    hook.organizationId,
+    `incoming-webhook:${hook.actionType}`,
+  );
   const cfg = (hook.actionConfig ?? {}) as IncomingWebhookActionConfig;
 
   try {
     let ref: string | undefined;
     if (hook.actionType === "deploy") {
+      const serviceIds = await assertDeployServiceTargets(hook.projectId, cfg);
       const result = await triggerDeployment(ctx, {
         projectId: hook.projectId,
         trigger: "webhook",
-        serviceIds: cfg.serviceId ? [cfg.serviceId] : undefined,
+        serviceIds,
+        strictServiceScope: serviceIds !== undefined,
+        // Incoming deploy hooks promise a redeploy, not just a container
+        // recreate from an already-cached mutable tag. Persist this intent on
+        // the deployment snapshot so the worker force-pulls selected external
+        // images while the deployment still retains webhook provenance.
+        forcePullImages: true,
       });
       ref = result?.deployment?.id;
     } else if (hook.actionType === "job") {
@@ -393,7 +421,10 @@ export interface DeliveryPage {
 type PageOpts = { cursor?: string; limit?: number };
 
 /** All webhook deliveries for a project (github pushes + custom hooks), newest first. */
-export async function listProjectDeliveries(projectId: string, opts?: PageOpts): Promise<DeliveryPage> {
+export async function listProjectDeliveries(
+  projectId: string,
+  opts?: PageOpts,
+): Promise<DeliveryPage> {
   const page = await repos.webhookDelivery.listByProject(projectId, opts);
   return { deliveries: page.rows.map(toDeliveryView), nextCursor: page.nextCursor };
 }
@@ -411,7 +442,10 @@ export async function listHookDeliveries(
 }
 
 /** Org-wide deliveries — includes project-less forwarded/ignored GitHub rows. */
-export async function listOrgDeliveries(organizationId: string, opts?: PageOpts): Promise<DeliveryPage> {
+export async function listOrgDeliveries(
+  organizationId: string,
+  opts?: PageOpts,
+): Promise<DeliveryPage> {
   const page = await repos.webhookDelivery.listByOrg(organizationId, opts);
   return { deliveries: page.rows.map(toDeliveryView), nextCursor: page.nextCursor };
 }

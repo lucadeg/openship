@@ -108,7 +108,8 @@ export interface TokenContext {
    *  "write". Threaded into `canUseGitHubRepo` — see the funnel gate in
    *  `chainCtx`. A read grant + owner-wide reach must never satisfy a write. */
   op?: GitHubAccessOp;
-  /** Override the installation id (rare; usually inferred from owner). */
+  /** Project snapshot used for diagnostics/webhook correlation. Token minting
+   *  still resolves the canonical workspace installation server-side. */
   installationId?: number;
   /** Project id — for per-project clone token lookup. */
   projectId?: string;
@@ -117,6 +118,17 @@ export interface TokenContext {
    *  clone-auth.ts. `tokenFor` itself has no per-server branch (SSH can't be a
    *  TokenResult); this is plumbing for parity, not resolution. */
   serverId?: string;
+  /** Restrict resolution to these credential kinds. NARROWING ONLY — the chain
+   *  still owns the ORDER, and this can neither promote a kind nor add one.
+   *
+   *  For an operation only ONE credential can perform, walking the whole chain
+   *  is wrong: the walk below returns the FIRST token that resolves and never
+   *  retries, so a resolvable gh-CLI/PAT token permanently SHADOWS the App and
+   *  the call 403s forever — even with a working installation one step later.
+   *  That is a property of the ENDPOINT, not of the caller's authority, so it
+   *  belongs here and not in `op`: GitHub's Checks API accepts App installation
+   *  tokens only (see `credential` in githubFetch). */
+  only?: GitHubTokenSource[];
 }
 
 // ─── The dispatcher ─────────────────────────────────────────────────────────
@@ -370,9 +382,16 @@ function platformFor(): GitHubPlatform {
   return env.CLOUD_MODE ? "saas" : "selfhosted";
 }
 
-/** The ordered specs for this platform + purpose. */
-function chainFor(purpose: GitHubPurpose): CredentialSpec[] {
-  return CHAINS[platformFor()][purpose].map((kind) => SPECS[kind]);
+/** The ordered specs for this platform + purpose, optionally narrowed to
+ *  specific kinds (`TokenContext.only`). Order always comes from CHAINS.
+ *
+ *  An EMPTY `only` is treated as no constraint, not as "narrow to nothing": an
+ *  empty filter would resolve zero credentials and surface as the generic
+ *  "connect your GitHub account" throw, which is a confusing way to report a
+ *  caller passing `[]`. A pin has to name at least one kind to mean anything. */
+function chainFor(purpose: GitHubPurpose, only?: GitHubTokenSource[]): CredentialSpec[] {
+  const kinds = CHAINS[platformFor()][purpose];
+  return (only?.length ? kinds.filter((k) => only.includes(k)) : kinds).map((kind) => SPECS[kind]);
 }
 
 /**
@@ -437,7 +456,7 @@ export async function tokenFor(
   tokenCtx: TokenContext = {},
 ): Promise<TokenResult | null> {
   const c = await chainCtx(ctx, purpose, tokenCtx);
-  for (const spec of chainFor(purpose)) {
+  for (const spec of chainFor(purpose, tokenCtx.only)) {
     const token = await spec.resolve(c);
     if (token) return { token, source: spec.kind };
   }
@@ -462,7 +481,7 @@ export async function canResolveTokenFor(
   tokenCtx: TokenContext = {},
 ): Promise<GitHubTokenSource | null> {
   const c = await chainCtx(ctx, purpose, tokenCtx);
-  for (const spec of chainFor(purpose)) {
+  for (const spec of chainFor(purpose, tokenCtx.only)) {
     if (await spec.probe(c)) return spec.kind;
   }
   return null;

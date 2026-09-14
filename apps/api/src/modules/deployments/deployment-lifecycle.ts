@@ -13,11 +13,18 @@
  * while all side-effects on completion live here.
  */
 
-import { repos, type Project, type Deployment, type NewDeployment } from "@repo/db";
+import {
+  repos,
+  type Project,
+  type Deployment,
+  type NewDeployment,
+  type ServiceDeployment,
+} from "@repo/db";
 import { DockerRuntime, isEdgeDownMessage, type BuildLogger, type LogEntry } from "@repo/adapters";
 import type { RuntimeAdapter } from "@repo/adapters";
 import { SYSTEM, safeErrorMessage } from "@repo/core";
 import { env } from "../../config";
+import { isArtifactRef } from "../../lib/container-ref";
 import type { DeploymentMeta } from "../../lib/deployment-runtime";
 import { notification } from "../../lib/notification-dispatcher";
 import { audit } from "../../lib/audit";
@@ -27,6 +34,7 @@ import { failureStatusFor } from "./blocking-errors";
 import { sanitizeStorableStrings, sliceWithoutSplittingPair } from "./build-log-sanitize";
 import { detectAndStoreFavicon } from "../../lib/favicon-detector";
 import { onWebmailDeployed } from "../mail/webmail/webmail-install.service";
+import { computeCleanupKeepSet } from "../projects/cleanup-keep-set";
 
 /**
  * The "your domains didn't route" line for a deploy that otherwise succeeded.
@@ -80,6 +88,9 @@ export interface LifecycleContext {
   buildSessionId: string;
   /** Returns collapsed logs for DB persistence. */
   persistLogs: () => LogEntry[];
+  /** The deployment's single logger. Optional for startup/recovery callers that
+   * have no live log stream; normal build pipelines always provide it. */
+  logger?: Pick<BuildLogger, "log">;
   /** Provisioned resources - set by the orchestrator as phases progress. */
   provisioned: { imageRef?: string };
   /**
@@ -108,6 +119,57 @@ function collectLogs(ctx: LifecycleContext): LogEntry[] {
       },
     ];
   }
+}
+
+/**
+ * Destroy only service containers this attempt actually owns.
+ *
+ * Compose intentionally copies an unchanged service's live container id onto
+ * the new deployment row. Treating every row as newly provisioned therefore
+ * destroys the previous active release during failure/cancellation cleanup.
+ * The same retained-resource keep set used by delete/reject is the authority
+ * here. If it cannot be computed, fail closed and leave cleanup to GC rather
+ * than taking a serving workload down.
+ */
+async function cleanupOwnedServiceContainers(
+  ctx: LifecycleContext,
+  outcome: "failure" | "cancel",
+): Promise<ServiceDeployment[]> {
+  const serviceDeps = await repos.service.listByDeployment(ctx.dep.id).catch(() => []);
+  if (!ctx.runtime || serviceDeps.length === 0) return serviceDeps;
+
+  let protectedContainers: Set<string>;
+  try {
+    protectedContainers = (
+      await computeCleanupKeepSet(ctx.project, { excludeDeploymentId: ctx.dep.id })
+    ).containers;
+  } catch (err) {
+    console.error(
+      `[DEPLOY] ${ctx.dep.id}: couldn't resolve the live-container keep set during ${outcome}; ` +
+        `protecting every service container: ${safeErrorMessage(err)}`,
+    );
+    return serviceDeps;
+  }
+
+  for (const serviceDep of serviceDeps) {
+    const containerId = serviceDep.containerId;
+    if (!containerId) continue;
+    if (protectedContainers.has(containerId)) {
+      console.log(
+        `[DEPLOY] ${ctx.dep.id}: keeping service container ${containerId.slice(0, 12)} — ` +
+          `it belongs to the live release`,
+      );
+      continue;
+    }
+    await ctx.runtime.destroy(containerId).catch((err) => {
+      console.error(
+        `[DEPLOY] Failed to destroy service container ${containerId} on ${outcome}:`,
+        err,
+      );
+    });
+  }
+
+  return serviceDeps;
 }
 
 /**
@@ -160,7 +222,9 @@ export async function reportPipelineError(
     );
     return;
   }
-  logger.log(`Error: ${message}`, "error");
+  // onFailure owns the one canonical terminal error line. Give it this logger
+  // for recovery/test contexts that did not construct the normal pipeline ctx.
+  ctx.logger ??= logger;
   await onFailure(ctx, message);
 }
 
@@ -173,6 +237,24 @@ function truncateError(msg: string): string {
   // a notification payload.
   const clean = sanitizeStorableStrings(msg);
   return clean.length > max ? sliceWithoutSplittingPair(clean, max) + "…" : clean;
+}
+
+/** Append the terminal reason exactly once before logs are collapsed/persisted.
+ * Individual build/deploy branches may emit step diagnostics, but none of them
+ * should have to remember a second DB-log write. */
+function ensureTerminalFailureLog(ctx: LifecycleContext, error?: string): void {
+  if (!error || !ctx.logger) return;
+  const terminalMessage = `Error: ${truncateError(error)}`;
+  let alreadyPresent = false;
+  try {
+    alreadyPresent = ctx
+      .persistLogs()
+      .some((entry) => entry.level === "error" && entry.message.trim() === terminalMessage.trim());
+  } catch {
+    // collectLogs below owns the observable fallback for a broken persistence
+    // callback. The live terminal line is still worth emitting here.
+  }
+  if (!alreadyPresent) ctx.logger.log(terminalMessage, "error");
 }
 
 /**
@@ -199,9 +281,7 @@ async function recordOutcome(
   extra: Partial<NewDeployment>,
   sheddable: ReadonlyArray<keyof NewDeployment> = [],
 ): Promise<{ state: "applied" | "refused" | "failed"; error: string | null }> {
-  const attempts: Array<{ label: string; extra: Partial<NewDeployment> }> = [
-    { label: "", extra },
-  ];
+  const attempts: Array<{ label: string; extra: Partial<NewDeployment> }> = [{ label: "", extra }];
   const shed = { ...extra };
   for (const key of sheddable) delete shed[key];
   if (Object.keys(shed).length < Object.keys(extra).length) {
@@ -242,10 +322,11 @@ export async function cleanupBuildArtifact(
 ): Promise<void> {
   // An absolute-path ref is a filesystem build DIRECTORY (a bare build dir, or a
   // static Docker build's extracted doc-root at STATIC_RELEASE_BASE/.builds/…),
-  // NOT a docker image. (Image tags contain "/" but never START with it.)
-  // removeImage would 404-no-op on a path and leak the dir, so remove it as a
-  // directory — destroy() rm's an absolute path on both runtimes.
-  if (artifactRef.startsWith("/")) {
+  // NOT a docker image. removeImage would fail on a path and leak the dir, so
+  // remove it as a directory — destroy() rm's an absolute path on both runtimes.
+  // The rule itself lives in `isArtifactRef`, shared with the teardown collector
+  // that used to open-code the opposite answer (issue #640).
+  if (isArtifactRef(artifactRef)) {
     await runtime.destroy(artifactRef);
     return;
   }
@@ -421,41 +502,27 @@ export async function onFailure(
 ): Promise<void> {
   const { runtime, project, dep, buildSessionId, provisioned } = ctx;
 
+  // Do this at the lifecycle choke point, before cleanup can add secondary
+  // diagnostics, so both SSE and the persisted build session end with the real
+  // failure reason even for direct compose-pipeline failures (#751).
+  ensureTerminalFailureLog(ctx, error);
+
   // Always delete the workspace/container on failure so the user doesn't
   // have to manually clean up.
   if (runtime && provisioned.imageRef) {
     try {
       await cleanupBuildArtifact(runtime, provisioned.imageRef);
     } catch (destroyErr) {
-      console.error(
-        `[DEPLOY] Failed to destroy ${provisioned.imageRef} on failure:`,
-        destroyErr,
-      );
+      console.error(`[DEPLOY] Failed to destroy ${provisioned.imageRef} on failure:`, destroyErr);
       // Retry once after a short delay
       await new Promise((r) => setTimeout(r, 2000));
       await cleanupBuildArtifact(runtime, provisioned.imageRef).catch((retryErr) => {
-        console.error(
-          `[DEPLOY] Retry destroy also failed for ${provisioned.imageRef}:`,
-          retryErr,
-        );
+        console.error(`[DEPLOY] Retry destroy also failed for ${provisioned.imageRef}:`, retryErr);
       });
     }
   }
 
-  if (runtime) {
-    const serviceDeps = await repos.service.listByDeployment(dep.id).catch(() => []);
-    for (const serviceDep of serviceDeps) {
-      if (!serviceDep.containerId) continue;
-      try {
-        await runtime.destroy(serviceDep.containerId);
-      } catch (destroyErr) {
-        console.error(
-          `[DEPLOY] Failed to destroy service container ${serviceDep.containerId} on failure:`,
-          destroyErr,
-        );
-      }
-    }
-  }
+  await cleanupOwnedServiceContainers(ctx, "failure");
 
   // INVARIANT: failure writes the DEPLOYMENT row only — NEVER the project row.
   // The project's live-release pointer (activeDeploymentId) advances solely on
@@ -515,7 +582,10 @@ export async function onFailure(
   // Notify — dispatch to every subscribed channel (per-user prefs +
   // org defaults). Fire-and-forget: the dispatcher fans out across
   // email/webhook/in-app/slack based on each member's subscriptions.
-  const lastLogs = collapsed.slice(-50).map((l) => l.message).join("\n");
+  const lastLogs = collapsed
+    .slice(-50)
+    .map((l) => l.message)
+    .join("\n");
   notification.emit({
     organizationId: dep.organizationId,
     eventType: "deployment.failed",
@@ -563,35 +633,31 @@ export async function onFailure(
 export async function onCancelled(
   ctx: LifecycleContext,
   durationMs?: number,
+  opts: { keepProvisioned?: boolean } = {},
 ): Promise<void> {
   const { runtime, dep, buildSessionId, provisioned } = ctx;
 
-  if (runtime && provisioned.imageRef) {
+  if (!opts.keepProvisioned && runtime && provisioned.imageRef) {
     try {
       await cleanupBuildArtifact(runtime, provisioned.imageRef);
     } catch (destroyErr) {
-      console.error(
-        `[DEPLOY] Failed to destroy ${provisioned.imageRef} on cancel:`,
-        destroyErr,
-      );
+      console.error(`[DEPLOY] Failed to destroy ${provisioned.imageRef} on cancel:`, destroyErr);
       await new Promise((r) => setTimeout(r, 2000));
       await cleanupBuildArtifact(runtime, provisioned.imageRef).catch(() => {});
     }
   }
 
-  // Destroy service containers and broadcast failed status (mirrors onFailure)
-  const serviceDeps = await repos.service.listByDeployment(dep.id).catch(() => []);
-  const services = serviceDeps.length > 0
-    ? await repos.service.listByProject(dep.projectId).catch(() => [])
-    : [];
+  // Destroy containers this attempt owns, while preserving any unchanged
+  // containers carried from the active release. Then close every service's UI
+  // status for this cancelled attempt.
+  const serviceDeps = opts.keepProvisioned
+    ? await repos.service.listByDeployment(dep.id).catch(() => [])
+    : await cleanupOwnedServiceContainers(ctx, "cancel");
+  const services =
+    serviceDeps.length > 0 ? await repos.service.listByProject(dep.projectId).catch(() => []) : [];
   const serviceNameMap = new Map(services.map((s) => [s.id, s.name]));
 
   for (const serviceDep of serviceDeps) {
-    if (runtime && serviceDep.containerId) {
-      await runtime.destroy(serviceDep.containerId).catch((err) => {
-        console.error(`[DEPLOY] Failed to destroy service container ${serviceDep.containerId} on cancel:`, err);
-      });
-    }
     sessionManager.broadcastServiceStatus(dep.id, {
       serviceName: serviceNameMap.get(serviceDep.serviceId) ?? serviceDep.serviceId,
       serviceId: serviceDep.serviceId,
@@ -647,6 +713,7 @@ export async function onSuccess(
     url?: string;
     durationMs: number;
     warningMessage?: string;
+    decisionPending?: boolean;
     metaPatch?: Record<string, unknown>;
   },
 ): Promise<void> {
@@ -784,6 +851,14 @@ export async function onSuccess(
       );
   }
 
+  // Invalidate any cached update_status for this project so subsequent drift checks
+  // poll fresh upstream state rather than comparing the newly deployed version
+  // against a stale pre-deploy cache entry.
+  try {
+    await repos.updateStatus.deleteByProject(project.id);
+  } catch {
+    // Cache invalidation is best-effort bookkeeping after a successful deploy.
+  }
   await finishSession(buildSessionId, "ready", result.durationMs, collectLogs(ctx));
   sessionManager.updateStatus(dep.id, "ready", {
     // The deploy WORKED whether or not the row took the write, and the terminal
@@ -797,6 +872,7 @@ export async function onSuccess(
           .filter(Boolean)
           .join(" ")
       : result.warningMessage,
+    decisionPending: result.decisionPending,
     // Advisory port-check results ride the live `complete` event so the dashboard
     // can raise the "wrong port?" modal immediately; the same data is persisted in
     // meta (above) for re-hydration on refresh.
@@ -846,6 +922,10 @@ export async function onSuccess(
 
   // Webmail on Openship Cloud, routed on the mail server's own `mail.<domain>`:
   // the mail VPS proxies that hostname to the cloud URL, which can only be
-  // registered once the URL exists. Returns immediately for every other deploy.
-  void onWebmailDeployed(project, result.url);
+  // registered once the URL exists. Await it so the deployment execution lease
+  // brackets this remote route/certificate write; otherwise project deletion
+  // could observe a finished worker, remove the route, and have this detached
+  // hook recreate it afterwards. The hook catches/logs its own failures and
+  // returns immediately for every non-webmail deploy.
+  await onWebmailDeployed(project, result.url);
 }

@@ -17,8 +17,12 @@
  */
 
 import type { CommandExecutor } from "@repo/adapters";
+import { shellQuote } from "@repo/core";
+import { randomUUID } from "node:crypto";
+import { posix as pathPosix } from "node:path";
 
 import { sshManager } from "../../../lib/ssh-manager";
+import { assertValidGeneratedConfigFiles } from "../../../lib/generated-config-files";
 
 /**
  * Persistent on-host root for app template config files. Sibling of the other
@@ -31,19 +35,23 @@ import { sshManager } from "../../../lib/ssh-manager";
 export const APP_CONFIG_HOST_ROOT =
   process.env.OPENSHIP_APP_CONFIG_DIR || "/var/lib/openship/app-config";
 
+function safeHostSegment(value: string): string {
+  const sanitized = value.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return sanitized === "." || sanitized === ".." ? "_" : sanitized;
+}
+
+export function appConfigHostServiceRoot(projectId: string, serviceName: string): string {
+  return `${APP_CONFIG_HOST_ROOT}/${safeHostSegment(projectId)}/${safeHostSegment(serviceName)}`;
+}
+
 export function appConfigHostPath(
   projectId: string,
   serviceName: string,
   containerPath: string,
 ): string {
-  const safeSvc = serviceName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  assertValidGeneratedConfigFiles([{ path: containerPath, content: "" }]);
   const rel = containerPath.replace(/^\/+/, "");
-  // Reject `..` traversal: `rel` is a template-supplied path written on the HOST
-  // (and bind-mounted), so a crafted `../../etc/...` must not escape the root.
-  if (rel.split("/").some((seg) => seg === "..")) {
-    throw new Error(`Unsafe app-config path (directory traversal): ${containerPath}`);
-  }
-  return `${APP_CONFIG_HOST_ROOT}/${projectId}/${safeSvc}/${rel}`;
+  return `${appConfigHostServiceRoot(projectId, serviceName)}/${rel}`;
 }
 
 /**
@@ -89,9 +97,26 @@ export async function writeAppConfigFile(
   content: string,
   serviceName: string,
   containerPath: string,
+  opts?: { mode?: number; privateDirectory?: string },
 ): Promise<void> {
+  const stagedPath = `${hostPath}.openship-${randomUUID()}.tmp`;
   try {
-    await writer.writeFile(hostPath, content);
+    if (!writer.rename) {
+      throw new Error("target file channel does not support atomic rename");
+    }
+    // The mounted file itself must remain readable by images that deliberately
+    // run as a non-root UID (Kong, Postgres, ...). Protect secrets from other
+    // host users at the directory boundary instead; Docker's root daemon can
+    // still traverse it and bind the 0644 file into the container.
+    const parent = pathPosix.dirname(hostPath);
+    const privateDirectory = opts?.privateDirectory ?? parent;
+    await writer.mkdir(privateDirectory);
+    await writer.exec(`chmod 0700 -- ${shellQuote(privateDirectory)}`);
+    // Replace through a sibling inode. Existing containers keep their current
+    // bind-mounted inode until they are replaced; a failed/partial write never
+    // truncates the config underneath the live workload.
+    await writer.writeFile(stagedPath, content, { mode: opts?.mode ?? 0o644 });
+    await writer.rename(stagedPath, hostPath);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     throw new Error(
@@ -100,5 +125,7 @@ export async function writeAppConfigFile(
         `be written on the machine running the containers — the usual causes are that Openship ` +
         `can't reach that machine, or can't write that path. Underlying error: ${detail}`,
     );
+  } finally {
+    await writer.rm?.(stagedPath).catch(() => undefined);
   }
 }
