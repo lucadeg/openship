@@ -1,12 +1,10 @@
+
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
-  # Manual run publishes ONLY the CLI to npm (current version, no tag / installers).
   workflow_dispatch: {}
 
+  # Automatic triggers removed; invoke through FounderOS/Admin Gate.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false

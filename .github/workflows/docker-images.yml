@@ -1,3 +1,4 @@
+
 name: Docker images
 
 # Publishes the official pull-based images to GHCR: the control plane
@@ -14,9 +15,6 @@ name: Docker images
 #                             prerelease-test Docker without cutting a release or
 #                             touching the current :latest.
 on:
-  push:
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
     inputs:
       tag:
@@ -24,6 +22,7 @@ on:
         required: false
         type: string
 
+  # Automatic triggers removed; invoke through FounderOS/Admin Gate.
 concurrency:
   group: docker-images-${{ github.ref }}
   cancel-in-progress: false
